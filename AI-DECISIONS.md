@@ -72,3 +72,35 @@ Formato pedido por la cátedra (AI-DECISIONS.md).
    - `README.md`: Actualizado con instrucciones de uso zip
 
 **Validación y Corrección Humana:** Validado por Pedro (2026-09-21): revisó el checklist del slice 1 (run-hello/run-zip, timeout, memoria, aislamiento network=none + read-only, contrato handler event/context, Node 20, docs/roadmap). Sin correcciones adicionales pedidas en esa validación.
+
+---
+
+## Slice 2 — Artifacts con MinIO (upload versionado + run-artifact)
+
+**Problema abordado:** Dejar de depender solo de paths locales de zip. Almacenar zips de funciones versionados en MinIO (compatible S3) y permitir que el runner descargue el artifact antes de ejecutar, reutilizando el aislamiento Docker del Slice 1.
+
+**Prompt / Herramienta utilizada:** Cursor Cloud Agent (Claude) — pedido explícito de implementar Slice 2 según especificación detallada en el issue/prompt.
+
+**Código / Arquitectura generada:**
+
+1. **Docker Compose (`docker-compose.yml`)**
+   - Servicio MinIO con API `:9000` y consola `:9001`
+   - Healthcheck integrado (`mc ready local`)
+   - Sidecar `minio-init` que crea bucket `nimbus-artifacts` al iniciar
+   - Volume persistente `nimbus-minio-data`
+   - Credenciales configurables via env (default: `minioadmin`)
+
+2. **Scripts de artifacts (`scripts/`)**
+   - `upload-artifact.sh`: Sube zip a key `functions/{fnId}/versions/{version}/code.zip`. Version = timestamp si no se especifica. Soporta AWS CLI y `mc`.
+   - `upload-hello.sh`: Wrapper que empaqueta hello y lo sube como función "hello"
+   - `run-artifact.sh`: Descarga artifact de MinIO a temp dir, ejecuta con `run-zip.sh`, cleanup automático. Soporta `latest` para buscar última versión.
+   - `run-hello-from-minio.sh`: Demo completa que levanta MinIO, sube hello, y lo ejecuta desde MinIO
+   - `minio-init.sh`: Script alternativo para inicializar bucket manualmente
+
+3. **Configuración**
+   - `.env.example`: Variables de MinIO y runner documentadas
+   - Variables: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT_URL`, `MINIO_BUCKET`
+
+4. **Documentación**
+   - `README.md`: Actualizado con instrucciones de MinIO y nuevos scripts
+   - `docs/roadmap.md`: Slice 2 marcado como completado

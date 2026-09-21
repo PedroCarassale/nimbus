@@ -21,11 +21,19 @@ Criterio de done: `docker compose up`, subir un zip, `POST` invoke por HTTP, rec
 - `scripts/run-hello.sh` — demo de un comando (pack + run)
 - `runtime-node/bootstrap.js` mejorado con context estilo Lambda
 
-## Slice 2 — Artifacts
+## Slice 2 — Artifacts ✅ HECHO
 
-5. MinIO en Compose
-6. Upload zip → object key versionado
-7. Runner descarga el artifact antes de ejecutar
+5. ✅ MinIO en Compose (`docker-compose.yml` + healthcheck + bucket auto)
+6. ✅ Upload zip → object key versionado (`scripts/upload-artifact.sh`)
+7. ✅ Runner descarga el artifact antes de ejecutar (`scripts/run-artifact.sh`)
+
+**Entregables:**
+- `docker-compose.yml` — MinIO con API `:9000` y consola `:9001`
+- `scripts/upload-artifact.sh` — sube zip a `functions/{fnId}/versions/{version}/code.zip`
+- `scripts/upload-hello.sh` — empaqueta + sube ejemplo hello
+- `scripts/run-artifact.sh` — descarga de MinIO + ejecuta con run-zip.sh
+- `scripts/run-hello-from-minio.sh` — demo completa del flujo
+- `.env.example` — variables de entorno documentadas
 
 ## Slice 3 — Control plane
 
