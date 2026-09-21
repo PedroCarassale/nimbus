@@ -1,22 +1,19 @@
 #!/usr/bin/env bash
+# Nimbus Functions — Demo rápida: empaqueta y ejecuta el ejemplo "hello"
+#
+# Uso: ./scripts/run-hello.sh [event.json]
+#
+# Si no se proporciona evento, usa examples/hello/event.json
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-EVENT_FILE=$(mktemp)
-trap 'rm -f "$EVENT_FILE"' EXIT
+EVENT_PATH="${1:-$PROJECT_ROOT/examples/hello/event.json}"
 
-echo '{"name":"mundo","ts":'"$(date +%s)"'}' > "$EVENT_FILE"
+# Empaquetar hello
+"$SCRIPT_DIR/pack-hello.sh"
 
-if ! docker image inspect nimbus-node >/dev/null 2>&1; then
-  echo ">> Building nimbus-node image..."
-  docker build -t nimbus-node "$REPO_ROOT/runtime-node"
-fi
-
-echo ">> Running hello function..."
-timeout 5s docker run --rm \
-  -v "$REPO_ROOT/examples/hello:/var/task:ro" \
-  -v "$EVENT_FILE:/tmp/event.json:ro" \
-  -e NIMBUS_HANDLER_PATH=/var/task/index.js \
-  nimbus-node
+# Ejecutar desde zip
+"$SCRIPT_DIR/run-zip.sh" "$PROJECT_ROOT/dist/hello.zip" "$EVENT_PATH"

@@ -8,12 +8,18 @@ Criterio de done: `docker compose up`, subir un zip, `POST` invoke por HTTP, rec
 
 0. Stack documentado (`docs/stack.md`) + runtime Node en Docker (`examples/hello` + `runtime-node` + `scripts/run-hello.sh`)
 
-## Slice 1 — Runner real
+## Slice 1 — Runner real ✅ HECHO
 
-1. Script/binario que baje un zip a un dir, monte `/var/task`, corra el container
-2. Timeout hard (`timeout` / kill)
-3. Límite de memoria básico (`docker --memory`)
-4. Capturar stdout/stderr del invoke
+1. ✅ Script que baje un zip a un dir, monte `/var/task`, corra el container (`scripts/run-zip.sh`)
+2. ✅ Timeout hard (`timeout` / kill) — configurable via `NIMBUS_TIMEOUT_SEC`
+3. ✅ Límite de memoria básico (`docker --memory`) — configurable via `NIMBUS_MEMORY`
+4. ✅ Capturar stdout/stderr del invoke con códigos de salida significativos
+
+**Entregables:**
+- `scripts/run-zip.sh` — script principal de invocación local
+- `scripts/pack-hello.sh` — empaqueta `examples/hello` en zip
+- `scripts/run-hello.sh` — demo de un comando (pack + run)
+- `runtime-node/bootstrap.js` mejorado con context estilo Lambda
 
 ## Slice 2 — Artifacts
 

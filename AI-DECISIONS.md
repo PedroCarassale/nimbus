@@ -31,10 +31,44 @@ Formato pedido por la cátedra (AI-DECISIONS.md).
 
 ## Roadmap hasta el MVP
 
-**Problema abordado:** Ordenar el trabajo restante hasta un MVP demostrable (create → deploy → invoke + logs).
+**Problema abordado:** Ordenar el trabajo restante hasta un MVP demostrable (create → deploy → invoke sync).
 
 **Prompt / Herramienta utilizada:** Grok Bot (nimbus) — armado de roadmap en chat y persistencia en `docs/roadmap.md`.
 
 **Código / Arquitectura generada:** `docs/roadmap.md` con slices 1–7 (runner, artifacts, control plane, compute, logs, DX, consola opcional) y exclusiones explícitas.
 
 **Validación y Corrección Humana:** Pedro pidió guardar el roadmap en el repo. Criterio de done acordado: compose + zip + invoke HTTP + logs sin Docker manual. Ajustable si el alcance del MVP cambia con Federico.
+
+---
+
+## Slice 1 — Runner Local con Zip, Timeout y Memoria
+
+**Problema abordado:** Implementar un runner local real que ejecute funciones Node.js desde archivos zip, con soporte para timeout configurable, límites de memoria, y captura de stdout/stderr con códigos de salida significativos.
+
+**Prompt / Herramienta utilizada:** Cursor Cloud Agent (Claude)
+
+**Código / Arquitectura generada:**
+
+1. **Runtime Node.js mejorado (`runtime-node/`)**
+   - `Dockerfile`: Imagen Alpine con Node.js 20, configura paths para handler y evento, usa ENTRYPOINT
+   - `bootstrap.js`: Entrypoint mejorado que carga el módulo del usuario, ejecuta el handler con event/context (estilo Lambda), y devuelve JSON. Soporta evento opcional.
+
+2. **Ejemplo Hello mejorado (`examples/hello/`)**
+   - `index.js`: Handler con saludo personalizable, timestamp y context
+   - `event.json`: Evento de ejemplo
+
+3. **Scripts nuevos (`scripts/`)**
+   - `run-zip.sh`: Script principal que:
+     - Construye la imagen Docker si no existe
+     - Extrae el zip a directorio temporal (con cleanup automático via trap)
+     - Ejecuta con `docker run --rm --memory --pids-limit --network=none --read-only`
+     - Aplica timeout via comando `timeout`
+     - Códigos de salida: 0 (éxito), 124 (timeout), 2 (uso), 3 (build), 4 (unzip)
+   - `pack-hello.sh`: Empaqueta `examples/hello` en `dist/hello.zip`
+   - `run-hello.sh`: Wrapper que empaqueta y ejecuta en un comando (reemplaza versión anterior)
+
+4. **Documentación**
+   - `docs/roadmap.md`: Slice 1 marcado como completado
+   - `README.md`: Actualizado con instrucciones de uso zip
+
+**Validación y Corrección Humana:** PENDIENTE de validación humana por Pedro/Federico
