@@ -1,0 +1,13 @@
+# Artifacts generados
+dist/
+*.zip
+
+# Node.js
+node_modules/
+
+# Logs
+*.log
+
+# Temporales
+*.tmp
+.DS_Store
