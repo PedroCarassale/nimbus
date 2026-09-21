@@ -33,3 +33,5 @@ examples/hello/
 |----------|---------|-------------|
 | `NIMBUS_HANDLER_PATH` | `/var/task/index.js` | Ruta al módulo del handler |
 | `NIMBUS_EVENT_PATH` | `/tmp/event.json` | Ruta al JSON del evento |
+
+Roadmap hasta el MVP: [docs/roadmap.md](docs/roadmap.md).
