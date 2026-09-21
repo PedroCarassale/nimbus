@@ -35,3 +35,5 @@ examples/hello/
 | `NIMBUS_EVENT_PATH` | `/tmp/event.json` | Ruta al JSON del evento |
 
 Roadmap hasta el MVP: [docs/roadmap.md](docs/roadmap.md).
+
+Auditoría IA (cátedra): [AI-DECISIONS.md](AI-DECISIONS.md). Instrucciones para agentes: [agents.md](agents.md).
