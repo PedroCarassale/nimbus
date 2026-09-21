@@ -71,4 +71,4 @@ Formato pedido por la cátedra (AI-DECISIONS.md).
    - `docs/roadmap.md`: Slice 1 marcado como completado
    - `README.md`: Actualizado con instrucciones de uso zip
 
-**Validación y Corrección Humana:** PENDIENTE de validación humana por Pedro/Federico
+**Validación y Corrección Humana:** Validado por Pedro (2026-09-21): revisó el checklist del slice 1 (run-hello/run-zip, timeout, memoria, aislamiento network=none + read-only, contrato handler event/context, Node 20, docs/roadmap). Sin correcciones adicionales pedidas en esa validación.
