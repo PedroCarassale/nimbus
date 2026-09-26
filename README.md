@@ -60,7 +60,7 @@ Consola MinIO: http://localhost:9001 (usuario: `minioadmin`, password: `minioadm
 
 ```bash
 # Levantar MinIO (crea el bucket automáticamente)
-docker compose up -d
+docker compose up -d minio minio-init
 
 # Subir un artifact
 ./scripts/upload-artifact.sh hello dist/hello.zip
@@ -74,6 +74,45 @@ docker compose up -d
 # Ejecutar versión específica
 ./scripts/run-artifact.sh hello 20240115-120000 evento.json
 ```
+
+### Control Plane API (Slice 3)
+
+```bash
+# Levantar todo el stack (postgres + minio + control-plane)
+docker compose up -d
+
+# Esperar a que esté listo
+curl http://localhost:3000/health
+
+# Crear una función
+curl -X POST http://localhost:3000/functions \
+  -H "Content-Type: application/json" \
+  -d '{"name": "mi-funcion"}'
+
+# Desplegar un zip (obtener FN_ID del paso anterior)
+./scripts/pack-hello.sh
+curl -X POST http://localhost:3000/functions/{FN_ID}/deploy \
+  -F "file=@dist/hello.zip"
+
+# Invocar la función
+curl -X POST http://localhost:3000/functions/{FN_ID}/invoke \
+  -H "Content-Type: application/json" \
+  -d '{"event": {"nombre": "Nimbus"}}'
+
+# Smoke test completo (create → deploy → invoke)
+./scripts/smoke-test.sh
+```
+
+#### Endpoints del Control Plane
+
+| Método | Endpoint | Descripción |
+|--------|----------|-------------|
+| GET | `/health` | Health check |
+| POST | `/functions` | Crear función |
+| GET | `/functions` | Listar funciones |
+| GET | `/functions/:id` | Obtener detalles |
+| POST | `/functions/:id/deploy` | Desplegar zip |
+| POST | `/functions/:id/invoke` | Invocar función |
 
 ### Variables de entorno
 
@@ -95,6 +134,15 @@ docker compose up -d
 | `AWS_ENDPOINT_URL` | `http://localhost:9000` | Endpoint de MinIO |
 | `MINIO_BUCKET` | `nimbus-artifacts` | Nombre del bucket |
 
+**PostgreSQL (Slice 3):**
+
+| Variable | Default | Descripción |
+|----------|---------|-------------|
+| `POSTGRES_USER` | `nimbus` | Usuario de Postgres |
+| `POSTGRES_PASSWORD` | `nimbus` | Password de Postgres |
+| `POSTGRES_DB` | `nimbus` | Nombre de la base de datos |
+| `DATABASE_URL` | `postgresql://nimbus:nimbus@localhost:5432/nimbus` | Connection string |
+
 Ver `.env.example` para todas las variables.
 
 Ejemplo con límites personalizados:
@@ -107,6 +155,14 @@ NIMBUS_MEMORY=256m NIMBUS_TIMEOUT_SEC=10 ./scripts/run-zip.sh mi-funcion.zip
 
 ```
 nimbus-functions/
+├── control-plane/         # NestJS Control Plane (Slice 3)
+│   ├── src/               # Código fuente TypeScript
+│   │   ├── functions/     # Módulo de funciones (CRUD + invoke)
+│   │   ├── prisma/        # Servicio Prisma
+│   │   └── minio/         # Servicio MinIO/S3
+│   ├── prisma/            # Schema y migraciones Postgres
+│   ├── Dockerfile         # Imagen del control plane
+│   └── package.json       # Dependencias Node.js
 ├── runtime-node/          # Imagen Docker del runtime Node.js
 │   ├── bootstrap.js       # Bootstrap de la plataforma
 │   └── Dockerfile         # Imagen base del runtime
@@ -120,11 +176,12 @@ nimbus-functions/
 │   ├── upload-hello.sh    # Empaqueta + sube hello (Slice 2)
 │   ├── run-artifact.sh    # Descarga + ejecuta desde MinIO (Slice 2)
 │   ├── run-hello-from-minio.sh  # Demo completa MinIO (Slice 2)
-│   └── minio-init.sh      # Inicializa bucket (alternativo)
+│   ├── minio-init.sh      # Inicializa bucket (alternativo)
+│   └── smoke-test.sh      # Test E2E del control plane (Slice 3)
 ├── docs/                  # Documentación
 │   ├── stack.md           # Stack técnico
 │   └── roadmap.md         # Roadmap de desarrollo
-├── docker-compose.yml     # MinIO para desarrollo local
+├── docker-compose.yml     # Postgres + MinIO + Control Plane
 ├── .env.example           # Variables de entorno de ejemplo
 └── dist/                  # Artifacts generados (ignorado en git)
 ```

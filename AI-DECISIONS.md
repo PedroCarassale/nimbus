@@ -104,3 +104,44 @@ Formato pedido por la cátedra (AI-DECISIONS.md).
 4. **Documentación**
    - `README.md`: Actualizado con instrucciones de MinIO y nuevos scripts
    - `docs/roadmap.md`: Slice 2 marcado como completado
+
+---
+
+## Slice 3 — Control Plane (NestJS + Postgres + APIs)
+
+**Problema abordado:** Implementar el control plane que maneja la metadata de funciones y orquesta invocaciones. El control plane provee APIs REST para crear funciones, desplegar código (zip → MinIO), e invocar funciones. Debe almacenar metadata en Postgres y reutilizar el runner de Slice 1-2 como bridge temporal hasta que exista el compute plane Go (Slice 4).
+
+**Prompt / Herramienta utilizada:** Cursor Cloud Agent (Claude) — pedido de implementar Slice 3 según especificación en issue/prompt con requisitos de: Postgres en compose, tablas functions/versions/invocations, NestJS con endpoints POST /functions, POST /functions/:id/deploy, POST /functions/:id/invoke, bridge temporal que ejecuta scripts existentes.
+
+**Código / Arquitectura generada:**
+
+1. **Docker Compose actualizado (`docker-compose.yml`)**
+   - Servicio Postgres 16 Alpine con healthcheck
+   - Servicio `control-plane` que depende de Postgres + MinIO
+   - Monta `/scripts` read-only y Docker socket para bridge temporal
+   - Volumen persistente `nimbus-postgres-data`
+
+2. **Aplicación NestJS (`control-plane/`)**
+   - Estructura modular: `functions/`, `prisma/`, `minio/`
+   - `PrismaService`: conexión a Postgres con cliente generado
+   - `MinioService`: upload/download de artifacts con AWS SDK v3
+   - `FunctionsService`: CRUD de funciones, versiones e invocaciones
+   - `RunnerService`: bridge temporal que ejecuta `run-artifact.sh` desde Nest (comentado para reemplazo en Slice 4)
+   - `FunctionsController`: endpoints REST con validación via class-validator
+
+3. **Schema de base de datos (`prisma/schema.prisma`)**
+   - Tabla `functions`: id (UUID), name (unique), timestamps
+   - Tabla `versions`: id, function_id (FK), version tag, artifact_key, created_at
+   - Tabla `invocations`: id, function_id, version_id, status (enum), request_id, input/output JSON, error, duration_ms
+   - Migración SQL inicial con índices para consultas frecuentes
+
+4. **Dockerfile multi-stage**
+   - Builder: compila TypeScript + genera cliente Prisma
+   - Runtime: Node 20 Alpine + bash + curl + aws-cli + docker-cli (para bridge)
+   - Ejecuta migraciones al iniciar
+
+5. **Scripts y documentación**
+   - `scripts/smoke-test.sh`: test E2E que crea función → deploys → invoke
+   - `README.md`: actualizado con endpoints y ejemplos curl
+   - `docs/roadmap.md`: Slice 3 marcado como completado
+   - `.env.example`: variables de Postgres agregadas

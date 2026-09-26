@@ -1,0 +1,64 @@
+// Nimbus Functions — Prisma Schema
+// Slice 3: Control plane metadata
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Function {
+  id        String   @id @default(uuid())
+  name      String   @unique
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  versions    Version[]
+  invocations Invocation[]
+
+  @@map("functions")
+}
+
+model Version {
+  id          String   @id @default(uuid())
+  functionId  String   @map("function_id")
+  version     String
+  artifactKey String   @map("artifact_key")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  function    Function     @relation(fields: [functionId], references: [id], onDelete: Cascade)
+  invocations Invocation[]
+
+  @@unique([functionId, version])
+  @@map("versions")
+}
+
+enum InvocationStatus {
+  PENDING
+  RUNNING
+  SUCCESS
+  ERROR
+  TIMEOUT
+}
+
+model Invocation {
+  id         String           @id @default(uuid())
+  functionId String           @map("function_id")
+  versionId  String?          @map("version_id")
+  status     InvocationStatus @default(PENDING)
+  requestId  String           @unique @map("request_id")
+  input      Json?
+  output     Json?
+  error      String?
+  durationMs Int?             @map("duration_ms")
+  createdAt  DateTime         @default(now()) @map("created_at")
+  updatedAt  DateTime         @updatedAt @map("updated_at")
+
+  function Function @relation(fields: [functionId], references: [id], onDelete: Cascade)
+  version  Version? @relation(fields: [versionId], references: [id], onDelete: SetNull)
+
+  @@map("invocations")
+}

@@ -35,11 +35,18 @@ Criterio de done: `docker compose up`, subir un zip, `POST` invoke por HTTP, rec
 - `scripts/run-hello-from-minio.sh` — demo completa del flujo
 - `.env.example` — variables de entorno documentadas
 
-## Slice 3 — Control plane
+## Slice 3 — Control plane ✅ HECHO
 
-8. Postgres: tablas `functions`, `versions`, `invocations`
-9. NestJS: `POST /functions`, `POST /functions/:id/deploy` (zip), `POST /functions/:id/invoke`
-10. Nest guarda metadata; no ejecuta el código del usuario
+8. ✅ Postgres: tablas `functions`, `versions`, `invocations`
+9. ✅ NestJS: `POST /functions`, `POST /functions/:id/deploy` (zip), `POST /functions/:id/invoke`
+10. ✅ Nest guarda metadata en Postgres y artifacts en MinIO
+11. ✅ Bridge temporal: invoke usa scripts de Slice 1-2 (run-artifact.sh) desde Nest
+
+**Entregables:**
+- `control-plane/` — Aplicación NestJS + TypeScript
+- `control-plane/prisma/schema.prisma` — Esquema de base de datos
+- `docker-compose.yml` — Postgres + MinIO + control-plane
+- `scripts/smoke-test.sh` — Test end-to-end del flujo create → deploy → invoke
 
 ## Slice 4 — Compute plane
 
