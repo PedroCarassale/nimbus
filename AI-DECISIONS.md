@@ -181,3 +181,43 @@ Formato pedido por la cátedra (AI-DECISIONS.md).
    - Request: `{executionId, functionId, version, event, timeoutSec, memoryMb, handler}`
    - Response: `{executionId, success, output, error, exitCode, durationMs}`
    - HTTP 429 cuando la función está ocupada (concurrencia max alcanzada)
+
+---
+
+## Slice 5 — Live Logs (SSE via Redis Streams)
+
+**Problema abordado:** Permitir a los usuarios ver logs en tiempo real de funciones en ejecución. El compute plane (Go) debe transmitir stdout/stderr a un Redis stream mientras ejecuta Docker, y el control plane (NestJS) debe exponer un endpoint SSE que los clientes puedan consumir para ver logs en vivo.
+
+**Prompt / Herramienta utilizada:** Cursor Cloud Agent (Claude) — pedido de implementar Slice 5 según especificación: Go pushes log lines to Redis stream, Nest exposes SSE endpoint, executionId correlaciona todo el flujo.
+
+**Código / Arquitectura generada:**
+
+1. **Paquete de logs Go (`compute-plane/internal/logs/`)**
+   - `stream.go`: StreamWriter para escribir logs a Redis, StreamReader para leer
+   - Usa Redis XADD para escritura incremental, XREAD BLOCK para suscripción
+   - Cada línea de stdout/stderr se serializa como JSON con timestamp, stream, sequence
+
+2. **Executor modificado (`compute-plane/internal/executor/`)**
+   - `runDockerWithStreaming`: reemplaza buffer completo por pipes + goroutines
+   - Lee stdout/stderr línea por línea con bufio.Scanner
+   - Escribe cada línea al StreamWriter en tiempo real
+   - Marca fin de ejecución con entrada `_end` en el stream
+
+3. **Módulo Redis NestJS (`control-plane/src/redis/`)**
+   - `RedisService`: conexión ioredis, métodos para leer streams y suscribirse
+   - AsyncGenerator para suscripción a logs con XREAD BLOCK
+
+4. **Módulo Invocations (`control-plane/src/invocations/`)**
+   - `GET /invocations/:id/logs`: endpoint SSE con Server-Sent Events
+   - Soporta `follow=true` (streaming en vivo) y `follow=false` (snapshot)
+   - Eventos: `connected`, `log`, `end`, `error`
+
+5. **Esquema de keys Redis**
+   - `nimbus:logs:{executionId}` — stream de logs por ejecución
+   - TTL: 1 hora después de completar
+   - MaxLen: 1000 entries (aproximado)
+
+6. **Flujo de IDs**
+   - `invocationId`: ID en Postgres, retornado por invoke
+   - `executionId`: UUID generado por Nest, enviado a Go, usado como key de stream
+   - Invocation almacena `executionId` para correlación

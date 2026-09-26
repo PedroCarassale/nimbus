@@ -62,11 +62,18 @@ Criterio de done: `docker compose up`, subir un zip, `POST` invoke por HTTP, rec
 - `docker-compose.yml` — Redis + compute-plane agregados
 - `control-plane/src/functions/runner.service.ts` — Cliente HTTP hacia Go
 
-## Slice 5 — Logs
+## Slice 5 — Logs ✅ HECHO
 
-15. Runner/Go empujan líneas a Redis stream
-16. Nest expone `GET /invocations/:id/logs` (SSE)
-17. `requestId` en todo el camino
+15. ✅ Runner/Go empujan líneas a Redis stream
+16. ✅ Nest expone `GET /invocations/:id/logs` (SSE)
+17. ✅ `executionId` en todo el camino (invocation → execution → logs)
+
+**Entregables:**
+- `compute-plane/internal/logs/` — Paquete Go para Redis streams (write/read)
+- `control-plane/src/redis/` — Módulo NestJS para conexión Redis
+- `control-plane/src/invocations/` — Módulo con endpoint SSE para logs
+- Esquema de keys: `nimbus:logs:{executionId}` (TTL 1h, max 1000 entries)
+- Invoke response incluye `invocationId`, `executionId`, y `logsUrl`
 
 ## Slice 6 — DX local
 

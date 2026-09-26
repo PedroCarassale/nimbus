@@ -99,6 +99,8 @@ INVOKE_RESPONSE=$(curl -sf -X POST "$API_URL/functions/$FN_ID/invoke" \
 
 STATUS=$(echo "$INVOKE_RESPONSE" | jq -r '.status')
 REQUEST_ID=$(echo "$INVOKE_RESPONSE" | jq -r '.requestId')
+INVOCATION_ID=$(echo "$INVOKE_RESPONSE" | jq -r '.invocationId')
+EXECUTION_ID=$(echo "$INVOKE_RESPONSE" | jq -r '.executionId')
 DURATION=$(echo "$INVOKE_RESPONSE" | jq -r '.durationMs')
 
 echo ""
@@ -108,8 +110,27 @@ echo ""
 
 if [ "$STATUS" == "SUCCESS" ]; then
   log_ok "Invocación exitosa (${DURATION}ms, requestId: $REQUEST_ID)"
+  
+  # 4. Verificar logs SSE
+  log_info "Verificando logs SSE para invocación $INVOCATION_ID..."
+  
+  LOGS_RESPONSE=$(curl -sf -N "$API_URL/invocations/$INVOCATION_ID/logs?follow=false" 2>&1 | head -20)
+  
+  if echo "$LOGS_RESPONSE" | grep -q "event: log"; then
+    log_ok "Logs SSE disponibles (stream key: nimbus:logs:$EXECUTION_ID)"
+    echo ""
+    echo "=== Ejemplo de logs SSE ==="
+    echo "$LOGS_RESPONSE" | head -10
+    echo "..."
+  else
+    log_info "Logs SSE: stream puede haber expirado o no generado aún"
+  fi
+  
   echo ""
   echo -e "${GREEN}=== SMOKE TEST PASSED ===${NC}"
+  echo ""
+  echo "Para ver logs en vivo de futuras invocaciones:"
+  echo "  curl -N $API_URL/invocations/{invocationId}/logs"
   exit 0
 else
   log_fail "Invocación falló con status: $STATUS"

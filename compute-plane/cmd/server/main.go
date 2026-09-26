@@ -50,7 +50,7 @@ func main() {
 	log.Println("[compute-plane] Conectado a MinIO")
 
 	concurrencyMgr := concurrency.NewManager(rdb)
-	exec := executor.New(mc)
+	exec := executor.New(mc, rdb)
 	handler := handlers.New(exec, concurrencyMgr)
 
 	r := chi.NewRouter()

@@ -145,10 +145,6 @@ export class FunctionsController {
       event,
     );
 
-    await this.functionsService.updateInvocation(invocation.id, {
-      status: 'RUNNING',
-    });
-
     console.log(
       `[invoke] Ejecutando ${fn.name} v${version.version} (requestId: ${invocation.requestId})`,
     );
@@ -158,6 +154,11 @@ export class FunctionsController {
       version.version,
       event,
     );
+
+    await this.functionsService.updateInvocation(invocation.id, {
+      status: 'RUNNING',
+      executionId: result.executionId,
+    });
 
     const status = result.success
       ? 'SUCCESS'
@@ -173,11 +174,14 @@ export class FunctionsController {
     });
 
     return {
+      invocationId: invocation.id,
       requestId: invocation.requestId,
+      executionId: result.executionId,
       status,
       durationMs: result.durationMs,
       output: result.output,
       error: result.error,
+      logsUrl: `/invocations/${invocation.id}/logs`,
     };
   }
 }

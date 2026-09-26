@@ -120,12 +120,15 @@ services:
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
       MINIO_BUCKET: ${MINIO_BUCKET:-nimbus-artifacts}
       COMPUTE_PLANE_URL: http://compute-plane:8080
+      REDIS_URL: redis:6379
       NIMBUS_TIMEOUT_SEC: ${NIMBUS_TIMEOUT_SEC:-5}
       NIMBUS_MEMORY: ${NIMBUS_MEMORY:-128m}
       NIMBUS_HANDLER: ${NIMBUS_HANDLER:-handler}
       NODE_ENV: development
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
       minio:
         condition: service_healthy

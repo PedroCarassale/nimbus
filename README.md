@@ -113,6 +113,8 @@ curl -X POST http://localhost:3000/functions/{FN_ID}/invoke \
 | GET | `/functions/:id` | Obtener detalles |
 | POST | `/functions/:id/deploy` | Desplegar zip |
 | POST | `/functions/:id/invoke` | Invocar función |
+| GET | `/invocations/:id` | Obtener detalles de invocación |
+| GET | `/invocations/:id/logs` | Stream SSE de logs en vivo |
 
 #### Endpoints del Compute Plane (interno)
 
@@ -121,6 +123,46 @@ curl -X POST http://localhost:3000/functions/{FN_ID}/invoke \
 | GET | `/health` | Health check |
 | POST | `/executions` | Ejecutar función (Nest → Go) |
 | POST | `/executions/:id/cancel` | Cancelar ejecución |
+
+### Live Logs con SSE (Slice 5)
+
+El endpoint `/invocations/:id/logs` expone logs en tiempo real usando Server-Sent Events.
+
+```bash
+# Invocar función y obtener invocationId
+RESPONSE=$(curl -s -X POST http://localhost:3000/functions/{FN_ID}/invoke \
+  -H "Content-Type: application/json" \
+  -d '{"event": {"nombre": "Test"}}')
+
+INVOCATION_ID=$(echo "$RESPONSE" | jq -r '.invocationId')
+
+# Ver logs en vivo (streaming)
+curl -N http://localhost:3000/invocations/$INVOCATION_ID/logs
+
+# Ver logs existentes sin streaming
+curl -N "http://localhost:3000/invocations/$INVOCATION_ID/logs?follow=false"
+```
+
+**Formato de eventos SSE:**
+
+```
+event: connected
+data: {"invocationId":"...","requestId":"...","executionId":"...","status":"RUNNING"}
+
+event: log
+data: {"timestamp":1695744000000,"stream":"stdout","line":"Hello World","sequence":1}
+
+event: log
+data: {"timestamp":1695744000100,"stream":"stderr","line":"[debug] processing...","sequence":2}
+
+event: end
+data: {"message":"Execution complete"}
+```
+
+**Esquema de keys Redis:**
+- Stream de logs: `nimbus:logs:{executionId}`
+- TTL: 1 hora después de completar la ejecución
+- Max entries: 1000 líneas por stream
 
 ### Arquitectura Slice 4
 
@@ -230,6 +272,13 @@ Cliente HTTP
 |----------|---------|-------------|
 | `COMPUTE_PLANE_URL` | `http://compute-plane:8080` | URL del compute plane (para Nest) |
 | `COMPUTE_PLANE_PORT` | `8080` | Puerto del compute plane |
+
+**Control Plane — Redis (Slice 5):**
+
+| Variable | Default | Descripción |
+|----------|---------|-------------|
+| `REDIS_URL` | `redis:6379` | Dirección de Redis para logs SSE |
+| `REDIS_PASSWORD` | `` | Password de Redis (vacío por defecto) |
 
 Ver `.env.example` para todas las variables.
 

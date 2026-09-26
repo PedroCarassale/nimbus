@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { v4 as uuidv4 } from 'uuid';
 
 export interface RunnerResult {
+  executionId: string;
   success: boolean;
   output: unknown;
   error?: string;
@@ -90,6 +91,7 @@ export class RunnerService {
       if (response.status === 429) {
         const errorBody = await response.json();
         return {
+          executionId,
           success: false,
           output: null,
           error: errorBody.error || 'Función ocupada, reintente más tarde',
@@ -105,6 +107,7 @@ export class RunnerService {
       );
 
       return {
+        executionId,
         success: result.success,
         output: result.output,
         error: result.error,
@@ -117,6 +120,7 @@ export class RunnerService {
       this.logger.error(`Error llamando compute-plane: ${errorMessage}`);
 
       return {
+        executionId,
         success: false,
         output: null,
         error: `Error comunicándose con compute-plane: ${errorMessage}`,

@@ -131,6 +131,7 @@ export class FunctionsService {
     id: string,
     data: {
       status: 'RUNNING' | 'SUCCESS' | 'ERROR' | 'TIMEOUT';
+      executionId?: string;
       output?: unknown;
       error?: string;
       durationMs?: number;
@@ -140,6 +141,7 @@ export class FunctionsService {
       where: { id },
       data: {
         status: data.status,
+        executionId: data.executionId,
         output: data.output as object | undefined,
         error: data.error,
         durationMs: data.durationMs,

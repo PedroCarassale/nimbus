@@ -2,6 +2,7 @@ package executor
 
 import (
 	"archive/zip"
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -12,13 +13,17 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/logs"
 	minioClient "github.com/PedroCarassale/nimbus/compute-plane/internal/minio"
+	"github.com/redis/go-redis/v9"
 )
 
 type Executor struct {
 	minio        *minioClient.Client
+	rdb          *redis.Client
 	defaultImage string
 }
 
@@ -43,9 +48,10 @@ type ExecutionResult struct {
 	Stderr      string      `json:"stderr,omitempty"`
 }
 
-func New(minio *minioClient.Client) *Executor {
+func New(minio *minioClient.Client, rdb *redis.Client) *Executor {
 	return &Executor{
 		minio:        minio,
+		rdb:          rdb,
 		defaultImage: getEnv("NIMBUS_IMAGE", "nimbus-node"),
 	}
 }
@@ -57,12 +63,17 @@ func (e *Executor) Execute(ctx context.Context, req *ExecutionRequest) *Executio
 		ExitCode:    1,
 	}
 
+	logWriter := logs.NewStreamWriter(e.rdb, req.ExecutionID)
+	defer logWriter.Close(ctx)
+
 	log.Printf("[executor] Iniciando ejecución %s (fn: %s, version: %s)", req.ExecutionID, req.FunctionID, req.Version)
+	logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Iniciando ejecución %s", req.ExecutionID))
 
 	tempDir, err := e.minio.DownloadArtifact(ctx, req.FunctionID, req.Version)
 	if err != nil {
 		result.Error = fmt.Sprintf("Error descargando artifact: %v", err)
 		result.DurationMs = time.Since(startTime).Milliseconds()
+		logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Error: %s", result.Error))
 		return result
 	}
 	defer os.RemoveAll(tempDir)
@@ -72,12 +83,14 @@ func (e *Executor) Execute(ctx context.Context, req *ExecutionRequest) *Executio
 	if err := os.MkdirAll(workDir, 0755); err != nil {
 		result.Error = fmt.Sprintf("Error creando directorio de trabajo: %v", err)
 		result.DurationMs = time.Since(startTime).Milliseconds()
+		logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Error: %s", result.Error))
 		return result
 	}
 
 	if err := e.unzip(zipPath, workDir); err != nil {
 		result.Error = fmt.Sprintf("Error extrayendo zip: %v", err)
 		result.DurationMs = time.Since(startTime).Milliseconds()
+		logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Error: %s", result.Error))
 		return result
 	}
 
@@ -86,12 +99,14 @@ func (e *Executor) Execute(ctx context.Context, req *ExecutionRequest) *Executio
 	if err := os.WriteFile(eventPath, eventBytes, 0644); err != nil {
 		result.Error = fmt.Sprintf("Error escribiendo evento: %v", err)
 		result.DurationMs = time.Since(startTime).Milliseconds()
+		logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Error: %s", result.Error))
 		return result
 	}
 
 	if err := e.ensureImage(ctx); err != nil {
 		result.Error = fmt.Sprintf("Error con imagen Docker: %v", err)
 		result.DurationMs = time.Since(startTime).Milliseconds()
+		logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Error: %s", result.Error))
 		return result
 	}
 
@@ -108,7 +123,8 @@ func (e *Executor) Execute(ctx context.Context, req *ExecutionRequest) *Executio
 		handler = "handler"
 	}
 
-	dockerResult := e.runDocker(ctx, workDir, timeoutSec, memoryMB, handler)
+	logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Ejecutando handler '%s' (timeout: %ds, memory: %dMB)", handler, timeoutSec, memoryMB))
+	dockerResult := e.runDockerWithStreaming(ctx, workDir, timeoutSec, memoryMB, handler, logWriter)
 
 	result.Success = dockerResult.success
 	result.Output = dockerResult.output
@@ -120,15 +136,18 @@ func (e *Executor) Execute(ctx context.Context, req *ExecutionRequest) *Executio
 	if !dockerResult.success && result.Error == "" {
 		if dockerResult.exitCode == 124 {
 			result.Error = fmt.Sprintf("Timeout excedido (%ds)", timeoutSec)
+			logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Error: %s", result.Error))
 		} else if dockerResult.stderr != "" {
 			result.Error = dockerResult.stderr
 		} else {
 			result.Error = "Error en la ejecución"
+			logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Error: %s", result.Error))
 		}
 	}
 
 	log.Printf("[executor] Ejecución %s completada (success: %v, exit: %d, duration: %dms)",
 		req.ExecutionID, result.Success, result.ExitCode, result.DurationMs)
+	logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Ejecución completada (success: %v, duration: %dms)", result.Success, result.DurationMs))
 
 	return result
 }
@@ -141,7 +160,7 @@ type dockerResult struct {
 	stderr   string
 }
 
-func (e *Executor) runDocker(ctx context.Context, workDir string, timeoutSec, memoryMB int, handler string) dockerResult {
+func (e *Executor) runDockerWithStreaming(ctx context.Context, workDir string, timeoutSec, memoryMB int, handler string, logWriter *logs.StreamWriter) dockerResult {
 	args := []string{
 		"run",
 		"--rm",
@@ -160,11 +179,47 @@ func (e *Executor) runDocker(ctx context.Context, workDir string, timeoutSec, me
 
 	cmd := exec.CommandContext(timeoutCtx, "timeout", append([]string{fmt.Sprintf("%ds", timeoutSec), "docker"}, args...)...)
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return dockerResult{exitCode: 1, stderr: fmt.Sprintf("Error creating stdout pipe: %v", err)}
+	}
 
-	err := cmd.Run()
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return dockerResult{exitCode: 1, stderr: fmt.Sprintf("Error creating stderr pipe: %v", err)}
+	}
+
+	if err := cmd.Start(); err != nil {
+		return dockerResult{exitCode: 1, stderr: fmt.Sprintf("Error starting command: %v", err)}
+	}
+
+	var stdoutBuf, stderrBuf bytes.Buffer
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		scanner := bufio.NewScanner(stdoutPipe)
+		for scanner.Scan() {
+			line := scanner.Text()
+			stdoutBuf.WriteString(line + "\n")
+			logWriter.WriteStdout(ctx, line)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		scanner := bufio.NewScanner(stderrPipe)
+		for scanner.Scan() {
+			line := scanner.Text()
+			stderrBuf.WriteString(line + "\n")
+			logWriter.WriteStderr(ctx, line)
+		}
+	}()
+
+	wg.Wait()
+
+	err = cmd.Wait()
 
 	exitCode := 0
 	if err != nil {
@@ -175,8 +230,8 @@ func (e *Executor) runDocker(ctx context.Context, workDir string, timeoutSec, me
 		}
 	}
 
-	stdoutStr := stdout.String()
-	stderrStr := stderr.String()
+	stdoutStr := stdoutBuf.String()
+	stderrStr := stderrBuf.String()
 
 	output := e.parseOutput(stdoutStr)
 
