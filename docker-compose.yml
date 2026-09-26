@@ -1,6 +1,7 @@
 # Nimbus Functions — Docker Compose
 # Slice 2: MinIO para almacenamiento de artifacts
 # Slice 3: Postgres para metadata + NestJS control plane
+# Slice 4: Redis para concurrencia + Go compute plane
 #
 # Uso: docker compose up -d
 
@@ -18,6 +19,21 @@ services:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-nimbus} -d ${POSTGRES_DB:-nimbus}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  redis:
+    image: redis:7-alpine
+    container_name: nimbus-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -60,6 +76,36 @@ services:
         echo 'Bucket $${MINIO_BUCKET} listo';
       "
 
+  compute-plane:
+    build:
+      context: ./compute-plane
+      dockerfile: Dockerfile
+    container_name: nimbus-compute-plane
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      REDIS_URL: redis:6379
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-nimbus-artifacts}
+      NIMBUS_IMAGE: nimbus-node
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./runtime-node:/app/runtime-node:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
   control-plane:
     build:
       context: ./control-plane
@@ -73,15 +119,18 @@ services:
       MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
       MINIO_BUCKET: ${MINIO_BUCKET:-nimbus-artifacts}
+      COMPUTE_PLANE_URL: http://compute-plane:8080
+      NIMBUS_TIMEOUT_SEC: ${NIMBUS_TIMEOUT_SEC:-5}
+      NIMBUS_MEMORY: ${NIMBUS_MEMORY:-128m}
+      NIMBUS_HANDLER: ${NIMBUS_HANDLER:-handler}
       NODE_ENV: development
     depends_on:
       postgres:
         condition: service_healthy
       minio:
         condition: service_healthy
-    volumes:
-      - ./scripts:/app/scripts:ro
-      - /var/run/docker.sock:/var/run/docker.sock
+      compute-plane:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
       interval: 10s
@@ -94,3 +143,5 @@ volumes:
     name: nimbus-postgres-data
   minio-data:
     name: nimbus-minio-data
+  redis-data:
+    name: nimbus-redis-data

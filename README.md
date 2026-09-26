@@ -75,10 +75,10 @@ docker compose up -d minio minio-init
 ./scripts/run-artifact.sh hello 20240115-120000 evento.json
 ```
 
-### Control Plane API (Slice 3)
+### Control Plane API (Slice 3-4)
 
 ```bash
-# Levantar todo el stack (postgres + minio + control-plane)
+# Levantar todo el stack (postgres + redis + minio + compute-plane + control-plane)
 docker compose up -d
 
 # Esperar a que esté listo
@@ -114,6 +114,80 @@ curl -X POST http://localhost:3000/functions/{FN_ID}/invoke \
 | POST | `/functions/:id/deploy` | Desplegar zip |
 | POST | `/functions/:id/invoke` | Invocar función |
 
+#### Endpoints del Compute Plane (interno)
+
+| Método | Endpoint | Descripción |
+|--------|----------|-------------|
+| GET | `/health` | Health check |
+| POST | `/executions` | Ejecutar función (Nest → Go) |
+| POST | `/executions/:id/cancel` | Cancelar ejecución |
+
+### Arquitectura Slice 4
+
+```
+Cliente HTTP
+    │
+    ▼
+┌─────────────────────────────────────┐
+│   Control Plane (NestJS :3000)      │
+│   - Valida request                  │
+│   - Consulta metadata en Postgres   │
+│   - Registra invocation             │
+└──────────────┬──────────────────────┘
+               │ HTTP POST /executions
+               ▼
+┌─────────────────────────────────────┐
+│   Compute Plane (Go :8080)          │
+│   - Adquiere lock Redis por función │
+│   - Descarga artifact de MinIO      │
+│   - Ejecuta Docker (isolated)       │
+│   - Libera lock y retorna resultado │
+└─────────────────────────────────────┘
+               │
+               ▼
+┌─────────────────────────────────────┐
+│   Docker Container (nimbus-node)    │
+│   --network=none --read-only        │
+│   --memory=128m --pids-limit=256    │
+└─────────────────────────────────────┘
+```
+
+### Contrato Nest ↔ Go
+
+**Request POST /executions:**
+```json
+{
+  "executionId": "uuid",
+  "functionId": "uuid",
+  "version": "20240115-120000",
+  "event": { "key": "value" },
+  "timeoutSec": 5,
+  "memoryMb": 128,
+  "handler": "handler"
+}
+```
+
+**Response:**
+```json
+{
+  "executionId": "uuid",
+  "success": true,
+  "output": { "resultado": "..." },
+  "error": "",
+  "exitCode": 0,
+  "durationMs": 150
+}
+```
+
+**Error 429 (función ocupada):**
+```json
+{
+  "error": "Función ocupada, reintente más tarde",
+  "executionId": "uuid",
+  "retryAfter": 5
+}
+```
+
 ### Variables de entorno
 
 **Runner (Slice 1):**
@@ -143,6 +217,20 @@ curl -X POST http://localhost:3000/functions/{FN_ID}/invoke \
 | `POSTGRES_DB` | `nimbus` | Nombre de la base de datos |
 | `DATABASE_URL` | `postgresql://nimbus:nimbus@localhost:5432/nimbus` | Connection string |
 
+**Redis (Slice 4):**
+
+| Variable | Default | Descripción |
+|----------|---------|-------------|
+| `REDIS_URL` | `redis:6379` | Dirección de Redis |
+| `REDIS_PASSWORD` | `` | Password de Redis (vacío por defecto) |
+
+**Compute Plane (Slice 4):**
+
+| Variable | Default | Descripción |
+|----------|---------|-------------|
+| `COMPUTE_PLANE_URL` | `http://compute-plane:8080` | URL del compute plane (para Nest) |
+| `COMPUTE_PLANE_PORT` | `8080` | Puerto del compute plane |
+
 Ver `.env.example` para todas las variables.
 
 Ejemplo con límites personalizados:
@@ -163,6 +251,15 @@ nimbus-functions/
 │   ├── prisma/            # Schema y migraciones Postgres
 │   ├── Dockerfile         # Imagen del control plane
 │   └── package.json       # Dependencias Node.js
+├── compute-plane/         # Go Compute Plane (Slice 4)
+│   ├── cmd/server/        # Entrypoint del servidor
+│   ├── internal/
+│   │   ├── handlers/      # HTTP handlers (StartExecution, Cancel)
+│   │   ├── executor/      # Descarga MinIO + Docker run
+│   │   ├── concurrency/   # Redis locks distribuidos
+│   │   └── minio/         # Cliente MinIO
+│   ├── Dockerfile         # Imagen del compute plane
+│   └── go.mod             # Dependencias Go
 ├── runtime-node/          # Imagen Docker del runtime Node.js
 │   ├── bootstrap.js       # Bootstrap de la plataforma
 │   └── Dockerfile         # Imagen base del runtime
@@ -177,11 +274,11 @@ nimbus-functions/
 │   ├── run-artifact.sh    # Descarga + ejecuta desde MinIO (Slice 2)
 │   ├── run-hello-from-minio.sh  # Demo completa MinIO (Slice 2)
 │   ├── minio-init.sh      # Inicializa bucket (alternativo)
-│   └── smoke-test.sh      # Test E2E del control plane (Slice 3)
+│   └── smoke-test.sh      # Test E2E del control plane (Slice 3-4)
 ├── docs/                  # Documentación
 │   ├── stack.md           # Stack técnico
 │   └── roadmap.md         # Roadmap de desarrollo
-├── docker-compose.yml     # Postgres + MinIO + Control Plane
+├── docker-compose.yml     # Postgres + Redis + MinIO + Compute + Control
 ├── .env.example           # Variables de entorno de ejemplo
 └── dist/                  # Artifacts generados (ignorado en git)
 ```

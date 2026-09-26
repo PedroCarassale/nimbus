@@ -1,8 +1,5 @@
-import { Injectable } from '@nestjs/common';
-import { spawn } from 'child_process';
-import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
+import { Injectable, Logger } from '@nestjs/common';
+import { v4 as uuidv4 } from 'uuid';
 
 export interface RunnerResult {
   success: boolean;
@@ -12,29 +9,48 @@ export interface RunnerResult {
   durationMs: number;
 }
 
+interface ComputePlaneRequest {
+  executionId: string;
+  functionId: string;
+  version: string;
+  event: Record<string, unknown>;
+  timeoutSec?: number;
+  memoryMb?: number;
+  handler?: string;
+}
+
+interface ComputePlaneResponse {
+  executionId: string;
+  success: boolean;
+  output: unknown;
+  error?: string;
+  exitCode: number;
+  durationMs: number;
+}
+
 /**
- * RunnerService — Bridge temporal para Slice 3
+ * RunnerService — Cliente HTTP hacia Go compute-plane (Slice 4)
  *
- * Este servicio ejecuta funciones usando los scripts de Slice 1-2 (run-artifact.sh).
- * En Slice 4, este bridge será reemplazado por llamadas Nest → Go (compute plane).
+ * Este servicio envía solicitudes de ejecución al compute-plane Go,
+ * que maneja Docker, timeouts, y concurrencia con Redis.
  *
- * TODO(slice-4): Reemplazar este servicio con cliente HTTP/gRPC hacia compute-plane Go.
- * El compute plane manejará Docker, timeouts, y orquestación de forma más robusta.
+ * Reemplaza el bridge temporal de Slice 3 que usaba run-artifact.sh.
  */
 @Injectable()
 export class RunnerService {
-  private readonly scriptsPath: string;
+  private readonly logger = new Logger(RunnerService.name);
+  private readonly computePlaneUrl: string;
 
   constructor() {
-    this.scriptsPath =
-      process.env.SCRIPTS_PATH || '/app/scripts';
+    this.computePlaneUrl =
+      process.env.COMPUTE_PLANE_URL || 'http://compute-plane:8080';
   }
 
   /**
-   * Ejecuta una función descargando el artifact de MinIO y corriendo run-artifact.sh
+   * Ejecuta una función enviando la solicitud al compute-plane Go.
    *
    * @param functionId - ID de la función en Postgres
-   * @param version - Tag de versión (e.g. "20240115-120000") o "latest"
+   * @param version - Tag de versión (e.g. "20240115-120000")
    * @param event - Evento JSON a pasar al handler
    */
   async invoke(
@@ -42,117 +58,101 @@ export class RunnerService {
     version: string,
     event: Record<string, unknown>,
   ): Promise<RunnerResult> {
+    const executionId = uuidv4();
     const startTime = Date.now();
 
-    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nimbus-invoke-'));
-    const eventPath = path.join(tempDir, 'event.json');
+    this.logger.log(
+      `Enviando ejecución ${executionId} al compute-plane (fn: ${functionId}, v: ${version})`,
+    );
 
     try {
-      fs.writeFileSync(eventPath, JSON.stringify(event));
-
-      const result = await this.runArtifactScript(
+      const request: ComputePlaneRequest = {
+        executionId,
         functionId,
         version,
-        eventPath,
-      );
-
-      const durationMs = Date.now() - startTime;
-
-      return {
-        ...result,
-        durationMs,
+        event,
+        timeoutSec: parseInt(process.env.NIMBUS_TIMEOUT_SEC || '5', 10),
+        memoryMb: parseInt(
+          (process.env.NIMBUS_MEMORY || '128m').replace('m', ''),
+          10,
+        ),
+        handler: process.env.NIMBUS_HANDLER || 'handler',
       };
-    } finally {
-      fs.rmSync(tempDir, { recursive: true, force: true });
-    }
-  }
 
-  private runArtifactScript(
-    functionId: string,
-    version: string,
-    eventPath: string,
-  ): Promise<Omit<RunnerResult, 'durationMs'>> {
-    return new Promise((resolve) => {
-      const scriptPath = path.join(this.scriptsPath, 'run-artifact.sh');
-
-      const proc = spawn(scriptPath, [functionId, version, eventPath], {
-        env: {
-          ...process.env,
-          AWS_ACCESS_KEY_ID: process.env.MINIO_ACCESS_KEY || 'minioadmin',
-          AWS_SECRET_ACCESS_KEY: process.env.MINIO_SECRET_KEY || 'minioadmin',
-          AWS_ENDPOINT_URL: process.env.MINIO_ENDPOINT || 'http://minio:9000',
-          MINIO_BUCKET: process.env.MINIO_BUCKET || 'nimbus-artifacts',
+      const response = await fetch(`${this.computePlaneUrl}/executions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
         },
-        stdio: ['pipe', 'pipe', 'pipe'],
+        body: JSON.stringify(request),
       });
 
-      let stdout = '';
-      let stderr = '';
-
-      proc.stdout.on('data', (data) => {
-        stdout += data.toString();
-      });
-
-      proc.stderr.on('data', (data) => {
-        stderr += data.toString();
-      });
-
-      proc.on('close', (code) => {
-        const exitCode = code ?? 1;
-
-        if (exitCode === 124) {
-          resolve({
-            success: false,
-            output: null,
-            error: 'Timeout excedido',
-            exitCode,
-          });
-          return;
-        }
-
-        const output = this.parseOutput(stdout);
-
-        if (exitCode === 0 && output !== null) {
-          resolve({
-            success: true,
-            output,
-            exitCode,
-          });
-        } else {
-          resolve({
-            success: false,
-            output,
-            error: stderr || 'Error en la ejecución',
-            exitCode,
-          });
-        }
-      });
-
-      proc.on('error', (err) => {
-        resolve({
+      if (response.status === 429) {
+        const errorBody = await response.json();
+        return {
           success: false,
           output: null,
-          error: `Error ejecutando script: ${err.message}`,
+          error: errorBody.error || 'Función ocupada, reintente más tarde',
           exitCode: 1,
-        });
-      });
-    });
+          durationMs: Date.now() - startTime,
+        };
+      }
+
+      const result: ComputePlaneResponse = await response.json();
+
+      this.logger.log(
+        `Ejecución ${executionId} completada (success: ${result.success}, exit: ${result.exitCode}, duration: ${result.durationMs}ms)`,
+      );
+
+      return {
+        success: result.success,
+        output: result.output,
+        error: result.error,
+        exitCode: result.exitCode,
+        durationMs: result.durationMs,
+      };
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : 'Error desconocido';
+      this.logger.error(`Error llamando compute-plane: ${errorMessage}`);
+
+      return {
+        success: false,
+        output: null,
+        error: `Error comunicándose con compute-plane: ${errorMessage}`,
+        exitCode: 1,
+        durationMs: Date.now() - startTime,
+      };
+    }
   }
 
-  private parseOutput(stdout: string): unknown {
-    const lines = stdout.trim().split('\n');
+  /**
+   * Cancela una ejecución en progreso.
+   *
+   * @param executionId - ID de la ejecución a cancelar
+   */
+  async cancel(executionId: string): Promise<boolean> {
+    try {
+      const response = await fetch(
+        `${this.computePlaneUrl}/executions/${executionId}/cancel`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+        },
+      );
 
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const line = lines[i].trim();
-      if (line.startsWith('{') || line.startsWith('[')) {
-        try {
-          return JSON.parse(line);
-        } catch {
-          continue;
-        }
+      if (!response.ok) {
+        this.logger.warn(`No se pudo cancelar ejecución ${executionId}`);
+        return false;
       }
-    }
 
-    return null;
+      const result = await response.json();
+      return result.cancelled === true;
+    } catch (error) {
+      this.logger.error(`Error cancelando ejecución: ${error}`);
+      return false;
+    }
   }
 }

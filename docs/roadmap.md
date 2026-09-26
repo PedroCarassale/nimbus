@@ -48,12 +48,19 @@ Criterio de done: `docker compose up`, subir un zip, `POST` invoke por HTTP, rec
 - `docker-compose.yml` — Postgres + MinIO + control-plane
 - `scripts/smoke-test.sh` — Test end-to-end del flujo create → deploy → invoke
 
-## Slice 4 — Compute plane
+## Slice 4 — Compute plane ✅ HECHO
 
-11. Go: `StartExecution` / `Cancel` (HTTP o gRPC corto)
-12. Nest → Go en cada invoke
-13. Go orquesta Docker + timeout + respuesta
-14. Redis: cola simple + concurrency max (1 por función al principio)
+11. ✅ Go: `POST /executions` (StartExecution) + `POST /executions/:id/cancel` (Cancel) — HTTP
+12. ✅ Nest → Go en cada invoke (reemplaza bridge shell temporal de Slice 3)
+13. ✅ Go orquesta Docker + timeout + respuesta (mismo aislamiento que run-zip.sh)
+14. ✅ Redis: lock distribuido con TTL para concurrency max 1 por función
+
+**Entregables:**
+- `compute-plane/` — Servicio Go con chi router
+- `compute-plane/internal/executor/` — Descarga MinIO + Docker run
+- `compute-plane/internal/concurrency/` — Redis locks (esquema `nimbus:lock:fn:{id}`)
+- `docker-compose.yml` — Redis + compute-plane agregados
+- `control-plane/src/functions/runner.service.ts` — Cliente HTTP hacia Go
 
 ## Slice 5 — Logs
 

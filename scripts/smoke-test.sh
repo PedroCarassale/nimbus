@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
-# Nimbus Functions — Smoke Test del Control Plane (Slice 3)
+# Nimbus Functions — Smoke Test del Control Plane (Slice 3-4)
 #
 # Uso: ./scripts/smoke-test.sh
 #
 # Este script realiza el flujo completo:
 # 1. Crea una función via API
 # 2. Despliega un zip (hello)
-# 3. Invoca la función
+# 3. Invoca la función (Nest → Go compute plane)
 #
 # Requiere:
-# - docker compose up (postgres + minio + control-plane)
+# - docker compose up (postgres + redis + minio + compute-plane + control-plane)
 # - curl y jq instalados
 
 set -euo pipefail
 
 API_URL="${API_URL:-http://localhost:3000}"
+COMPUTE_URL="${COMPUTE_URL:-http://localhost:8080}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Colores para output
@@ -30,6 +31,19 @@ log_fail() { echo -e "${RED}[✗]${NC} $1"; exit 1; }
 # Verificar dependencias
 command -v curl >/dev/null 2>&1 || log_fail "curl requerido"
 command -v jq >/dev/null 2>&1 || log_fail "jq requerido"
+
+# Esperar a que el compute-plane esté listo
+log_info "Esperando compute-plane en $COMPUTE_URL..."
+for i in {1..30}; do
+  if curl -sf "$COMPUTE_URL/health" >/dev/null 2>&1; then
+    log_ok "Compute plane listo"
+    break
+  fi
+  if [ $i -eq 30 ]; then
+    log_fail "Compute plane no responde después de 30s"
+  fi
+  sleep 1
+done
 
 # Esperar a que el control-plane esté listo
 log_info "Esperando control-plane en $API_URL..."

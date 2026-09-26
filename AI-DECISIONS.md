@@ -145,3 +145,39 @@ Formato pedido por la cátedra (AI-DECISIONS.md).
    - `README.md`: actualizado con endpoints y ejemplos curl
    - `docs/roadmap.md`: Slice 3 marcado como completado
    - `.env.example`: variables de Postgres agregadas
+
+---
+
+## Slice 4 — Compute Plane (Go + Redis + Docker)
+
+**Problema abordado:** Separar la ejecución de funciones del control plane. El control plane (NestJS) debe delegar la ejecución real al compute plane (Go), que maneja Docker, timeouts, y concurrencia. Esto permite escalar los planos de forma independiente y evita que NestJS dependa de Docker CLI y scripts bash.
+
+**Prompt / Herramienta utilizada:** Cursor Cloud Agent (Claude) — pedido de implementar Slice 4 según especificación: servicio Go con HTTP API, Redis para concurrencia max 1 por función, y reemplazo del bridge temporal de Slice 3.
+
+**Código / Arquitectura generada:**
+
+1. **Servicio Go (`compute-plane/`)**
+   - `cmd/server/main.go`: servidor HTTP con chi router, graceful shutdown
+   - `internal/handlers/`: endpoints `POST /executions` (StartExecution), `POST /executions/:id/cancel` (Cancel)
+   - `internal/executor/`: descarga artifact de MinIO, extrae zip, ejecuta Docker con aislamiento (network=none, read-only, memory limit, timeout)
+   - `internal/concurrency/`: lock distribuido con Redis (SetNX + TTL) — max 1 ejecución concurrente por función
+   - `internal/minio/`: cliente MinIO para descarga de artifacts
+   - `Dockerfile`: multi-stage build, binario estático, runtime Alpine con docker-cli
+
+2. **Esquema de keys Redis**
+   - `nimbus:lock:fn:{functionId}` — lock exclusivo por función (SetNX con TTL 5min)
+   - `nimbus:exec:{executionId}` — metadata de ejecución activa (HSET)
+
+3. **Integración Nest → Go**
+   - `control-plane/src/functions/runner.service.ts`: cliente HTTP hacia compute-plane (reemplaza bridge shell)
+   - Simplificación del Dockerfile de control-plane (ya no necesita docker-cli, aws-cli, bash)
+
+4. **Docker Compose actualizado**
+   - Servicio `redis` (Redis 7 Alpine con persistencia AOF)
+   - Servicio `compute-plane` (depende de redis + minio, monta docker.sock + runtime-node)
+   - Control-plane depende de compute-plane healthy
+
+5. **Contrato HTTP Nest ↔ Go**
+   - Request: `{executionId, functionId, version, event, timeoutSec, memoryMb, handler}`
+   - Response: `{executionId, success, output, error, exitCode, durationMs}`
+   - HTTP 429 cuando la función está ocupada (concurrencia max alcanzada)
