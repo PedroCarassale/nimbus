@@ -24,7 +24,12 @@ make up
 
 # 3. Ejecutar demo end-to-end: crear → desplegar → invocar función
 make hello
+
+# 4. Abrir la consola web (opcional)
+make console
 ```
+
+**Consola Web:** http://localhost:8088
 
 Esto demuestra el flujo completo del MVP:
 - **Control Plane** (NestJS): crea función, almacena metadata en Postgres, sube código a MinIO
@@ -34,29 +39,39 @@ Esto demuestra el flujo completo del MVP:
 ### Arquitectura
 
 ```
-┌──────────────────────────────────────────────────────────────────────────┐
-│                          docker compose up                                │
-├──────────────┬──────────────┬──────────────┬──────────────┬──────────────┤
-│   Postgres   │    Redis     │    MinIO     │  Control     │   Compute    │
-│   (metadata) │  (locks/logs)│  (artifacts) │  Plane:3000  │   Plane:8080 │
-└──────────────┴──────────────┴──────────────┴──────┬───────┴───────┬──────┘
-                                                    │ HTTP          │ Docker
-                                                    ▼               ▼
-                                              ┌─────────────────────────────┐
-                                              │  nimbus-node container      │
-                                              │  (isolated: --network=none) │
-                                              └─────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                              docker compose up                                   │
+├──────────┬──────────┬──────────┬────────────┬────────────┬──────────────────────┤
+│ Postgres │  Redis   │  MinIO   │  Control   │  Compute   │      Console         │
+│ (metada) │ (locks)  │(artifacts│ Plane:3000 │ Plane:8080 │   (React):8088       │
+└──────────┴──────────┴──────────┴─────┬──────┴──────┬─────┴──────────┬───────────┘
+                                       │ HTTP        │ Docker         │ Browser
+                                       ▼             ▼                ▼
+                                 ┌─────────────────────────────┐  ┌────────────┐
+                                 │  nimbus-node container      │  │   Usuario  │
+                                 │  (isolated: --network=none) │  │            │
+                                 └─────────────────────────────┘  └────────────┘
 ```
 
 ### Comandos Útiles
 
 ```bash
 make help         # Ver todos los comandos disponibles
+make console      # Abrir consola web en http://localhost:8088
 make smoke        # Test completo con verificación de logs SSE
 make logs         # Ver logs de todos los servicios
 make down         # Detener el stack
 make down-clean   # Detener y eliminar volúmenes
 ```
+
+### Consola Web
+
+La consola en http://localhost:8088 permite:
+- Crear y listar funciones
+- Subir archivo .zip para desplegar
+- Invocar funciones con editor JSON
+- Ver resultado de la invocación
+- Logs en tiempo real via SSE
 
 ### Ver Logs en Tiempo Real (SSE)
 
@@ -351,6 +366,14 @@ NIMBUS_MEMORY=256m NIMBUS_TIMEOUT_SEC=10 ./scripts/run-zip.sh mi-funcion.zip
 
 ```
 nimbus-functions/
+├── console/               # React Console (Slice 7)
+│   ├── src/               # Código fuente TypeScript + React
+│   │   ├── components/    # Componentes (LogsPanel, JsonEditor)
+│   │   ├── pages/         # Páginas (FunctionsList, FunctionDetail)
+│   │   ├── api.ts         # Cliente HTTP para control-plane
+│   │   └── types.ts       # Tipos TypeScript
+│   ├── Dockerfile         # Build + nginx
+│   └── package.json       # Dependencias
 ├── control-plane/         # NestJS Control Plane (Slice 3)
 │   ├── src/               # Código fuente TypeScript
 │   │   ├── functions/     # Módulo de funciones (CRUD + invoke)

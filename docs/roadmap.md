@@ -91,10 +91,21 @@ Criterio de done: `docker compose up`, subir un zip, `POST` invoke por HTTP, rec
 - `docker compose up` levanta Postgres, Redis, MinIO, control-plane, compute-plane
 - `make hello` crea función → despliega zip → invoca → muestra resultado JSON + hint de logs SSE
 
-## Slice 7 — Consola mínima (opcional para MVP usable)
+## Slice 7 — Consola mínima ✅ HECHO
 
-21. React: crear función, subir zip, invoke, ver logs
-22. Si apura: Postman/curl alcanza y el front va post-MVP
+21. ✅ React: crear función, subir zip, invoke, ver logs
+22. ✅ Integrado en docker-compose (nginx en puerto 8088)
+
+**Entregables:**
+- `console/` — Aplicación React + TypeScript + Vite
+- `console/src/pages/` — FunctionsList (listar/crear), FunctionDetail (deploy/invoke)
+- `console/src/components/` — LogsPanel (SSE en vivo), JsonEditor
+- `console/Dockerfile` — Build multi-stage + nginx
+- `docker-compose.yml` — Servicio console en puerto 8088
+- `Makefile` — Targets `console` (abrir browser) y `console-dev` (hot reload)
+- `README.md` — Documentación de consola web
+
+**Acceso:** http://localhost:8088 después de `make up`
 
 ## Fuera del MVP
 

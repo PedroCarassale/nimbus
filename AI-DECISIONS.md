@@ -257,3 +257,38 @@ Formato pedido por la cátedra (AI-DECISIONS.md).
    - Diagrama ASCII de arquitectura
    - Comandos útiles y ejemplo de logs SSE
    - Mantiene documentación detallada existente
+
+---
+
+## Slice 7 — Consola React Mínima
+
+**Problema abordado:** Proveer una interfaz web para que usuarios puedan interactuar con Nimbus sin usar curl. La consola debe permitir crear funciones, subir código (zip), invocar funciones con un editor JSON de eventos, y ver logs en tiempo real via SSE.
+
+**Prompt / Herramienta utilizada:** Cursor Cloud Agent (Claude) — pedido de implementar consola React mínima con Vite, integrada con las APIs existentes del control-plane, UI en español, sin librerías de UI externas.
+
+**Código / Arquitectura generada:**
+
+1. **Aplicación React (`console/`)**
+   - Vite + React 19 + TypeScript como base
+   - `src/api.ts`: Cliente HTTP para todas las APIs del control-plane
+   - `src/types.ts`: Tipos TypeScript para funciones, versiones, invocaciones, logs
+   - `src/pages/FunctionsList.tsx`: Listar y crear funciones
+   - `src/pages/FunctionDetail.tsx`: Deploy (upload zip), invoke (editor JSON), ver resultado
+   - `src/components/LogsPanel.tsx`: Panel de logs SSE en tiempo real
+   - `src/components/JsonEditor.tsx`: Editor JSON con validación
+   - CSS puro con variables CSS, tema oscuro, responsive
+
+2. **Integración con Docker Compose**
+   - `Dockerfile`: Build multi-stage (Node para build, nginx para runtime)
+   - `nginx.conf`: Proxy `/api/` a control-plane, SPA fallback, cache de assets
+   - Servicio `console` en docker-compose.yml escuchando en puerto 8088
+
+3. **DX local**
+   - Proxy de Vite configurable para desarrollo (`npm run dev` en puerto 5173)
+   - `make console`: Abre la consola en el navegador
+   - `make console-dev`: Inicia Vite en modo desarrollo con hot reload
+
+4. **Documentación**
+   - `console/README.md`: Instrucciones de desarrollo y build
+   - `README.md`: Actualizado con consola en arquitectura y comandos
+   - `docs/roadmap.md`: Slice 7 marcado como completado
