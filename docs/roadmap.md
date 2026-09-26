@@ -75,11 +75,21 @@ Criterio de done: `docker compose up`, subir un zip, `POST` invoke por HTTP, rec
 - Esquema de keys: `nimbus:logs:{executionId}` (TTL 1h, max 1000 entries)
 - Invoke response incluye `invocationId`, `executionId`, y `logsUrl`
 
-## Slice 6 — DX local
+## Slice 6 — DX local ✅ HECHO
 
-18. `docker compose up` (Postgres, Redis, MinIO, Nest, Go)
-19. `make hello` = create + deploy + invoke de punta a punta
-20. README: cómo reproducir en 3 comandos
+18. ✅ `docker compose up` (Postgres, Redis, MinIO, Nest, Go) — one-shot reliable con healthchecks
+19. ✅ `make hello` = create + deploy + invoke de punta a punta
+20. ✅ README: cómo reproducir en 3 comandos
+
+**Entregables:**
+- `Makefile` — Targets: `up`, `down`, `hello`, `smoke`, `logs`, `help`
+- `scripts/hello-demo.sh` — Demo MVP end-to-end con output formateado
+- `docker-compose.yml` — Healthcheck de MinIO corregido (curl vs mc)
+- `README.md` — Sección "MVP Demo — 3 Comandos" con arquitectura visual
+
+**MVP Criterion Met:** `make up && make hello` ejecuta todo el flujo sin intervención manual:
+- `docker compose up` levanta Postgres, Redis, MinIO, control-plane, compute-plane
+- `make hello` crea función → despliega zip → invoca → muestra resultado JSON + hint de logs SSE
 
 ## Slice 7 — Consola mínima (opcional para MVP usable)
 

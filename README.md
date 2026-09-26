@@ -9,18 +9,77 @@ Plataforma serverless (estilo Lambda) de Pedro Carassale y Federico Tessadro.
 - **Auditoría IA (cátedra):** [AI-DECISIONS.md](AI-DECISIONS.md)
 - **Instrucciones para agentes:** [agents.md](agents.md)
 
-## Quickstart
+---
+
+## 🚀 MVP Demo — 3 Comandos
+
+**Requisitos:** Docker, Docker Compose, curl, jq, zip
+
+```bash
+# 1. Clonar e ir al directorio
+git clone https://github.com/PedroCarassale/nimbus.git && cd nimbus
+
+# 2. Levantar el stack completo
+make up
+
+# 3. Ejecutar demo end-to-end: crear → desplegar → invocar función
+make hello
+```
+
+Esto demuestra el flujo completo del MVP:
+- **Control Plane** (NestJS): crea función, almacena metadata en Postgres, sube código a MinIO
+- **Compute Plane** (Go): ejecuta la función en Docker aislado con timeout y límites de memoria
+- **Live Logs** (SSE): logs en tiempo real via Redis streams
+
+### Arquitectura
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                          docker compose up                                │
+├──────────────┬──────────────┬──────────────┬──────────────┬──────────────┤
+│   Postgres   │    Redis     │    MinIO     │  Control     │   Compute    │
+│   (metadata) │  (locks/logs)│  (artifacts) │  Plane:3000  │   Plane:8080 │
+└──────────────┴──────────────┴──────────────┴──────┬───────┴───────┬──────┘
+                                                    │ HTTP          │ Docker
+                                                    ▼               ▼
+                                              ┌─────────────────────────────┐
+                                              │  nimbus-node container      │
+                                              │  (isolated: --network=none) │
+                                              └─────────────────────────────┘
+```
+
+### Comandos Útiles
+
+```bash
+make help         # Ver todos los comandos disponibles
+make smoke        # Test completo con verificación de logs SSE
+make logs         # Ver logs de todos los servicios
+make down         # Detener el stack
+make down-clean   # Detener y eliminar volúmenes
+```
+
+### Ver Logs en Tiempo Real (SSE)
+
+Después de invocar una función, puedes ver los logs en streaming:
+
+```bash
+curl -N http://localhost:3000/invocations/{invocationId}/logs
+```
+
+---
+
+## Quickstart Detallado
 
 ### Requisitos
 
 - Docker + Docker Compose
 - Bash
 - zip/unzip
-- AWS CLI o MinIO Client (`mc`) — para artifacts en MinIO
+- curl y jq (para scripts de demo)
 
-### Demo rápida (local)
+### Demo local sin stack (solo runtime)
 
-Ejecuta el ejemplo "hello" con un solo comando:
+Ejecuta el ejemplo "hello" directamente con Docker:
 
 ```bash
 ./scripts/run-hello.sh

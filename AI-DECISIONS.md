@@ -221,3 +221,39 @@ Formato pedido por la cátedra (AI-DECISIONS.md).
    - `invocationId`: ID en Postgres, retornado por invoke
    - `executionId`: UUID generado por Nest, enviado a Go, usado como key de stream
    - Invocation almacena `executionId` para correlación
+
+---
+
+## Slice 6 — DX Local / make hello
+
+**Problema abordado:** Simplificar la experiencia de desarrollo local para que cualquier desarrollador pueda probar el MVP completo de Nimbus con comandos mínimos, sin necesidad de ejecutar pasos manuales de configuración, migraciones, o creación de buckets.
+
+**Prompt / Herramienta utilizada:** Cursor Cloud Agent (Claude) — pedido de implementar Slice 6 según especificación: Makefile con targets up/down/hello, asegurar compose one-shot reliable, README con 3 comandos.
+
+**Código / Arquitectura generada:**
+
+1. **Makefile con targets principales**
+   - `make up`: levanta stack con `docker compose up -d --build` + espera healthchecks
+   - `make down`: detiene stack, `make down-clean`: elimina volúmenes
+   - `make hello`: ejecuta demo completa (create → deploy → invoke → muestra resultado)
+   - `make smoke`: ejecuta smoke-test.sh existente
+   - `make logs`: muestra logs en follow mode
+   - `make help`: documentación inline de todos los targets
+
+2. **Script hello-demo.sh**
+   - Verifica que el stack esté corriendo
+   - Crea función "hello" (o reutiliza existente)
+   - Empaqueta examples/hello en zip
+   - Despliega via API
+   - Invoca y muestra resultado formateado
+   - Incluye hints de logs SSE y comandos para invocar de nuevo
+
+3. **Healthcheck de MinIO corregido**
+   - Cambio de `mc ready local` a `curl -f http://localhost:9000/minio/health/live`
+   - `mc` no está disponible en la imagen base de MinIO, curl sí
+
+4. **README.md actualizado**
+   - Nueva sección "MVP Demo — 3 Comandos" al inicio
+   - Diagrama ASCII de arquitectura
+   - Comandos útiles y ejemplo de logs SSE
+   - Mantiene documentación detallada existente
