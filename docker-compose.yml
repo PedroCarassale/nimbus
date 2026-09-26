@@ -1,0 +1,150 @@
+# Nimbus Functions — Docker Compose
+# Slice 2: MinIO para almacenamiento de artifacts
+# Slice 3: Postgres para metadata + NestJS control plane
+# Slice 4: Redis para concurrencia + Go compute plane
+#
+# Uso: docker compose up -d
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: nimbus-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-nimbus}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nimbus}
+      POSTGRES_DB: ${POSTGRES_DB:-nimbus}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-nimbus} -d ${POSTGRES_DB:-nimbus}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  redis:
+    image: redis:7-alpine
+    container_name: nimbus-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  minio:
+    image: minio/minio:latest
+    container_name: nimbus-minio
+    ports:
+      - "9000:9000"   # API S3
+      - "9001:9001"   # Consola web
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio-data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: nimbus-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-nimbus-artifacts}
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set nimbus http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD};
+        mc mb nimbus/$${MINIO_BUCKET} --ignore-existing;
+        mc anonymous set download nimbus/$${MINIO_BUCKET};
+        echo 'Bucket $${MINIO_BUCKET} listo';
+      "
+
+  compute-plane:
+    build:
+      context: ./compute-plane
+      dockerfile: Dockerfile
+    container_name: nimbus-compute-plane
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      REDIS_URL: redis:6379
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-nimbus-artifacts}
+      NIMBUS_IMAGE: nimbus-node
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./runtime-node:/app/runtime-node:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  control-plane:
+    build:
+      context: ./control-plane
+      dockerfile: Dockerfile
+    container_name: nimbus-control-plane
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-nimbus}:${POSTGRES_PASSWORD:-nimbus}@postgres:5432/${POSTGRES_DB:-nimbus}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-nimbus-artifacts}
+      COMPUTE_PLANE_URL: http://compute-plane:8080
+      REDIS_URL: redis:6379
+      NIMBUS_TIMEOUT_SEC: ${NIMBUS_TIMEOUT_SEC:-5}
+      NIMBUS_MEMORY: ${NIMBUS_MEMORY:-128m}
+      NIMBUS_HANDLER: ${NIMBUS_HANDLER:-handler}
+      NODE_ENV: development
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      compute-plane:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  postgres-data:
+    name: nimbus-postgres-data
+  minio-data:
+    name: nimbus-minio-data
+  redis-data:
+    name: nimbus-redis-data
