@@ -1,12 +1,14 @@
 # Nimbus Functions — Makefile
 # Slice 6: DX local para MVP demo
+# Slice 7: Consola web React
 #
 # Targets principales:
-#   make up      — Levanta todo el stack (Postgres, Redis, MinIO, control/compute planes)
+#   make up      — Levanta todo el stack (Postgres, Redis, MinIO, control/compute planes, console)
 #   make down    — Detiene y limpia el stack
 #   make hello   — Demo completa: crea función hello, despliega, invoca y muestra resultado
 #   make smoke   — Ejecuta smoke test completo
 #   make logs    — Muestra logs de todos los servicios
+#   make console — Abre la consola web en el navegador
 
 .PHONY: up down hello smoke logs build clean wait-healthy help
 
@@ -106,6 +108,20 @@ clean: ## Limpia artifacts generados (dist/)
 	@echo "$(GREEN)>>> Limpieza completada$(NC)"
 
 restart: down up ## Reinicia todo el stack
+
+console: ## Abre la consola web (requiere stack up)
+	@echo "$(GREEN)>>> Consola Nimbus disponible en: http://localhost:8088$(NC)"
+	@echo ">>> Alternativa dev: cd console && npm run dev (http://localhost:5173)"
+	@if command -v xdg-open >/dev/null 2>&1; then \
+		xdg-open http://localhost:8088 2>/dev/null || true; \
+	elif command -v open >/dev/null 2>&1; then \
+		open http://localhost:8088 2>/dev/null || true; \
+	fi
+
+console-dev: ## Inicia consola en modo desarrollo (hot reload)
+	@echo "$(YELLOW)>>> Iniciando consola en modo desarrollo...$(NC)"
+	@echo ">>> Asegúrate de que el stack esté corriendo (make up)"
+	cd console && npm run dev
 
 # Targets de desarrollo
 dev-control: ## Logs en vivo del control plane
