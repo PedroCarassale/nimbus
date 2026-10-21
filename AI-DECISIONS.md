@@ -292,3 +292,20 @@ Formato pedido por la cátedra (AI-DECISIONS.md).
    - `console/README.md`: Instrucciones de desarrollo y build
    - `README.md`: Actualizado con consola en arquitectura y comandos
    - `docs/roadmap.md`: Slice 7 marcado como completado
+
+---
+
+## Roadmaps post-MVP por persona (control plane / compute plane)
+
+**Problema abordado:** Con el MVP terminado, hacía falta dividir el trabajo restante entre Pedro y Federico para avanzar en paralelo, y darle a Federico un resumen de lo construido, ya que no había visto el código.
+
+**Prompt / Herramienta utilizada:** Grok Bot (asistente de Pedro), a pedido de Pedro: armar un roadmap por persona con el resumen del MVP y subirlo al repo.
+
+**Código / Arquitectura generada:**
+
+1. `docs/roadmap-federico.md`: qué es Nimbus, qué está hecho (slices 0–7), flujo de un invoke, estructura y API actual del control plane, observaciones del código actual (nombre único global, sin auth, timeout/memoria fijos, estado `RUNNING` tardío), roadmap del control plane + consola en pasos (auth, config por función, versiones/alias, historial, URL pública, cron, pulido), contrato Nest ↔ Go y reglas del repo.
+2. `docs/roadmap-pedro.md`: estado actual de `compute-plane/` y roadmap del compute plane + infra (concurrencia y cola, config del lado Go, warm containers, async + reintentos + DLQ, observabilidad, Firecracker/multi-runtime, deploy real).
+3. `docs/roadmap.md`: sección "Después del MVP" con links a los dos roadmaps.
+
+División: el compute plane es la parte más compleja (procesos, aislamiento, concurrencia); el control plane concentra el producto que ve el usuario. El punto de integración es el contrato `POST /executions`, que se cambia de forma compatible hacia atrás y documentada en `docs/`.
+

@@ -107,6 +107,13 @@ Criterio de done: `docker compose up`, subir un zip, `POST` invoke por HTTP, rec
 
 **Acceso:** http://localhost:8088 después de `make up`
 
+## Después del MVP
+
+El trabajo post-MVP está dividido en dos roadmaps:
+
+- [`roadmap-federico.md`](roadmap-federico.md): control plane + consola (auth, config por función, versiones/alias, historial, URL pública).
+- [`roadmap-pedro.md`](roadmap-pedro.md): compute plane + infra (concurrencia y cola, warm containers, async/DLQ, observabilidad).
+
 ## Fuera del MVP
 
 - Auth productizada
