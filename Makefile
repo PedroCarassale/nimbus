@@ -10,7 +10,7 @@
 #   make logs    — Muestra logs de todos los servicios
 #   make console — Abre la consola web en el navegador
 
-.PHONY: up down hello smoke logs build clean wait-healthy help
+.PHONY: up down hello smoke load logs build clean wait-healthy help
 
 # Variables
 COMPOSE := docker compose
@@ -70,6 +70,10 @@ hello: ## Demo completa: create → deploy → invoke función hello
 smoke: ## Ejecuta smoke test (create, deploy, invoke, logs, error, timeout)
 	@echo "$(YELLOW)>>> Ejecutando smoke test...$(NC)"
 	@./scripts/smoke-test.sh
+
+load: ## 6 invokes en paralelo: 2 corren, 3 esperan, 1 recibe 429
+	@echo "$(YELLOW)>>> Prueba de concurrencia...$(NC)"
+	@./scripts/load-concurrency.sh
 
 logs: ## Muestra logs de todos los servicios (follow)
 	$(COMPOSE) logs -f

@@ -10,11 +10,11 @@ compute-plane/
   cmd/server/main.go            # servidor HTTP (chi) en :8080
   internal/handlers/            # POST /executions, POST /executions/:id/cancel, GET /health
   internal/executor/            # baja el zip de MinIO, lo extrae y corre docker run
-  internal/concurrency/         # lock en Redis: nimbus:lock:fn:{functionId} (máx. 1 a la vez)
+  internal/concurrency/         # semáforo + cola FIFO en Redis (N por función, tope global)
   internal/logs/                # escribe stdout/stderr en nimbus:logs:{executionId}
   internal/minio/               # cliente S3
 ```
-- Si una función ya se está ejecutando, la segunda invocación no espera en una cola.
+- Cada función admite N ejecuciones a la vez (`NIMBUS_FN_CONCURRENCY`, default 2). El resto espera en una cola FIFO de Redis, con tope (`NIMBUS_FN_QUEUE_MAX`) y 429 si se llena. Hay un tope global de ejecuciones por proceso (`NIMBUS_MAX_CONTAINERS`). Detalle en [`concurrencia.md`](concurrencia.md).
 - Cada invoke crea un container nuevo (cold start siempre).
 - Todas las invocaciones son sincrónicas.
 
@@ -23,10 +23,10 @@ compute-plane/
 - [x] Tests del compute plane (Go) + CI en GitHub Actions.
 
 ### Paso 1 — Concurrencia real y cola
-- [ ] Permitir N ejecuciones simultáneas por función (configurable).
-- [ ] Cola en Redis: si se llega al máximo, la invocación espera turno.
-- [ ] Límite de cola y rechazo claro (`429`) cuando se llena.
-- [ ] Límite global de containers por máquina.
+- [x] Permitir N ejecuciones simultáneas por función (configurable).
+- [x] Cola en Redis: si se llega al máximo, la invocación espera turno.
+- [x] Límite de cola y rechazo claro (`429`) cuando se llena.
+- [x] Límite global de containers por máquina.
 
 ### Paso 2 — Configuración por función (lado Go)
 - [ ] Recibir y aplicar `timeoutSec`, `memoryMb`, `envVars` y `handler` desde el contrato.

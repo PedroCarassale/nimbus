@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 
@@ -16,10 +17,10 @@ type runner interface {
 	Execute(ctx context.Context, req *executor.ExecutionRequest) *executor.ExecutionResult
 }
 
-// locker is the per-function Redis lock. *concurrency.Manager implements it.
+// locker admits executions through the Redis semaphore. *concurrency.Manager implements it.
 type locker interface {
-	AcquireLock(ctx context.Context, functionID, executionID string) (bool, error)
-	ReleaseLock(ctx context.Context, functionID, executionID string) error
+	Acquire(ctx context.Context, functionID, executionID string, maxConcurrency int) (queuedMs int64, err error)
+	Release(ctx context.Context, functionID, executionID string) error
 	MarkForCancellation(ctx context.Context, executionID string) error
 }
 
@@ -41,13 +42,14 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 }
 
 type StartExecutionRequest struct {
-	ExecutionID string                 `json:"executionId"`
-	FunctionID  string                 `json:"functionId"`
-	Version     string                 `json:"version"`
-	Event       map[string]interface{} `json:"event"`
-	TimeoutSec  int                    `json:"timeoutSec"`
-	MemoryMB    int                    `json:"memoryMb"`
-	Handler     string                 `json:"handler"`
+	ExecutionID    string                 `json:"executionId"`
+	FunctionID     string                 `json:"functionId"`
+	Version        string                 `json:"version"`
+	Event          map[string]interface{} `json:"event"`
+	TimeoutSec     int                    `json:"timeoutSec"`
+	MemoryMB       int                    `json:"memoryMb"`
+	Handler        string                 `json:"handler"`
+	MaxConcurrency int                    `json:"maxConcurrency,omitempty"`
 }
 
 type StartExecutionResponse struct {
@@ -57,6 +59,7 @@ type StartExecutionResponse struct {
 	Error       string      `json:"error,omitempty"`
 	ExitCode    int         `json:"exitCode"`
 	DurationMs  int64       `json:"durationMs"`
+	QueuedMs    int64       `json:"queuedMs"`
 }
 
 func (h *Handler) StartExecution(w http.ResponseWriter, r *http.Request) {
@@ -73,25 +76,21 @@ func (h *Handler) StartExecution(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[handler] StartExecution: %s (fn: %s, v: %s)", req.ExecutionID, req.FunctionID, req.Version)
 
-	acquired, err := h.concurrency.AcquireLock(r.Context(), req.FunctionID, req.ExecutionID)
-	if err != nil {
-		log.Printf("[handler] Error adquiriendo lock: %v", err)
-		http.Error(w, `{"error": "Error interno adquiriendo lock"}`, http.StatusInternalServerError)
-		return
+	maxConcurrency := req.MaxConcurrency
+	if maxConcurrency < 0 {
+		maxConcurrency = 0
 	}
-	if !acquired {
-		log.Printf("[handler] No se pudo adquirir lock para función %s (concurrencia máxima)", req.FunctionID)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusTooManyRequests)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"error":       "Función ocupada, reintente más tarde",
-			"executionId": req.ExecutionID,
-			"retryAfter":  5,
-		})
+	queuedMs, err := h.concurrency.Acquire(r.Context(), req.FunctionID, req.ExecutionID, maxConcurrency)
+	if err != nil {
+		writeAdmissionError(w, req.ExecutionID, queuedMs, err)
 		return
 	}
 
-	defer h.concurrency.ReleaseLock(r.Context(), req.FunctionID, req.ExecutionID)
+	defer func() {
+		if releaseErr := h.concurrency.Release(context.WithoutCancel(r.Context()), req.FunctionID, req.ExecutionID); releaseErr != nil {
+			log.Printf("[handler] Error liberando slot: %v", releaseErr)
+		}
+	}()
 
 	execReq := &executor.ExecutionRequest{
 		ExecutionID: req.ExecutionID,
@@ -112,6 +111,7 @@ func (h *Handler) StartExecution(w http.ResponseWriter, r *http.Request) {
 		Error:       result.Error,
 		ExitCode:    result.ExitCode,
 		DurationMs:  result.DurationMs,
+		QueuedMs:    queuedMs,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -129,6 +129,56 @@ type CancelExecutionResponse struct {
 	ExecutionID string `json:"executionId"`
 	Cancelled   bool   `json:"cancelled"`
 	Message     string `json:"message"`
+}
+
+func writeAdmissionError(w http.ResponseWriter, executionID string, queuedMs int64, err error) {
+	w.Header().Set("Content-Type", "application/json")
+	switch {
+	case errors.Is(err, concurrency.ErrQueueFull):
+		log.Printf("[handler] Cola llena, ejecución %s rechazada", executionID)
+		w.Header().Set("Retry-After", "5")
+		w.WriteHeader(http.StatusTooManyRequests)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error":       "Cola llena para esta función",
+			"executionId": executionID,
+			"retryAfter":  5,
+			"reason":      "queue_full",
+			"queuedMs":    queuedMs,
+		})
+	case errors.Is(err, concurrency.ErrWaitTimeout):
+		log.Printf("[handler] Tiempo de espera en cola agotado para %s", executionID)
+		w.Header().Set("Retry-After", "5")
+		w.WriteHeader(http.StatusTooManyRequests)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error":       "Tiempo máximo de espera en cola excedido",
+			"executionId": executionID,
+			"retryAfter":  5,
+			"reason":      "queue_timeout",
+			"queuedMs":    queuedMs,
+		})
+	case errors.Is(err, concurrency.ErrCancelled):
+		log.Printf("[handler] Ejecución %s cancelada en la cola", executionID)
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error":       "Ejecución cancelada mientras esperaba en la cola",
+			"executionId": executionID,
+			"queuedMs":    queuedMs,
+		})
+	case errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
+		w.WriteHeader(http.StatusRequestTimeout)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error":       "La solicitud de ejecución fue cancelada",
+			"executionId": executionID,
+			"queuedMs":    queuedMs,
+		})
+	default:
+		log.Printf("[handler] Error de admisión: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error":       "Error interno de admisión",
+			"executionId": executionID,
+		})
+	}
 }
 
 func (h *Handler) CancelExecution(w http.ResponseWriter, r *http.Request) {

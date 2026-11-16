@@ -139,11 +139,14 @@ Es el punto de integración entre control plane y compute plane. Hoy, `POST /exe
   "event": {},
   "timeoutSec": 5,
   "memoryMb": 128,
-  "handler": "handler"
+  "handler": "handler",
+  "maxConcurrency": 2
 }
 ```
 
-Y devuelve `{ executionId, success, output, error, exitCode, durationMs }`.
+`maxConcurrency` es opcional. Si no viene, Go usa `NIMBUS_FN_CONCURRENCY`. La respuesta de una ejecución que entró es `{ executionId, success, output, error, exitCode, durationMs, queuedMs }`. `queuedMs` son los milisegundos esperados en la cola (`0` si entró directo).
+
+Si la cola de la función está llena, o se vence la espera, Go responde **429** con `reason` `queue_full` o `queue_timeout`. El control plane lo traduce a **429 Too Many Requests** en `POST /functions/:id/invoke`. El detalle del semáforo, la cola y el tope global está en [`concurrencia.md`](concurrencia.md).
 
 Reglas:
 - Todo campo nuevo que el control plane necesite de Go (variables de entorno, invocación async, etc.) se define primero en `docs/` y después se implementa en cada lado.
