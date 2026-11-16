@@ -10,7 +10,7 @@
 #   make logs    — Muestra logs de todos los servicios
 #   make console — Abre la consola web en el navegador
 
-.PHONY: up down hello smoke load config-check warm-check async-check obs obs-check logs build clean wait-healthy help
+.PHONY: up down hello smoke load config-check warm-check async-check obs obs-check qa logs build clean wait-healthy help
 
 # Variables
 COMPOSE := docker compose
@@ -106,6 +106,10 @@ obs: ## Prometheus, Grafana, Jaeger y el collector (perfil obs, aparte de make u
 obs-check: ## Tráfico real y consulta a Prometheus, Grafana y Jaeger
 	@echo "$(YELLOW)>>> Prueba de observabilidad...$(NC)"
 	@./scripts/obs-check.sh
+
+qa: ## QA profundo de los pasos 0–5 (consola, stress, restarts, seguridad)
+	@echo "$(YELLOW)>>> QA profundo...$(NC)"
+	@./scripts/qa-deep.sh
 
 logs: ## Muestra logs de todos los servicios (follow)
 	$(COMPOSE) logs -f

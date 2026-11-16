@@ -199,7 +199,9 @@ services:
       control-plane:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:80"]
+      # wget resuelve localhost a ::1 y nginx escucha en IPv4. 127.0.0.1 evita
+      # un healthcheck que falla para siempre con "connection refused".
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:80"]
       interval: 10s
       timeout: 5s
       retries: 5

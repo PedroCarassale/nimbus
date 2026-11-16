@@ -20,7 +20,7 @@ func TestWorkerRetriesThenDLQ(t *testing.T) {
 	var calls atomic.Int32
 	worker := NewWorker(cq.q, func(context.Context, json.RawMessage) RunResult {
 		calls.Add(1)
-		return RunResult{Kind: KindRetry, Error: "boom", ExitCode: 1}
+		return RunResult{Kind: KindRetry, Error: "boom", ExitCode: 1, DurationMs: 42}
 	})
 	ctx := context.Background()
 	if _, _, err := cq.q.Enqueue(ctx, "inv-1", "exec-1", jobBody(t, "exec-1")); err != nil {
@@ -90,6 +90,9 @@ func TestWorkerRetriesThenDLQ(t *testing.T) {
 	}
 	if st.Phase != PhaseDead || st.Result == nil || st.Result.Status != "ERROR" || st.Result.Attempts != 3 {
 		t.Fatalf("state %+v", st)
+	}
+	if st.Result.DurationMs != 42 {
+		t.Fatalf("DLQ result dropped durationMs: %+v", st.Result)
 	}
 }
 

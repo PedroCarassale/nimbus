@@ -109,6 +109,10 @@ El mismo texto se usa si Node aborta con “JavaScript heap out of memory” (ex
 
 El aislamiento anterior no cambia: `--network=none`, `--read-only`, `--pids-limit=256`. Con el pool warm el container además corre como el usuario `node` y acepta varios invokes; el contrato de memoria, CPU, handler y `envVars` es el mismo. Ver [`warm.md`](warm.md).
 
+## Zip del artifact
+
+Go descomprime el zip en el host, bajo `NIMBUS_WORK_DIR`, antes de crear el container. Un path con `..` que salga del directorio de la versión se rechaza. Un symlink también se rechaza. El total descomprimido no puede pasar de 32 MiB y el zip no puede traer más de 4096 entradas. Si se pasa, la invocación falla con `Error extrayendo zip` y no deja el archivo afuera.
+
 ## Qué manda Nest hoy
 
 No hay campos nuevos en Prisma. `control-plane/src/functions/runner.service.ts` sigue armando el body así, con variables de entorno del control plane y no con la config de la función:
