@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/cancel"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/fnconfig"
 )
 
@@ -192,6 +193,48 @@ func TestPoolKeySeparatesConfig(t *testing.T) {
 	p.Run(context.Background(), cases[2], Invocation{ExecutionID: "2"})
 	if got := len(starter.list()); got != 2 {
 		t.Fatalf("different handlers started %d sessions", got)
+	}
+}
+
+func TestPoolCancelDiscardsBusySession(t *testing.T) {
+	p, _ := testPool(t, Config{IdleTTL: time.Minute, MaxPerFunction: 2, GlobalMax: 4})
+	busy := &fakeSession{id: "busy", initMs: 5, hold: make(chan struct{}), entered: make(chan struct{}, 1)}
+	next := &fakeSession{id: "next", initMs: 6}
+	p.starter = &scriptedStarter{sessions: []*fakeSession{busy, next}}
+	spec := specOf("fn", "v1", "handler", 128, 0)
+
+	ctx, stop := context.WithCancelCause(context.Background())
+	done := make(chan Outcome, 1)
+	go func() {
+		out, _ := p.Run(ctx, spec, Invocation{ExecutionID: "run-1"})
+		done <- out
+	}()
+	select {
+	case <-busy.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("invoke did not start")
+	}
+	stop(cancel.ErrRun)
+
+	var out Outcome
+	select {
+	case out = <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled invoke did not return")
+	}
+	if out.Success || !out.Tainted || out.Error != cancel.Message || out.ExitCode != cancel.ExitCode {
+		t.Fatalf("cancel out=%+v", out)
+	}
+	if _, destroyed := busy.snapshot(); !destroyed {
+		t.Fatal("cancelled warm session was kept")
+	}
+	if p.Idle() != 0 {
+		t.Fatalf("idle after cancel = %d", p.Idle())
+	}
+
+	out, meta := p.Run(context.Background(), spec, Invocation{ExecutionID: "run-2"})
+	if !out.Success || !meta.ColdStart {
+		t.Fatalf("next invoke reused the cancelled container out=%+v meta=%+v", out, meta)
 	}
 }
 

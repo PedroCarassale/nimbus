@@ -48,6 +48,10 @@ type Manager struct {
 
 	mu    sync.Mutex
 	stops map[string]context.CancelFunc
+
+	sweepStop     chan struct{}
+	sweepStopOnce sync.Once
+	sweepStart    sync.Once
 }
 
 func NewManager(rdb *redis.Client, cfg Config) *Manager {
@@ -78,6 +82,7 @@ func NewManager(rdb *redis.Client, cfg Config) *Manager {
 		machineID: machineID(),
 		now:       time.Now,
 		stops:     make(map[string]context.CancelFunc),
+		sweepStop: make(chan struct{}),
 	}
 }
 
@@ -382,12 +387,113 @@ func (m *Manager) stopKeepAlive(executionID string) {
 }
 
 func (m *Manager) stopAll() {
+	m.stopSweeper()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for id, cancel := range m.stops {
 		cancel()
 		delete(m.stops, id)
 	}
+}
+
+func (m *Manager) stopSweeper() {
+	if m.sweepStop == nil {
+		return
+	}
+	m.sweepStopOnce.Do(func() { close(m.sweepStop) })
+}
+
+// StartSweeper drops expired slot leases and deletes machine keys that belong
+// to a process which is no longer refreshing them. A dead compute plane keeps
+// nimbus:slots:machine:{hostname} until the lease timestamp is in the past;
+// admission only sweeps the key of the process that is running.
+func (m *Manager) StartSweeper() {
+	m.sweepStart.Do(func() {
+		// The first pass is synchronous so a restart drops expired keys
+		// before accepting work. The ticker covers leases that expire later.
+		if _, err := m.SweepStaleSlots(context.Background()); err != nil {
+			log.Printf("[concurrency] barrido de slots: %v", err)
+		}
+		go m.sweepLoop()
+	})
+}
+
+func (m *Manager) sweepLoop() {
+	interval := m.cfg.Lease / 2
+	if interval < time.Second {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-m.sweepStop:
+			return
+		case <-ticker.C:
+			n, err := m.SweepStaleSlots(context.Background())
+			if err != nil {
+				log.Printf("[concurrency] barrido de slots: %v", err)
+				continue
+			}
+			if n > 0 {
+				log.Printf("[concurrency] slots vencidos eliminados: %d keys", n)
+			}
+		}
+	}
+}
+
+// SweepStaleSlots removes expired members from per-function and per-machine
+// slot sets. A key with nothing left is deleted. Queue keys are not touched:
+// their score is a FIFO ticket, not a lease.
+// Live members (score in the future) of another host stay, so a second
+// compute plane does not lose its own slots.
+func (m *Manager) SweepStaleSlots(ctx context.Context) (int, error) {
+	now := strconv.FormatInt(m.now().UnixMilli(), 10)
+	removed := 0
+	for _, pattern := range []string{"nimbus:slots:machine:*", "nimbus:slots:fn:*"} {
+		n, err := m.sweepPattern(ctx, pattern, now)
+		if err != nil {
+			return removed, err
+		}
+		removed += n
+	}
+	return removed, nil
+}
+
+func (m *Manager) sweepPattern(ctx context.Context, pattern, now string) (int, error) {
+	removed := 0
+	seen := map[string]struct{}{}
+	var cursor uint64
+	for {
+		keys, next, err := m.rdb.Scan(ctx, cursor, pattern, 100).Result()
+		if err != nil {
+			return removed, err
+		}
+		for _, key := range keys {
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			if err := m.rdb.ZRemRangeByScore(ctx, key, "-inf", now).Err(); err != nil {
+				return removed, err
+			}
+			n, err := m.rdb.ZCard(ctx, key).Result()
+			if err != nil {
+				return removed, err
+			}
+			if n == 0 {
+				if err := m.rdb.Del(ctx, key).Err(); err != nil {
+					return removed, err
+				}
+				removed++
+			}
+		}
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	return removed, nil
 }
 
 func parseStatus(res interface{}) (string, error) {

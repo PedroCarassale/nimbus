@@ -78,7 +78,7 @@ Si el request trae `traceparent`, el job lo guarda y el worker sigue en esa traz
 | Handler que lanza, exit distinto de 0, OOM | sí |
 | Timeout (exit 124) | sí |
 | 429 de la cola de concurrencia, o el worker se cayó a mitad | sí |
-| 400 de validación, o cancelación explícita (409) | no, y no entra a la DLQ |
+| 400 de validación, o cancelación explícita (409), esté en cola o ya corriendo | no, y no entra a la DLQ |
 
 `NIMBUS_ASYNC_MAX_ATTEMPTS` cuenta el primer intento. El default es **3**: un intento y dos reintentos, como Lambda. El tiempo de espera después del intento `n` es `min(max, base * 2^(n-1))` más un jitter aleatorio entre 0 y `NIMBUS_ASYNC_BACKOFF_JITTER_MS`.
 
@@ -100,7 +100,9 @@ Estos endpoints están en el compute plane (`:8080`), no en Nest.
 `POST /executions/:id/cancel` usa el `executionId` que devolvió el 202. Desde el enqueue existe el hash `nimbus:exec:{executionId}` con estado `pending`, así que cancelar antes de que un worker lo tome no responde 404.
 
 - Si todavía no arrancó (está en el stream, en el backoff o en la cola FIFO), el intento termina en `ERROR` con el texto de cancelación y no entra a la DLQ.
-- Si ya está corriendo, queda marcado y el container sigue hasta que el handler termina o vence el timeout. El flag no mata el proceso.
+- Si ya está corriendo, el compute plane mata el container y no lo devuelve al pool warm. El intento termina en `ERROR` con `"Ejecución cancelada"`, `exitCode` 130, y no se reintenta ni entra a la DLQ. `durationMs` es el tiempo hasta el corte.
+
+`InvocationStatus` en Prisma no tiene `CANCELLED`. Se usa `ERROR` con ese mensaje. El consumidor de Nest ya aplica un resultado `ERROR`; no hay cambio de código en el control plane.
 
 ## Si se cae el proceso
 

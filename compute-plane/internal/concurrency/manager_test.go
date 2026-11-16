@@ -566,6 +566,55 @@ func TestReleaseDoesNotDropAnotherSlot(t *testing.T) {
 	}
 }
 
+func TestSweepStaleSlotsDropsDeadHostsOnly(t *testing.T) {
+	m := newTestManager(t)
+	ctx := context.Background()
+	now := m.now().UnixMilli()
+
+	if err := m.rdb.ZAdd(ctx, "nimbus:slots:machine:dead-host", redis.Z{Score: float64(now - 1000), Member: "ghost"}).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.rdb.ZAdd(ctx, "nimbus:slots:machine:live-peer", redis.Z{Score: float64(now + 60_000), Member: "alive"}).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.rdb.ZAdd(ctx, m.globalKey(), redis.Z{Score: float64(now - 50), Member: "old"}, redis.Z{Score: float64(now + 60_000), Member: "current"}).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.rdb.ZAdd(ctx, "nimbus:slots:fn:old-fn", redis.Z{Score: float64(now - 10), Member: "gone"}).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.rdb.ZAdd(ctx, "nimbus:queue:fn:old-fn", redis.Z{Score: 1, Member: "waiter"}).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := m.SweepStaleSlots(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("deleted keys = %d, want 2 (dead host and empty function set)", n)
+	}
+	if exists, _ := m.rdb.Exists(ctx, "nimbus:slots:machine:dead-host").Result(); exists != 0 {
+		t.Fatal("dead host key still present")
+	}
+	if exists, _ := m.rdb.Exists(ctx, "nimbus:slots:fn:old-fn").Result(); exists != 0 {
+		t.Fatal("empty function slot key still present")
+	}
+	score, err := m.rdb.ZScore(ctx, "nimbus:slots:machine:live-peer", "alive").Result()
+	if err != nil || score < float64(now) {
+		t.Fatalf("live peer slot = %v err=%v", score, err)
+	}
+	if _, err := m.rdb.ZScore(ctx, m.globalKey(), "old").Result(); !errors.Is(err, redis.Nil) {
+		t.Fatalf("expired member on the current host was kept: %v", err)
+	}
+	if _, err := m.rdb.ZScore(ctx, m.globalKey(), "current").Result(); err != nil {
+		t.Fatalf("live member on the current host was dropped: %v", err)
+	}
+	if n, err := m.rdb.ZCard(ctx, "nimbus:queue:fn:old-fn").Result(); err != nil || n != 1 {
+		t.Fatalf("queue was swept: n=%d err=%v", n, err)
+	}
+}
+
 func TestKeyFormat(t *testing.T) {
 	m := newTestManager(t)
 	if got := m.slotsKey("abc"); got != "nimbus:slots:fn:abc" {

@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/cancel"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/fnconfig"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/logs"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/metrics"
@@ -112,10 +113,30 @@ func (e *Executor) Shutdown(ctx context.Context) {
 }
 
 func (e *Executor) Execute(ctx context.Context, req *ExecutionRequest) *ExecutionResult {
+	var result *ExecutionResult
 	if e.pool != nil {
-		return e.executeWarm(ctx, req)
+		result = e.executeWarm(ctx, req)
+	} else {
+		result = e.executeCold(ctx, req)
 	}
-	return e.executeCold(ctx, req)
+	if result == nil {
+		result = &ExecutionResult{ExecutionID: req.ExecutionID, ExitCode: 1}
+	}
+	applyUserCancel(ctx, result)
+	return result
+}
+
+// applyUserCancel replaces whatever the handler returned when the user
+// cancelled the run. docker rm -f exits 137, which would otherwise look
+// like an OOM, and a frame that won the race would look like success.
+func applyUserCancel(ctx context.Context, result *ExecutionResult) {
+	if result == nil || !cancel.Is(ctx) {
+		return
+	}
+	result.Success = false
+	result.Output = nil
+	result.Error = cancel.Message
+	result.ExitCode = cancel.ExitCode
 }
 
 func (e *Executor) executeCold(ctx context.Context, req *ExecutionRequest) *ExecutionResult {
@@ -127,7 +148,8 @@ func (e *Executor) executeCold(ctx context.Context, req *ExecutionRequest) *Exec
 	}
 
 	logWriter := logs.NewStreamWriter(e.rdb, req.ExecutionID)
-	defer logWriter.Close(ctx)
+	// WithoutCancel: a user cancel must still write the _end marker and the TTL.
+	defer logWriter.Close(context.WithoutCancel(ctx))
 
 	ntrace.Logf(ctx, "[executor] Iniciando ejecución %s (fn: %s, version: %s)", req.ExecutionID, req.FunctionID, req.Version)
 	logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Iniciando ejecución %s", req.ExecutionID))
@@ -228,8 +250,21 @@ func (e *Executor) runDockerWithStreaming(ctx context.Context, executionID, work
 	// User env values are secrets. The log line keeps the keys and redacts the values.
 	log.Printf("[executor] docker %s", formatArgsForLog(args))
 
-	timeoutCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.TimeoutSec)*time.Second)
-	defer cancel()
+	timeoutCtx, cancelTimeout := context.WithTimeout(ctx, time.Duration(cfg.TimeoutSec)*time.Second)
+	defer cancelTimeout()
+	// Close the watcher before the timeout context is cancelled on the way
+	// out, so a normal exit does not docker rm before OOMKilled is read.
+	killDone := make(chan struct{})
+	defer close(killDone)
+	go func() {
+		select {
+		case <-timeoutCtx.Done():
+			if cancel.Is(timeoutCtx) {
+				removeContainer(name)
+			}
+		case <-killDone:
+		}
+	}()
 
 	cmd := exec.CommandContext(timeoutCtx, "docker", args...)
 	cmd.WaitDelay = 3 * time.Second
@@ -291,20 +326,32 @@ func (e *Executor) runDockerWithStreaming(ctx context.Context, executionID, work
 	waitErr := cmd.Wait()
 
 	timedOut := errors.Is(timeoutCtx.Err(), context.DeadlineExceeded)
+	userCancel := cancel.Is(timeoutCtx)
 	exitCode := exitCodeFrom(waitErr, timedOut)
+	if userCancel {
+		exitCode = cancel.ExitCode
+	}
 
 	stdoutStr := stdoutBuf.String()
 	stderrStr := stderrBuf.String()
 	// A deadline kill is SIGKILL too. Inspect OOM only when the deadline
 	// did not fire, then always remove the container (--rm would drop it
-	// before we can read OOMKilled).
+	// before we can read OOMKilled). A user cancel also kills with SIGKILL;
+	// that is not an OOM.
 	oom := false
-	if !timedOut && exitCode != 0 {
+	if !timedOut && !userCancel && exitCode != 0 {
 		oom = containerOOMKilled(name) || exitCode == 137 || heapOOM(stderrStr)
 	}
 	removeContainer(name)
 
 	output, ok := parseOutput(stdoutStr)
+	if userCancel {
+		return dockerResult{
+			success:  false,
+			exitCode: cancel.ExitCode,
+			stderr:   cancel.Message,
+		}
+	}
 	return dockerResult{
 		success:  exitCode == 0 && ok,
 		output:   output,
@@ -446,12 +493,40 @@ func containerName(executionID string) string {
 }
 
 func removeContainer(name string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "docker", "rm", "-f", name)
-	if err := cmd.Run(); err != nil {
-		log.Printf("[executor] no se pudo borrar el container %s: %v", name, err)
+	if name == "" {
+		return
 	}
+	// Cancel fires one rm from the watcher and another after docker run
+	// returns. The second often sees "removal already in progress" and the
+	// container is still listed until the first rm finishes. Wait it out so
+	// the HTTP response does not return while the container is still up.
+	deadline := time.Now().Add(15 * time.Second)
+	var lastErr string
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		cmd := exec.CommandContext(ctx, "docker", "rm", "-f", name)
+		out, err := cmd.CombinedOutput()
+		cancel()
+		text := strings.TrimSpace(string(out))
+		if err == nil || strings.Contains(text, "No such container") {
+			return
+		}
+		lastErr = text
+		if !containerExists(name) || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if containerExists(name) {
+		log.Printf("[executor] no se pudo borrar el container %s: %s", name, lastErr)
+	}
+}
+
+func containerExists(name string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "docker", "inspect", "-f", "{{.Id}}", name)
+	return cmd.Run() == nil
 }
 
 func exitCodeFrom(err error, timedOut bool) int {

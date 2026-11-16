@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/cancel"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/fnconfig"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/logs"
 	"github.com/alicebob/miniredis/v2"
@@ -32,6 +33,33 @@ func testConfig(t *testing.T) fnconfig.Resolved {
 		t.Fatal(err)
 	}
 	return cfg
+}
+
+func TestApplyUserCancelOverridesSuccess(t *testing.T) {
+	ctx, stop := context.WithCancelCause(context.Background())
+	stop(cancel.ErrRun)
+	result := &ExecutionResult{
+		ExecutionID: "exec",
+		Success:     true,
+		Output:      map[string]interface{}{"slept": 2500},
+		ExitCode:    0,
+		DurationMs:  400,
+		ColdStart:   false,
+	}
+	applyUserCancel(ctx, result)
+	if result.Success || result.Output != nil || result.Error != cancel.Message || result.ExitCode != cancel.ExitCode {
+		t.Fatalf("cancelled result = %+v", result)
+	}
+	if result.DurationMs != 400 || result.ColdStart {
+		t.Fatalf("timing was rewritten: %+v", result)
+	}
+
+	okCtx := context.Background()
+	kept := &ExecutionResult{Success: true, ExitCode: 0, Output: "ok"}
+	applyUserCancel(okCtx, kept)
+	if !kept.Success || kept.Output != "ok" {
+		t.Fatalf("uncancelled result changed: %+v", kept)
+	}
 }
 
 func TestDockerRunArgsIsolation(t *testing.T) {

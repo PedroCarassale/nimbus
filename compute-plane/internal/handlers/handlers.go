@@ -8,6 +8,7 @@ import (
 	"net/http"
 
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/async"
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/cancel"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/concurrency"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/executor"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/fnconfig"
@@ -36,6 +37,7 @@ type Handler struct {
 	concurrency locker
 	defaults    fnconfig.Defaults
 	queue       *async.Queue
+	runs        *runStops
 }
 
 func New(exec *executor.Executor, concMgr *concurrency.Manager) *Handler {
@@ -47,6 +49,7 @@ func NewWithDefaults(exec *executor.Executor, concMgr *concurrency.Manager, defa
 		executor:    exec,
 		concurrency: concMgr,
 		defaults:    defaults,
+		runs:        newRunStops(),
 	}
 }
 
@@ -176,7 +179,32 @@ func (h *Handler) dispatch(ctx context.Context, req StartExecutionRequest, mode 
 		Config:      resolved,
 	}
 
-	result := h.executor.Execute(ctx, execReq)
+	// The request context stays alive for the HTTP call. Cancel is a second
+	// request, so it has to abort this one explicitly.
+	runCtx, stop := context.WithCancelCause(ctx)
+	if h.runs != nil {
+		h.runs.track(req.ExecutionID, stop)
+	}
+	if alreadyCancelled(h.concurrency, ctx, req.ExecutionID) {
+		stop(cancel.ErrRun)
+	}
+	result := h.executor.Execute(runCtx, execReq)
+	wasCancelled := cancel.Is(runCtx) || (result != nil && (result.ExitCode == cancel.ExitCode || result.Error == cancel.Message))
+	if h.runs != nil {
+		h.runs.untrack(req.ExecutionID)
+	}
+	if !wasCancelled {
+		stop(context.Canceled)
+	}
+	if result == nil {
+		result = &executor.ExecutionResult{ExecutionID: req.ExecutionID, ExitCode: 1}
+	}
+	if wasCancelled {
+		result.Success = false
+		result.Output = nil
+		result.Error = cancel.Message
+		result.ExitCode = cancel.ExitCode
+	}
 	resp := StartExecutionResponse{
 		ExecutionID: result.ExecutionID,
 		Success:     result.Success,
@@ -190,10 +218,28 @@ func (h *Handler) dispatch(ctx context.Context, req StartExecutionRequest, mode 
 	}
 	outcome := metrics.Classify(result.Success, result.ExitCode, result.Error)
 	metrics.RecordInvocation(req.FunctionID, mode, outcome, result.DurationMs, result.ColdStart, result.InitMs)
+	if wasCancelled {
+		log.Printf("[handler] Ejecución %s cancelada (duration: %dms)", req.ExecutionID, result.DurationMs)
+		return http.StatusConflict, resp
+	}
 	if !result.Success && result.ExitCode == 124 {
 		return http.StatusGatewayTimeout, resp
 	}
 	return http.StatusOK, resp
+}
+
+// cancelState is implemented by *concurrency.Manager. Tests that use a fake
+// locker do not have to report a flag.
+type cancelState interface {
+	IsCancelled(ctx context.Context, executionID string) bool
+}
+
+func alreadyCancelled(l locker, ctx context.Context, executionID string) bool {
+	checker, ok := l.(cancelState)
+	if !ok {
+		return false
+	}
+	return checker.IsCancelled(ctx, executionID)
 }
 
 func (h *Handler) validate(req StartExecutionRequest) (fnconfig.Resolved, int, any) {
@@ -304,6 +350,11 @@ func (h *Handler) CancelExecution(w http.ResponseWriter, r *http.Request) {
 			Message:     err.Error(),
 		})
 		return
+	}
+	// Queued and pending executions observe the Redis flag. A running one
+	// is in this process: abort kills its container and discards a warm slot.
+	if h.runs != nil {
+		h.runs.abort(executionID)
 	}
 
 	w.Header().Set("Content-Type", "application/json")

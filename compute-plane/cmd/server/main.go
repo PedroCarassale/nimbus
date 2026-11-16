@@ -63,6 +63,7 @@ func main() {
 	log.Printf("[compute-plane] Config por función: timeout=%ds memory=%dMB handler=%s cpus=%s",
 		fnDefaults.TimeoutSec, fnDefaults.MemoryMB, fnDefaults.Handler, fnDefaults.CPUsLabel())
 	concurrencyMgr := concurrency.NewManager(rdb, concCfg)
+	concurrencyMgr.StartSweeper()
 	if err := warm.CleanupOrphans(ctx); err != nil {
 		log.Printf("[compute-plane] No se pudieron limpiar containers warm anteriores: %v", err)
 	}

@@ -209,7 +209,7 @@ curl -X POST http://localhost:3000/functions/{FN_ID}/invoke \
 | GET | `/health` | Health check |
 | GET | `/metrics` | Métricas Prometheus |
 | POST | `/executions` | Ejecutar función (Nest → Go) |
-| POST | `/executions/:id/cancel` | Cancelar ejecución |
+| POST | `/executions/:id/cancel` | Cancelar ejecución. En cola no arranca. Si ya corre, mata el container |
 | POST | `/async/jobs` | Encolar una invocación async (Nest → Go). Responde 202 |
 | GET | `/dlq` | Listar la DLQ |
 | POST | `/dlq/:id/redrive` | Volver a encolar una entrada de la DLQ |

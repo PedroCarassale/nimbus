@@ -9,11 +9,15 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/cancel"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/concurrency"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/executor"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/metrics"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/go-chi/chi/v5"
+	"github.com/redis/go-redis/v9"
 )
 
 type fakeRunner struct {
@@ -73,6 +77,28 @@ func (f *fakeLocker) Release(context.Context, string, string) error {
 	f.releaseCalls++
 	f.mu.Unlock()
 	return nil
+}
+
+// blockingRunner waits until ctx is cancelled, then returns success.
+// A real cancel has to override that success: the handler already finished
+// from the runner's point of view only because we killed its context.
+type blockingRunner struct {
+	started chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingRunner) Execute(ctx context.Context, req *executor.ExecutionRequest) *executor.ExecutionResult {
+	if b.started != nil {
+		b.once.Do(func() { close(b.started) })
+	}
+	<-ctx.Done()
+	return &executor.ExecutionResult{
+		ExecutionID: req.ExecutionID,
+		Success:     true,
+		Output:      map[string]interface{}{"slept": 2500},
+		ExitCode:    0,
+		DurationMs:  2500,
+	}
 }
 
 func (f *fakeLocker) MarkForCancellation(_ context.Context, executionID string) error {
@@ -452,6 +478,64 @@ func TestStartExecutionForwardsRuntimeConfig(t *testing.T) {
 	}
 	if len(cfg.Env) != 1 || cfg.Env[0].Name != "GREETING" || cfg.Env[0].Value != "super-secret-value" {
 		t.Fatalf("env %+v", cfg.Env)
+	}
+}
+
+func TestCancelRunningDoesNotReportSuccess(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	mgr := concurrency.NewManager(rdb, concurrency.Config{
+		MaxConcurrency: 2,
+		QueueMax:       4,
+		GlobalMax:      8,
+		MaxWait:        time.Second,
+		Lease:          time.Minute,
+	})
+	runner := &blockingRunner{started: make(chan struct{})}
+	h := &Handler{executor: runner, concurrency: mgr, runs: newRunStops()}
+	router := newRouter(h)
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodPost, "/executions", strings.NewReader(`{
+			"executionId":"run-1","functionId":"fn","version":"v1","timeoutSec":15,"event":{"sleepMs":2500}
+		}`))
+		req.Header.Set("Content-Type", "application/json")
+		rr := httptest.NewRecorder()
+		router.ServeHTTP(rr, req)
+		done <- rr
+	}()
+	select {
+	case <-runner.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("execution did not start")
+	}
+	cancelRR := postJSON(t, router, "/executions/run-1/cancel", "")
+	if cancelRR.Code != http.StatusOK || !strings.Contains(cancelRR.Body.String(), `"cancelled":true`) {
+		t.Fatalf("cancel %d %s", cancelRR.Code, cancelRR.Body.String())
+	}
+	var rr *httptest.ResponseRecorder
+	select {
+	case rr = <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled execution did not return")
+	}
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("status %d %s", rr.Code, rr.Body.String())
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["success"] != false || body["error"] != cancel.Message {
+		t.Fatalf("body %s", rr.Body.String())
+	}
+	if body["exitCode"] != float64(cancel.ExitCode) {
+		t.Fatalf("exit %v", body["exitCode"])
+	}
+	if strings.Contains(rr.Body.String(), `"slept"`) {
+		t.Fatalf("handler output survived the cancel: %s", rr.Body.String())
 	}
 }
 

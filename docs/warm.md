@@ -86,7 +86,7 @@ Eso es a propósito. No es un aislamiento entre invokes. El aislamiento entre fu
 
 Cada línea del frame `log` se escribe en `nimbus:logs:{executionId}` de esa invocación. El bootstrap manda el `executionId` en el frame; si no coincide, el container se descarta y no se escribe en el stream equivocado.
 
-`POST /executions/:id/cancel` no cambia: si el invoke todavía está en la cola, sale de la cola; si ya corre, queda marcado en Redis y el container sigue hasta que el handler termina o vence el timeout. Cancelar no mata el container.
+`POST /executions/:id/cancel`, si el invoke todavía está en la cola, lo saca de la cola. Si ya corre, el proceso corta el contexto, hace `docker rm -f` del container (en ese momento se llama `nimbus-{executionId}`) y lo marca tainted. No vuelve al pool: el siguiente invoke de esa clave arranca uno nuevo. El `POST /executions` responde 409 con `success: false` y `"Ejecución cancelada"`. El detalle del exit 130 y de la fila en Postgres está en [`concurrencia.md`](concurrencia.md).
 
 ## Contrato
 

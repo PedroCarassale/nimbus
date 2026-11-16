@@ -28,7 +28,8 @@ func (e *Executor) executeWarm(ctx context.Context, req *ExecutionRequest) *Exec
 	logWriter := logs.NewStreamWriter(e.rdb, req.ExecutionID)
 	defer func() {
 		result.DurationMs = time.Since(startTime).Milliseconds()
-		logWriter.Close(ctx)
+		// WithoutCancel: a user cancel must still write the _end marker and the TTL.
+		logWriter.Close(context.WithoutCancel(ctx))
 	}()
 
 	ntrace.Logf(ctx, "[executor] Iniciando ejecución %s (fn: %s, version: %s)", req.ExecutionID, req.FunctionID, req.Version)
