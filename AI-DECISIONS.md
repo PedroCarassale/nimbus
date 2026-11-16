@@ -309,3 +309,33 @@ Formato pedido por la cátedra (AI-DECISIONS.md).
 
 División: el compute plane es la parte más compleja (procesos, aislamiento, concurrencia); el control plane concentra el producto que ve el usuario. El punto de integración es el contrato `POST /executions`, que se cambia de forma compatible hacia atrás y documentada en `docs/`.
 
+---
+
+## Paso 0 — Base estable del compute plane
+
+**Problema abordado:** El stack del MVP (`make up`, `make hello`, logs SSE) no se había ejecutado de punta a punta con Docker. El compute plane no podía ver el código del usuario desde el daemon, no interpretaba el JSON multilínea del runtime, el timeout no devolvía el exit code 124 del contrato, el healthcheck hacía HEAD contra una ruta que solo acepta GET, y las imágenes oficiales de MinIO ya no se pueden bajar.
+
+**Prompt / Herramienta utilizada:** Cursor Cloud Agent (Grok 4.7), sobre el pedido de Paso 0 del roadmap de Pedro: Docker real, `make up` / `make hello` / `make smoke`, logs SSE, casos de timeout y error, tests Go y GitHub Actions.
+
+**Código / Arquitectura generada:**
+
+1. **Ejecución (compute plane)**
+   - `NIMBUS_WORK_DIR=/tmp/nimbus-work` se monta con el mismo path en el contenedor y en el host, porque `docker run -v` lo resuelve el daemon.
+   - El resultado del handler se parsea aunque el bootstrap lo imprima en varias líneas.
+   - El timeout lo aplica el contexto de Go, mata el container con `docker rm -f` y responde exit code 124.
+   - El cliente de artifacts crea el bucket si todavía no existe y guarda el zip bajo el directorio compartido.
+   - CLI de Docker 27 (Alpine 3.21) para hablar con Engine 29.
+   - Tests con miniredis de locks, streams de logs, handlers HTTP y helpers del executor.
+
+2. **Infra**
+   - Compose usa Silo (`pgsty/silo`) y `pgsty/mc` en lugar de `minio/minio` y `minio/mc`, con digest fijo.
+   - `make up` construye `nimbus-node`, crea el directorio de trabajo y espera también a la consola.
+   - `make smoke` exige logs SSE (`follow=false` y `curl -N`), un handler que lanza error y un timeout.
+   - GitHub Actions: build/vet/test de Go, build de Nest, build de la consola y job de compose smoke.
+
+3. **Ajustes mínimos fuera del compute plane, necesarios para el flujo**
+   - Control plane: OpenSSL 3 y `binaryTargets` de Prisma para que `migrate` arranque en Alpine; el `XREAD` de ioredis se normaliza porque `call()` devuelve un solo stream y el SSE en vivo no cerraba.
+   - El contrato `POST /executions` no cambia.
+
+**Validación y Corrección Humana:** Riesgos que quedan en el diseño: el compute plane monta el socket de Docker del host; `/tmp/nimbus-work` contiene el código de las funciones en el host; el timeout cuenta desde que arranca `docker run`, incluido el cold start del container.
+

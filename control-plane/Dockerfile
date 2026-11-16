@@ -5,6 +5,9 @@ FROM node:20-alpine AS builder
 
 WORKDIR /app
 
+# OpenSSL 3: Prisma en Alpine moderno no trae libssl 1.1.
+RUN apk add --no-cache openssl
+
 # Instalar dependencias de build
 COPY package*.json ./
 RUN npm ci
@@ -25,7 +28,8 @@ WORKDIR /app
 
 # Dependencias mínimas del sistema
 # - curl: healthcheck
-RUN apk add --no-cache curl
+# - openssl: el schema engine de Prisma (migrate) necesita libssl 3
+RUN apk add --no-cache curl openssl
 
 # Copiar dependencias de producción
 COPY package*.json ./

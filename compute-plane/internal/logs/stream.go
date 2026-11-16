@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -25,6 +26,7 @@ type LogEntry struct {
 }
 
 type StreamWriter struct {
+	mu          sync.Mutex
 	rdb         *redis.Client
 	executionID string
 	streamKey   string
@@ -45,6 +47,9 @@ func (sw *StreamWriter) StreamKey() string {
 }
 
 func (sw *StreamWriter) Write(ctx context.Context, stream string, line string) error {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+
 	sw.sequence++
 
 	entry := LogEntry{
@@ -85,12 +90,16 @@ func (sw *StreamWriter) WriteStderr(ctx context.Context, line string) error {
 }
 
 func (sw *StreamWriter) Close(ctx context.Context) error {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+
+	sw.sequence++
 	entry := LogEntry{
 		Timestamp:   time.Now().UnixMilli(),
 		ExecutionID: sw.executionID,
 		Stream:      "_end",
 		Line:        "execution_complete",
-		Sequence:    sw.sequence + 1,
+		Sequence:    sw.sequence,
 	}
 
 	entryJSON, _ := json.Marshal(entry)

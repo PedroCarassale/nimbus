@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -17,12 +18,17 @@ import (
 	"time"
 
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/logs"
-	minioClient "github.com/PedroCarassale/nimbus/compute-plane/internal/minio"
 	"github.com/redis/go-redis/v9"
 )
 
+// artifactDownloader fetches a function zip into a local directory.
+// The returned directory is owned by the caller and contains code.zip.
+type artifactDownloader interface {
+	DownloadArtifact(ctx context.Context, functionID, version string) (string, error)
+}
+
 type Executor struct {
-	minio        *minioClient.Client
+	store        artifactDownloader
 	rdb          *redis.Client
 	defaultImage string
 }
@@ -48,9 +54,9 @@ type ExecutionResult struct {
 	Stderr      string      `json:"stderr,omitempty"`
 }
 
-func New(minio *minioClient.Client, rdb *redis.Client) *Executor {
+func New(store artifactDownloader, rdb *redis.Client) *Executor {
 	return &Executor{
-		minio:        minio,
+		store:        store,
 		rdb:          rdb,
 		defaultImage: getEnv("NIMBUS_IMAGE", "nimbus-node"),
 	}
@@ -69,7 +75,7 @@ func (e *Executor) Execute(ctx context.Context, req *ExecutionRequest) *Executio
 	log.Printf("[executor] Iniciando ejecución %s (fn: %s, version: %s)", req.ExecutionID, req.FunctionID, req.Version)
 	logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Iniciando ejecución %s", req.ExecutionID))
 
-	tempDir, err := e.minio.DownloadArtifact(ctx, req.FunctionID, req.Version)
+	tempDir, err := e.store.DownloadArtifact(ctx, req.FunctionID, req.Version)
 	if err != nil {
 		result.Error = fmt.Sprintf("Error descargando artifact: %v", err)
 		result.DurationMs = time.Since(startTime).Milliseconds()
@@ -87,7 +93,7 @@ func (e *Executor) Execute(ctx context.Context, req *ExecutionRequest) *Executio
 		return result
 	}
 
-	if err := e.unzip(zipPath, workDir); err != nil {
+	if err := unzip(zipPath, workDir); err != nil {
 		result.Error = fmt.Sprintf("Error extrayendo zip: %v", err)
 		result.DurationMs = time.Since(startTime).Milliseconds()
 		logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Error: %s", result.Error))
@@ -110,21 +116,10 @@ func (e *Executor) Execute(ctx context.Context, req *ExecutionRequest) *Executio
 		return result
 	}
 
-	timeoutSec := req.TimeoutSec
-	if timeoutSec <= 0 {
-		timeoutSec = 5
-	}
-	memoryMB := req.MemoryMB
-	if memoryMB <= 0 {
-		memoryMB = 128
-	}
-	handler := req.Handler
-	if handler == "" {
-		handler = "handler"
-	}
+	timeoutSec, memoryMB, handler := applyDefaults(req.TimeoutSec, req.MemoryMB, req.Handler)
 
 	logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Ejecutando handler '%s' (timeout: %ds, memory: %dMB)", handler, timeoutSec, memoryMB))
-	dockerResult := e.runDockerWithStreaming(ctx, workDir, timeoutSec, memoryMB, handler, logWriter)
+	dockerResult := e.runDockerWithStreaming(ctx, req.ExecutionID, workDir, timeoutSec, memoryMB, handler, logWriter)
 
 	result.Success = dockerResult.success
 	result.Output = dockerResult.output
@@ -134,12 +129,16 @@ func (e *Executor) Execute(ctx context.Context, req *ExecutionRequest) *Executio
 	result.DurationMs = time.Since(startTime).Milliseconds()
 
 	if !dockerResult.success && result.Error == "" {
-		if dockerResult.exitCode == 124 {
+		switch {
+		case dockerResult.exitCode == 124:
 			result.Error = fmt.Sprintf("Timeout excedido (%ds)", timeoutSec)
 			logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Error: %s", result.Error))
-		} else if dockerResult.stderr != "" {
+		case dockerResult.exitCode == 0:
+			result.Error = "La función terminó sin un JSON de salida"
+			logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Error: %s", result.Error))
+		case dockerResult.stderr != "":
 			result.Error = dockerResult.stderr
-		} else {
+		default:
 			result.Error = "Error en la ejecución"
 			logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Error: %s", result.Error))
 		}
@@ -160,24 +159,16 @@ type dockerResult struct {
 	stderr   string
 }
 
-func (e *Executor) runDockerWithStreaming(ctx context.Context, workDir string, timeoutSec, memoryMB int, handler string, logWriter *logs.StreamWriter) dockerResult {
-	args := []string{
-		"run",
-		"--rm",
-		fmt.Sprintf("--memory=%dm", memoryMB),
-		"--pids-limit=256",
-		"--network=none",
-		"--read-only",
-		"-v", fmt.Sprintf("%s:/var/task:ro", workDir),
-		"-e", fmt.Sprintf("NIMBUS_HANDLER_FUNCTION=%s", handler),
-		"-e", "NIMBUS_EVENT_PATH=/var/task/event.json",
-		e.defaultImage,
-	}
+func (e *Executor) runDockerWithStreaming(ctx context.Context, executionID, workDir string, timeoutSec, memoryMB int, handler string, logWriter *logs.StreamWriter) dockerResult {
+	name := containerName(executionID)
+	args := dockerRunArgs(name, workDir, e.defaultImage, handler, memoryMB)
+	log.Printf("[executor] docker %s", strings.Join(args, " "))
 
-	timeoutCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second+2*time.Second)
+	timeoutCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(timeoutCtx, "timeout", append([]string{fmt.Sprintf("%ds", timeoutSec), "docker"}, args...)...)
+	cmd := exec.CommandContext(timeoutCtx, "docker", args...)
+	cmd.WaitDelay = 3 * time.Second
 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
@@ -218,25 +209,22 @@ func (e *Executor) runDockerWithStreaming(ctx context.Context, workDir string, t
 	}()
 
 	wg.Wait()
+	waitErr := cmd.Wait()
 
-	err = cmd.Wait()
-
-	exitCode := 0
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else {
-			exitCode = 1
-		}
+	timedOut := errors.Is(timeoutCtx.Err(), context.DeadlineExceeded)
+	exitCode := exitCodeFrom(waitErr, timedOut)
+	if exitCode != 0 {
+		// Killing the docker CLI does not stop the container. --rm only runs
+		// if the CLI exits on its own.
+		removeContainer(name)
 	}
 
 	stdoutStr := stdoutBuf.String()
 	stderrStr := stderrBuf.String()
-
-	output := e.parseOutput(stdoutStr)
+	output, ok := parseOutput(stdoutStr)
 
 	return dockerResult{
-		success:  exitCode == 0 && output != nil,
+		success:  exitCode == 0 && ok,
 		output:   output,
 		exitCode: exitCode,
 		stdout:   stdoutStr,
@@ -244,20 +232,124 @@ func (e *Executor) runDockerWithStreaming(ctx context.Context, workDir string, t
 	}
 }
 
-func (e *Executor) parseOutput(stdout string) interface{} {
-	lines := strings.Split(strings.TrimSpace(stdout), "\n")
+// dockerRunArgs builds the docker CLI arguments for one user container.
+// workDir must be a host path the Docker daemon can see. When the compute
+// plane itself runs in a container, NIMBUS_WORK_DIR has to be bind-mounted
+// at the same absolute path on the host.
+func dockerRunArgs(containerName, workDir, image, handler string, memoryMB int) []string {
+	return []string{
+		"run",
+		"--name", containerName,
+		"--rm",
+		fmt.Sprintf("--memory=%dm", memoryMB),
+		"--pids-limit=256",
+		"--network=none",
+		"--read-only",
+		"-v", fmt.Sprintf("%s:/var/task:ro", workDir),
+		"-e", fmt.Sprintf("NIMBUS_HANDLER_FUNCTION=%s", handler),
+		"-e", "NIMBUS_EVENT_PATH=/var/task/event.json",
+		image,
+	}
+}
 
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := strings.TrimSpace(lines[i])
-		if strings.HasPrefix(line, "{") || strings.HasPrefix(line, "[") {
-			var result interface{}
-			if err := json.Unmarshal([]byte(line), &result); err == nil {
-				return result
-			}
+func containerName(executionID string) string {
+	var b strings.Builder
+	b.WriteString("nimbus-")
+	for _, r := range executionID {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
 		}
 	}
+	name := b.String()
+	if len(name) > 63 {
+		name = name[:63]
+	}
+	return strings.TrimRight(name, ".-")
+}
 
-	return nil
+func removeContainer(name string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "docker", "rm", "-f", name)
+	if err := cmd.Run(); err != nil {
+		log.Printf("[executor] no se pudo borrar el container %s: %v", name, err)
+	}
+}
+
+func applyDefaults(timeoutSec, memoryMB int, handler string) (int, int, string) {
+	if timeoutSec <= 0 {
+		timeoutSec = 5
+	}
+	if memoryMB <= 0 {
+		memoryMB = 128
+	}
+	if handler == "" {
+		handler = "handler"
+	}
+	return timeoutSec, memoryMB, handler
+}
+
+func exitCodeFrom(err error, timedOut bool) int {
+	if timedOut {
+		return 124
+	}
+	if err == nil {
+		return 0
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		code := exitErr.ExitCode()
+		if code < 0 {
+			return 1
+		}
+		return code
+	}
+	return 1
+}
+
+// parseOutput extracts the handler result from stdout.
+// The Node bootstrap pretty-prints JSON, and the handler may log lines
+// before that result, so a single-line scan is not enough.
+func parseOutput(stdout string) (interface{}, bool) {
+	trimmed := strings.TrimSpace(stdout)
+	if trimmed == "" {
+		return nil, false
+	}
+	if v, ok := decodeJSONValue(trimmed); ok {
+		return v, true
+	}
+
+	lines := strings.Split(trimmed, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		chunk := strings.TrimSpace(strings.Join(lines[i:], "\n"))
+		if chunk == "" || !looksLikeJSON(chunk) {
+			continue
+		}
+		if v, ok := decodeJSONValue(chunk); ok {
+			return v, true
+		}
+	}
+	return nil, false
+}
+
+func looksLikeJSON(s string) bool {
+	switch s[0] {
+	case '{', '[', '"', 't', 'f', 'n', '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+		return true
+	default:
+		return false
+	}
+}
+
+func decodeJSONValue(s string) (interface{}, bool) {
+	var v interface{}
+	if err := json.Unmarshal([]byte(s), &v); err != nil {
+		return nil, false
+	}
+	return v, true
 }
 
 func (e *Executor) ensureImage(ctx context.Context) error {
@@ -287,26 +379,30 @@ func (e *Executor) ensureImage(ctx context.Context) error {
 	return nil
 }
 
-func (e *Executor) unzip(src, dest string) error {
+func unzip(src, dest string) error {
 	r, err := zip.OpenReader(src)
 	if err != nil {
 		return err
 	}
 	defer r.Close()
 
-	for _, f := range r.File {
-		fpath := filepath.Join(dest, f.Name)
+	destClean := filepath.Clean(dest)
+	prefix := destClean + string(os.PathSeparator)
 
-		if !strings.HasPrefix(fpath, filepath.Clean(dest)+string(os.PathSeparator)) {
+	for _, f := range r.File {
+		fpath := filepath.Join(destClean, f.Name)
+		if fpath != destClean && !strings.HasPrefix(fpath, prefix) {
 			return fmt.Errorf("illegal file path: %s", fpath)
 		}
 
 		if f.FileInfo().IsDir() {
-			os.MkdirAll(fpath, os.ModePerm)
+			if err := os.MkdirAll(fpath, 0o755); err != nil {
+				return err
+			}
 			continue
 		}
 
-		if err := os.MkdirAll(filepath.Dir(fpath), os.ModePerm); err != nil {
+		if err := os.MkdirAll(filepath.Dir(fpath), 0o755); err != nil {
 			return err
 		}
 

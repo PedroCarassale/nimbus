@@ -19,20 +19,28 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /compute-plane ./cmd/server
 
 # --- Runtime ---
-FROM alpine:3.19
+# alpine 3.21 ships docker-cli 27.x, which can talk to Docker Engine 27–29.
+# The previous 3.19 CLI spoke an API older than Engine 29's minimum.
+FROM alpine:3.21
 
 RUN apk add --no-cache \
     docker-cli \
     ca-certificates \
-    tzdata
+    tzdata \
+    wget
 
 WORKDIR /app
 
 # Copiar binario compilado
 COPY --from=builder /compute-plane /app/compute-plane
 
-# Puerto por defecto
+# Puerto por defecto.
+# NIMBUS_WORK_DIR se monta en el host con el mismo path (ver docker-compose).
 ENV PORT=8080
+ENV NIMBUS_WORK_DIR=/tmp/nimbus-work
+ENV NIMBUS_IMAGE=nimbus-node
+
+RUN mkdir -p /tmp/nimbus-work
 
 EXPOSE 8080
 
