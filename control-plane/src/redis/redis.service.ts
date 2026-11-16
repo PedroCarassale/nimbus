@@ -105,7 +105,13 @@ export class RedisService implements OnModuleDestroy {
 
         if (!result) continue;
 
-        const streams = result as [string, [string, string[]][]][];
+        // ioredis call() returns one stream as [key, messages]. The typed
+        // xread() helper wraps that as [[key, messages]]. Normalize both.
+        const streams = (
+          Array.isArray(result) && typeof result[0] === 'string'
+            ? [result]
+            : result
+        ) as [string, [string, string[]][]][];
         for (const [, messages] of streams) {
           for (const [msgId, fields] of messages) {
             const dataIndex = fields.indexOf('data');

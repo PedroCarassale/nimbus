@@ -19,8 +19,8 @@ compute-plane/
 - Todas las invocaciones son sincrónicas.
 
 ### Paso 0 — Base estable
-- [ ] Correr `make up` + `make hello` con Docker real y arreglar lo que rompa.
-- [ ] Tests del compute plane (Go) + CI en GitHub Actions.
+- [x] Correr `make up` + `make hello` con Docker real y arreglar lo que rompa.
+- [x] Tests del compute plane (Go) + CI en GitHub Actions.
 
 ### Paso 1 — Concurrencia real y cola
 - [ ] Permitir N ejecuciones simultáneas por función (configurable).

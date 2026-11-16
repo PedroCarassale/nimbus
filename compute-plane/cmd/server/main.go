@@ -59,6 +59,7 @@ func main() {
 	r.Use(middleware.Timeout(120 * time.Second))
 
 	r.Get("/health", handler.Health)
+	r.Head("/health", handler.Health)
 	r.Post("/executions", handler.StartExecution)
 	r.Post("/executions/{id}/cancel", handler.CancelExecution)
 

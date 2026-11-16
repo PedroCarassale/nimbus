@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -10,9 +11,21 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
+// runner executes user code. *executor.Executor implements it.
+type runner interface {
+	Execute(ctx context.Context, req *executor.ExecutionRequest) *executor.ExecutionResult
+}
+
+// locker is the per-function Redis lock. *concurrency.Manager implements it.
+type locker interface {
+	AcquireLock(ctx context.Context, functionID, executionID string) (bool, error)
+	ReleaseLock(ctx context.Context, functionID, executionID string) error
+	MarkForCancellation(ctx context.Context, executionID string) error
+}
+
 type Handler struct {
-	executor    *executor.Executor
-	concurrency *concurrency.Manager
+	executor    runner
+	concurrency locker
 }
 
 func New(exec *executor.Executor, concMgr *concurrency.Manager) *Handler {

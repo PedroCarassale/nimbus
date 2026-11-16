@@ -16,6 +16,8 @@
 COMPOSE := docker compose
 API_URL := http://localhost:3000
 COMPUTE_URL := http://localhost:8080
+CONSOLE_URL := http://localhost:8088
+WORK_DIR := /tmp/nimbus-work
 
 # Colores para output
 GREEN := \033[0;32m
@@ -33,10 +35,15 @@ help: ## Muestra esta ayuda
 
 up: ## Levanta todo el stack (Postgres, Redis, MinIO, Nest, Go)
 	@echo "$(YELLOW)>>> Levantando stack Nimbus...$(NC)"
+	@mkdir -p $(WORK_DIR)
+	@chmod 1777 $(WORK_DIR)
+	@echo "$(YELLOW)>>> Construyendo imagen de runtime nimbus-node...$(NC)"
+	docker build -t nimbus-node ./runtime-node
 	$(COMPOSE) up -d --build
 	@echo "$(YELLOW)>>> Esperando que los servicios estén healthy...$(NC)"
 	@$(MAKE) wait-healthy
 	@echo "$(GREEN)>>> Stack listo! Control plane en $(API_URL)$(NC)"
+	@echo "$(GREEN)>>> Consola en $(CONSOLE_URL)$(NC)"
 
 down: ## Detiene y limpia el stack
 	@echo "$(YELLOW)>>> Deteniendo stack...$(NC)"
@@ -60,7 +67,7 @@ hello: ## Demo completa: create → deploy → invoke función hello
 	@echo ""
 	@./scripts/hello-demo.sh
 
-smoke: ## Ejecuta smoke test completo (create, deploy, invoke, logs)
+smoke: ## Ejecuta smoke test (create, deploy, invoke, logs, error, timeout)
 	@echo "$(YELLOW)>>> Ejecutando smoke test...$(NC)"
 	@./scripts/smoke-test.sh
 
@@ -78,25 +85,40 @@ ps: ## Muestra estado de los servicios
 
 wait-healthy: ## Espera a que todos los servicios estén healthy
 	@echo "Esperando control-plane..."
-	@for i in $$(seq 1 60); do \
+	@for i in $$(seq 1 180); do \
 		if curl -sf $(API_URL)/health >/dev/null 2>&1; then \
 			echo "$(GREEN)  ✓ Control plane listo$(NC)"; \
 			break; \
 		fi; \
-		if [ $$i -eq 60 ]; then \
+		if [ $$i -eq 180 ]; then \
 			echo "$(RED)  ✗ Timeout esperando control-plane$(NC)"; \
+			$(COMPOSE) logs --no-color control-plane compute-plane minio || true; \
 			exit 1; \
 		fi; \
 		sleep 1; \
 	done
 	@echo "Esperando compute-plane..."
-	@for i in $$(seq 1 60); do \
+	@for i in $$(seq 1 120); do \
 		if curl -sf $(COMPUTE_URL)/health >/dev/null 2>&1; then \
 			echo "$(GREEN)  ✓ Compute plane listo$(NC)"; \
 			break; \
 		fi; \
-		if [ $$i -eq 60 ]; then \
+		if [ $$i -eq 120 ]; then \
 			echo "$(RED)  ✗ Timeout esperando compute-plane$(NC)"; \
+			$(COMPOSE) logs --no-color compute-plane || true; \
+			exit 1; \
+		fi; \
+		sleep 1; \
+	done
+	@echo "Esperando consola..."
+	@for i in $$(seq 1 90); do \
+		if curl -sf $(CONSOLE_URL)/ >/dev/null 2>&1; then \
+			echo "$(GREEN)  ✓ Consola lista$(NC)"; \
+			break; \
+		fi; \
+		if [ $$i -eq 90 ]; then \
+			echo "$(RED)  ✗ Timeout esperando consola$(NC)"; \
+			$(COMPOSE) logs --no-color console || true; \
 			exit 1; \
 		fi; \
 		sleep 1; \

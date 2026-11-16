@@ -31,6 +31,10 @@ make console
 
 **Consola Web:** http://localhost:8088
 
+`make up` construye la imagen `nimbus-node` y crea `/tmp/nimbus-work`. Ese directorio va montado con el mismo path en el compute plane y en el host: el daemon de Docker resuelve ahí el código de la función.
+
+El servicio S3 del compose es Silo (`pgsty/silo`), compatible con la API de MinIO. Las imágenes `minio/minio` y `minio/mc` ya no se pueden descargar sin cuenta.
+
 Esto demuestra el flujo completo del MVP:
 - **Control Plane** (NestJS): crea función, almacena metadata en Postgres, sube código a MinIO
 - **Compute Plane** (Go): ejecuta la función en Docker aislado con timeout y límites de memoria
@@ -58,7 +62,7 @@ Esto demuestra el flujo completo del MVP:
 ```bash
 make help         # Ver todos los comandos disponibles
 make console      # Abrir consola web en http://localhost:8088
-make smoke        # Test completo con verificación de logs SSE
+make smoke        # Test completo: invoke, logs SSE, error y timeout
 make logs         # Ver logs de todos los servicios
 make down         # Detener el stack
 make down-clean   # Detener y eliminar volúmenes
@@ -346,6 +350,7 @@ Cliente HTTP
 |----------|---------|-------------|
 | `COMPUTE_PLANE_URL` | `http://compute-plane:8080` | URL del compute plane (para Nest) |
 | `COMPUTE_PLANE_PORT` | `8080` | Puerto del compute plane |
+| `NIMBUS_WORK_DIR` | `/tmp/nimbus-work` | Directorio de trabajo compartido con el daemon de Docker. El path tiene que coincidir dentro del contenedor y en el host |
 
 **Control Plane — Redis (Slice 5):**
 

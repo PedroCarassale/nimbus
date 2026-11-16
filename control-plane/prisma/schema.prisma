@@ -2,7 +2,9 @@
 // Slice 3: Control plane metadata
 
 generator client {
-  provider = "prisma-client-js"
+  provider      = "prisma-client-js"
+  // node:20-alpine actual usa OpenSSL 3. Sin esto Prisma elige libssl 1.1 y migrate no arranca.
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
 }
 
 datasource db {
