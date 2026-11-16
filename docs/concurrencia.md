@@ -26,10 +26,14 @@ Compatible hacia atrás: los campos nuevos son opcionales.
   "event": {},
   "timeoutSec": 5,
   "memoryMb": 128,
+  "cpus": 0.5,
   "handler": "handler",
+  "envVars": { "GREETING": "hola" },
   "maxConcurrency": 2
 }
 ```
+
+`timeoutSec`, `memoryMb`, `cpus`, `handler` y `envVars` son opcionales. Los límites y el formato del handler están en [`configuracion.md`](configuracion.md). Un valor inválido responde 400 y no entra a la cola.
 
 `maxConcurrency` (opcional, entero positivo) reemplaza `NIMBUS_FN_CONCURRENCY` **solo para esa admisión**. Si no viene, o vale 0 o menos, se usa el default del entorno. El tope global `NIMBUS_MAX_CONTAINERS` sigue aplicando. Dos invocaciones en vuelo con valores distintos admiten hasta el mayor de los dos, nunca por encima del tope global.
 

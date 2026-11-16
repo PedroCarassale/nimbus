@@ -103,6 +103,10 @@ services:
       NIMBUS_IMAGE: nimbus-node
       # Mismo path en el contenedor y en el host: el daemon resuelve -v.
       NIMBUS_WORK_DIR: /tmp/nimbus-work
+      NIMBUS_TIMEOUT_SEC: ${NIMBUS_TIMEOUT_SEC:-5}
+      NIMBUS_MEMORY_MB: ${NIMBUS_MEMORY_MB:-128}
+      NIMBUS_HANDLER: ${NIMBUS_HANDLER:-handler}
+      NIMBUS_CPUS: ${NIMBUS_CPUS:-}
       NIMBUS_FN_CONCURRENCY: ${NIMBUS_FN_CONCURRENCY:-2}
       NIMBUS_FN_QUEUE_MAX: ${NIMBUS_FN_QUEUE_MAX:-32}
       NIMBUS_FN_QUEUE_WAIT_SEC: ${NIMBUS_FN_QUEUE_WAIT_SEC:-30}

@@ -9,6 +9,7 @@ En orden sugerido. Cada paso es un PR chico contra `main`.
 compute-plane/
   cmd/server/main.go            # servidor HTTP (chi) en :8080
   internal/handlers/            # POST /executions, POST /executions/:id/cancel, GET /health
+  internal/fnconfig/            # timeout, memoria, CPU, handler y envVars por invocación
   internal/executor/            # baja el zip de MinIO, lo extrae y corre docker run
   internal/concurrency/         # semáforo + cola FIFO en Redis (N por función, tope global)
   internal/logs/                # escribe stdout/stderr en nimbus:logs:{executionId}
@@ -29,8 +30,10 @@ compute-plane/
 - [x] Límite global de containers por máquina.
 
 ### Paso 2 — Configuración por función (lado Go)
-- [ ] Recibir y aplicar `timeoutSec`, `memoryMb`, `envVars` y `handler` desde el contrato.
-- [ ] Límite de CPU (`--cpus`).
+- [x] Recibir y aplicar `timeoutSec`, `memoryMb`, `envVars` y `handler` desde el contrato.
+- [x] Límite de CPU (`--cpus`).
+
+Detalle de campos, defaults y límites: [`configuracion.md`](configuracion.md).
 
 ### Paso 3 — Warm containers
 - [ ] Reusar containers ya iniciados para la misma función y versión.

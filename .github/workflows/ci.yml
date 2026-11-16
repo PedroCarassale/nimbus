@@ -84,6 +84,8 @@ jobs:
         run: make hello
       - name: make smoke
         run: make smoke
+      - name: make config-check
+        run: make config-check
       - name: Logs on failure
         if: failure()
         run: docker compose logs --no-color > compose-logs.txt || true

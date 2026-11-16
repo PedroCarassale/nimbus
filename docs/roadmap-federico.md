@@ -78,7 +78,7 @@ console/
 ### Cosas a saber del código actual
 - `name` es único a nivel global. Con usuarios va a tener que ser único **por usuario**.
 - No hay auth: cualquiera ve y ejecuta todo.
-- Timeout y memoria no se configuran por función; salen de valores fijos o variables de entorno.
+- El compute plane ya aplica timeout, memoria, CPU, handler y `envVars` por invocación ([`configuracion.md`](configuracion.md)). Nest todavía no los guarda: `runner.service.ts` manda timeout, memoria y handler desde variables de entorno, y no manda `envVars` ni `cpus`.
 - En `invoke`, el estado `RUNNING` se guarda recién cuando la ejecución ya terminó. Conviene marcarlo antes de llamar a Go.
 - Hay `GET /invocations/:id`, pero no hay un listado de invocaciones por función.
 
@@ -129,7 +129,7 @@ En orden sugerido. Cada paso es un PR chico contra `main`.
 
 El roadmap del compute plane está en [`roadmap-pedro.md`](roadmap-pedro.md).
 
-Es el punto de integración entre control plane y compute plane. Hoy, `POST /executions` recibe:
+Es el punto de integración entre control plane y compute plane. `POST /executions` recibe:
 
 ```json
 {
@@ -139,10 +139,22 @@ Es el punto de integración entre control plane y compute plane. Hoy, `POST /exe
   "event": {},
   "timeoutSec": 5,
   "memoryMb": 128,
-  "handler": "handler",
+  "cpus": 0.5,
+  "handler": "index.handler",
+  "envVars": { "GREETING": "hola" },
   "maxConcurrency": 2
 }
 ```
+
+`timeoutSec`, `memoryMb`, `cpus`, `handler` y `envVars` son opcionales. Go los valida y los aplica en el container. Límites, defaults y el formato del handler (`index.handler`, `src/app.main`) están en [`configuracion.md`](configuracion.md). Un valor inválido responde **400** con `error` y `field`, antes de encolar.
+
+Hoy Nest **no** manda la config de la función. `runner.service.ts` sigue enviando:
+
+- `timeoutSec` desde `NIMBUS_TIMEOUT_SEC` (default 5)
+- `memoryMb` desde `NIMBUS_MEMORY` (default `128m`)
+- `handler` desde `NIMBUS_HANDLER` (default `handler`)
+
+No envía `envVars` ni `cpus`. Cuando exista `PATCH /functions/:id`, el invoke tiene que reenviar esos campos con los mismos nombres. No hace falta cambiar el shape de más arriba. Los máximos del control plane pueden ser más chicos; Go rechaza igual lo que se pase de 300s, 2048 MB o 4 CPUs.
 
 `maxConcurrency` es opcional. Si no viene, Go usa `NIMBUS_FN_CONCURRENCY`. La respuesta de una ejecución que entró es `{ executionId, success, output, error, exitCode, durationMs, queuedMs }`. `queuedMs` son los milisegundos esperados en la cola (`0` si entró directo).
 

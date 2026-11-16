@@ -9,6 +9,7 @@ import (
 
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/concurrency"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/executor"
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/fnconfig"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -27,13 +28,26 @@ type locker interface {
 type Handler struct {
 	executor    runner
 	concurrency locker
+	defaults    fnconfig.Defaults
 }
 
 func New(exec *executor.Executor, concMgr *concurrency.Manager) *Handler {
+	return NewWithDefaults(exec, concMgr, fnconfig.LoadDefaults())
+}
+
+func NewWithDefaults(exec *executor.Executor, concMgr *concurrency.Manager, defaults fnconfig.Defaults) *Handler {
 	return &Handler{
 		executor:    exec,
 		concurrency: concMgr,
+		defaults:    defaults,
 	}
+}
+
+func (h *Handler) effectiveDefaults() fnconfig.Defaults {
+	if h.defaults.TimeoutSec == 0 || h.defaults.MemoryMB == 0 || h.defaults.Handler == "" {
+		return fnconfig.Builtin()
+	}
+	return h.defaults
 }
 
 func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
@@ -46,9 +60,11 @@ type StartExecutionRequest struct {
 	FunctionID     string                 `json:"functionId"`
 	Version        string                 `json:"version"`
 	Event          map[string]interface{} `json:"event"`
-	TimeoutSec     int                    `json:"timeoutSec"`
-	MemoryMB       int                    `json:"memoryMb"`
-	Handler        string                 `json:"handler"`
+	TimeoutSec     json.RawMessage        `json:"timeoutSec"`
+	MemoryMB       json.RawMessage        `json:"memoryMb"`
+	CPUs           json.RawMessage        `json:"cpus"`
+	Handler        json.RawMessage        `json:"handler"`
+	EnvVars        json.RawMessage        `json:"envVars"`
 	MaxConcurrency int                    `json:"maxConcurrency,omitempty"`
 }
 
@@ -63,18 +79,49 @@ type StartExecutionResponse struct {
 }
 
 func (h *Handler) StartExecution(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var req StartExecutionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error": "JSON inválido"}`, http.StatusBadRequest)
+		msg := "JSON inválido"
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			msg = "El cuerpo de la solicitud supera 1 MB"
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": msg})
 		return
 	}
 
 	if req.ExecutionID == "" || req.FunctionID == "" || req.Version == "" {
-		http.Error(w, `{"error": "executionId, functionId y version son requeridos"}`, http.StatusBadRequest)
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "executionId, functionId y version son requeridos",
+		})
 		return
 	}
 
-	log.Printf("[handler] StartExecution: %s (fn: %s, v: %s)", req.ExecutionID, req.FunctionID, req.Version)
+	resolved, err := fnconfig.Resolve(fnconfig.Raw{
+		TimeoutSec: req.TimeoutSec,
+		MemoryMB:   req.MemoryMB,
+		CPUs:       req.CPUs,
+		Handler:    req.Handler,
+		EnvVars:    req.EnvVars,
+	}, h.effectiveDefaults())
+	if err != nil {
+		var ferr *fnconfig.FieldError
+		if errors.As(err, &ferr) {
+			log.Printf("[handler] Configuración rechazada para %s: %s", req.ExecutionID, ferr.Message)
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": ferr.Message,
+				"field": ferr.Field,
+			})
+			return
+		}
+		log.Printf("[handler] Configuración rechazada para %s", req.ExecutionID)
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Configuración inválida"})
+		return
+	}
+
+	log.Printf("[handler] StartExecution: %s (fn: %s, v: %s, timeout: %ds, memory: %dMB, cpus: %s, handler: %s, env: %d)",
+		req.ExecutionID, req.FunctionID, req.Version, resolved.TimeoutSec, resolved.MemoryMB, cpusLabel(resolved), resolved.Handler, len(resolved.Env))
 
 	maxConcurrency := req.MaxConcurrency
 	if maxConcurrency < 0 {
@@ -97,9 +144,7 @@ func (h *Handler) StartExecution(w http.ResponseWriter, r *http.Request) {
 		FunctionID:  req.FunctionID,
 		Version:     req.Version,
 		Event:       req.Event,
-		TimeoutSec:  req.TimeoutSec,
-		MemoryMB:    req.MemoryMB,
-		Handler:     req.Handler,
+		Config:      resolved,
 	}
 
 	result := h.executor.Execute(r.Context(), execReq)
@@ -129,6 +174,19 @@ type CancelExecutionResponse struct {
 	ExecutionID string `json:"executionId"`
 	Cancelled   bool   `json:"cancelled"`
 	Message     string `json:"message"`
+}
+
+func cpusLabel(cfg fnconfig.Resolved) string {
+	if cfg.CPUsFlag == "" {
+		return "sin límite"
+	}
+	return cfg.CPUsFlag
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(payload)
 }
 
 func writeAdmissionError(w http.ResponseWriter, executionID string, queuedMs int64, err error) {

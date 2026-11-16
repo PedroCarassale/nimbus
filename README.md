@@ -64,6 +64,7 @@ make help         # Ver todos los comandos disponibles
 make console      # Abrir consola web en http://localhost:8088
 make smoke        # Test completo: invoke, logs SSE, error y timeout
 make load         # 6 invokes en paralelo: 2 corren, 3 esperan, 1 recibe 429
+make config-check # timeout, memoria, env, handler y cpus contra el compute plane
 make logs         # Ver logs de todos los servicios
 make down         # Detener el stack
 make down-clean   # Detener y eliminar volúmenes
@@ -285,10 +286,14 @@ Cliente HTTP
   "event": { "key": "value" },
   "timeoutSec": 5,
   "memoryMb": 128,
-  "handler": "handler",
+  "cpus": 0.5,
+  "handler": "index.handler",
+  "envVars": { "GREETING": "hola" },
   "maxConcurrency": 2
 }
 ```
+
+`timeoutSec`, `memoryMb`, `cpus`, `handler` y `envVars` son opcionales. Un valor fuera de rango responde 400. Límites, defaults y el formato `archivo.export` del handler: [docs/configuracion.md](docs/configuracion.md). Nest hoy manda timeout, memoria y handler desde variables de entorno, y no manda `cpus` ni `envVars`.
 
 **Response:**
 ```json
@@ -321,9 +326,11 @@ Cliente HTTP
 
 | Variable | Default | Descripción |
 |----------|---------|-------------|
-| `NIMBUS_MEMORY` | `128m` | Límite de memoria Docker |
-| `NIMBUS_TIMEOUT_SEC` | `5` | Timeout de ejecución en segundos |
-| `NIMBUS_HANDLER` | `handler` | Nombre de la función exportada |
+| `NIMBUS_MEMORY` | `128m` | Límite de memoria Docker (`scripts/run-zip.sh`) |
+| `NIMBUS_MEMORY_MB` | `128` | Default de `memoryMb` en el compute plane (64..2048) |
+| `NIMBUS_TIMEOUT_SEC` | `5` | Timeout de ejecución en segundos (1..300 en el compute plane) |
+| `NIMBUS_HANDLER` | `handler` | Handler `archivo.export` (default: export `handler` de `index.js`) |
+| `NIMBUS_CPUS` | vacío | Default de `--cpus` (0.1..4). Vacío: sin cuota |
 | `NIMBUS_IMAGE` | `nimbus-node` | Nombre de la imagen Docker |
 
 **MinIO (Slice 2):**
@@ -358,6 +365,10 @@ Cliente HTTP
 | `COMPUTE_PLANE_URL` | `http://compute-plane:8080` | URL del compute plane (para Nest) |
 | `COMPUTE_PLANE_PORT` | `8080` | Puerto del compute plane |
 | `NIMBUS_WORK_DIR` | `/tmp/nimbus-work` | Directorio de trabajo compartido con el daemon de Docker. El path tiene que coincidir dentro del contenedor y en el host |
+| `NIMBUS_TIMEOUT_SEC` | `5` | Default de `timeoutSec` si el request no lo manda |
+| `NIMBUS_MEMORY_MB` | `128` | Default de `memoryMb` si el request no lo manda |
+| `NIMBUS_HANDLER` | `handler` | Default del handler si el request no lo manda |
+| `NIMBUS_CPUS` | vacío | Default de CPU. Vacío: no se pasa `--cpus` |
 | `NIMBUS_FN_CONCURRENCY` | `2` | Ejecuciones simultáneas por función |
 | `NIMBUS_FN_QUEUE_MAX` | `32` | Tamaño de la cola por función (`0` = sin espera, 429 al tope) |
 | `NIMBUS_FN_QUEUE_WAIT_SEC` | `30` | Espera máxima en la cola antes de un 429 |
