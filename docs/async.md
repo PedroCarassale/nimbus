@@ -69,6 +69,8 @@ Una config inválida (timeout, memoria, CPU, handler, env) responde **400** en e
 
 Go expone la cola en `POST /async/jobs` con el mismo body que `POST /executions` más `invocationId`. Responde **202** `{ invocationId, executionId, status: "queued" }`. Repetir el mismo `invocationId` no encola dos veces.
 
+Si el request trae `traceparent`, el job lo guarda y el worker sigue en esa traza. Sin el header el intento abre una traza propia. El detalle está en [`observabilidad.md`](observabilidad.md).
+
 ## Qué se reintenta
 
 | Resultado | Reintento |
@@ -92,6 +94,13 @@ Cuando se acaban los intentos, Go guarda la entrada en el hash `nimbus:async:dlq
 El redrive responde 200 con `{ id, invocationId, executionId, status: "queued" }`. Si no está, 404. Nest pone la fila otra vez en `PENDING` y el worker sigue. Un id que no existe no se inventa.
 
 Estos endpoints están en el compute plane (`:8080`), no en Nest.
+
+## Cancelar un async
+
+`POST /executions/:id/cancel` usa el `executionId` que devolvió el 202. Desde el enqueue existe el hash `nimbus:exec:{executionId}` con estado `pending`, así que cancelar antes de que un worker lo tome no responde 404.
+
+- Si todavía no arrancó (está en el stream, en el backoff o en la cola FIFO), el intento termina en `ERROR` con el texto de cancelación y no entra a la DLQ.
+- Si ya está corriendo, queda marcado y el container sigue hasta que el handler termina o vence el timeout. El flag no mata el proceso.
 
 ## Si se cae el proceso
 

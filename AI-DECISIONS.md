@@ -468,3 +468,67 @@ El contrato queda en `docs/async.md`.
 
 **Validación y Corrección Humana:** Riesgos que quedan en el diseño: el reclaim y el contenedor huérfano pueden solaparse unos segundos después de un kill, hasta que el arranque borra los warm. Los intentos de una misma invocación comparten `executionId` y el stream de logs, así que un `_end` de un intento puede aparecer antes que las líneas del siguiente. El 429 de la cola de concurrencia gasta un intento. `NIMBUS_ASYNC_CLAIM_IDLE_MS` más corto que una ejecución larga hace que otro worker vea el mensaje pendiente; el lock evita correrlo dos veces, pero el idle se reinicia. Nest aplica resultados en orden de `seq`; si ese consumidor está caído, la fila se actualiza cuando vuelve.
 
+---
+
+## Paso 5 — Observabilidad del compute plane
+
+**Problema abordado:** No había forma de ver, fuera de los logs, cuántas invocaciones corrían, cuántas fallaban, cuánto duraban, cuántas fueron cold o warm, ni qué tan llena estaba la cola o la DLQ. Tampoco se podía seguir un invoke desde Nest hasta el container.
+
+**Prompt / Herramienta utilizada:** Cursor Cloud Agent (Grok 4.7), pedido de Paso 5 del roadmap de Pedro, apilado sobre la rama de Paso 4.
+
+**Código / Arquitectura generada:**
+
+1. **Métricas en el compute plane**
+   - `GET /metrics` con `prometheus/client_golang`. Contadores de invocaciones por `function_id`, `status` (`success`, `error`, `timeout`, `oom`) y `mode` (`sync`, `async`), más series aparte de errores, timeouts y OOM.
+   - Histograma de duración, cold vs warm, e histograma de `initMs`.
+   - Espera de cola, profundidad de la cola por función (scrape a Redis), ejecuciones activas, tamaño del pool warm, slots globales y el tope `NIMBUS_MAX_CONTAINERS`.
+   - Rechazos 429 (`queue_full`, `queue_timeout`), reintentos async y el tamaño de la DLQ.
+   - `function_id` es etiqueta. `execution_id` no: una serie por ejecución no se queda quieta.
+
+2. **Trazas OpenTelemetry**
+   - Go exporta OTLP HTTP con un batch processor. `NIMBUS_TRACING=0` (o `OTEL_SDK_DISABLED=true`) no instala el exporter. Si el collector no responde, el error se loguea como mucho cada 30s y la invocación no falla.
+   - Nest abre `nimbus.invoke` y `nimbus.compute.call`, e inyecta `traceparent` en `POST /executions` y `POST /async/jobs`.
+   - El job de Redis guarda `traceparent` y `tracestate`. El worker abre `async.attempt` en esa traza, también en los reintentos.
+   - Los spans de Go son `queue.wait`, `artifact.download`, `container.acquire` y `container.run`.
+   - El container recibe `NIMBUS_TRACE_ID` y `TRACEPARENT`. En el camino frío van en `docker -e`. En el warm el proceso se reutiliza, así que cada invoke los manda en el frame de stdin y el bootstrap los publica en `process.env` para esa llamada, y los escribe en el log.
+
+3. **Perfil de Compose**
+   - `make up` no levanta observabilidad. `make obs` prende Prometheus (`:9090`), Grafana (`:3001`, viewer anónimo, dashboard provisionado), Jaeger (`:16686`) y un collector OTLP (`:4318`) que reenvía a Jaeger.
+   - `make obs-check` genera sync, async, error, timeout, OOM, DLQ y un 429, y consulta las APIs. CI no corre ese target.
+
+4. **Control plane, cambio chico**
+   - `GET /metrics` con dos series HTTP (`nimbus_http_requests_total`, `nimbus_http_request_duration_seconds`). Los UUID del path se reemplazan por `:id`.
+   - `runner.service.ts` propaga el traceparent. No hay columnas nuevas. El body de `POST /executions` no cambia.
+
+**Validación y Corrección Humana:** Riesgos que quedan en el diseño: el trace id dentro de un container warm se actualiza por invoke en `process.env`, pero `docker inspect` sigue mostrando el valor del `docker run` que creó el proceso. Un collector caído descarta spans; no hay cola durable de trazas. La profundidad de cola y la DLQ se leen en el scrape, así que un pico más corto que el intervalo de 5s puede no aparecer. `nimbus_containers_in_use` cuenta slots de Redis, no `docker ps`. Las etiquetas por `function_id` crecen con la cantidad de funciones del proceso.
+
+---
+
+## QA de los pasos 0 a 5
+
+**Problema abordado:** El stack de los pasos 0 a 5 (concurrencia, config, warm, async y observabilidad) estaba entero en ramas sin mergear. Había que correrlo junto, buscar interacciones que los checks de cada paso no cubren, y corregir lo que se rompiera.
+
+**Prompt / Herramienta utilizada:** Cursor Cloud Agent (Grok 4.7). Pedido de QA profundo del stack #9–#15, con Docker en la VM, la suite de `make` dos veces, un flujo de consola con Chrome headless, stress, restarts, zips maliciosos y compatibilidad (`NIMBUS_WARM=0`, `NIMBUS_TRACING=0`, body mínimo de `POST /executions`).
+
+**Código / Arquitectura generada:**
+
+1. **Unzip del artifact en el host**
+   - Tope de 32 MiB descomprimidos, 4096 entradas, y rechazo de symlinks. El path `..` ya se rechazaba. El fallo sigue siendo `Error extrayendo zip`.
+
+2. **Cancel de un async que todavía no fue admitido**
+   - `XADD`, el retry y el redrive crean `nimbus:exec:{id}` en `pending` (TTL 24 h). El admit, si ve `cancelled`, no ejecuta. Un 409 es fatal: no reintenta y no entra a la DLQ.
+
+3. **DLQ**
+   - `dead()` copia `DurationMs` del intento. Antes el JSON lo perdía (`omitempty`).
+
+4. **Tag de versión**
+   - Dejó de ser `YYYYMMDD-HHMMSS`. Ahora lleva milisegundos y un sufijo aleatorio, y un choque del unique reintenta con otro tag. El tag viejo hacía que un segundo deploy del mismo segundo pisara el zip en MinIO y devolviera 500.
+
+5. **Consola**
+   - El healthcheck de nginx usa `127.0.0.1` (wget resolvía `localhost` a `::1`). El panel SSE no marca error cuando el stream cierra después de `end`.
+
+6. **`make qa`**
+   - `scripts/qa-deep.sh` y `scripts/qa-console.mjs`. El informe está en `docs/qa-pasos-0-5.md`.
+
+**Validación y Corrección Humana:** Riesgos que quedan en el diseño: cancelar una ejecución que ya corre no mata el container. El camino frío (`NIMBUS_WARM=0`) sigue como root de la imagen. `docker inspect` muestra los env mientras el container vive. Las keys `nimbus:slots:machine:{hostname}` de un proceso muerto quedan con miembros ya vencidos. Multer no limita el tamaño del upload; el tope del zip aplica al descomprimir. Nest no reenvía `envVars` ni `cpus`, y no hay auth.
+

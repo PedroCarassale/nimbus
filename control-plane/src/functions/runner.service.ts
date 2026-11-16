@@ -1,5 +1,12 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { v4 as uuidv4 } from 'uuid';
+import {
+  context,
+  propagation,
+  SpanKind,
+  SpanStatusCode,
+  trace,
+} from '@opentelemetry/api';
 
 export interface RunnerResult {
   executionId: string;
@@ -92,13 +99,12 @@ export class RunnerService {
         handler: process.env.NIMBUS_HANDLER || 'handler',
       };
 
-      const response = await fetch(`${this.computePlaneUrl}/executions`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(request),
-      });
+      const response = await this.tracedFetch(
+        'sync',
+        functionId,
+        `${this.computePlaneUrl}/executions`,
+        request,
+      );
 
       if (response.status === 429) {
         const errorBody = (await response.json().catch(() => ({}))) as {
@@ -176,11 +182,12 @@ export class RunnerService {
     };
 
     try {
-      const response = await fetch(`${this.computePlaneUrl}/async/jobs`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(request),
-      });
+      const response = await this.tracedFetch(
+        'async',
+        functionId,
+        `${this.computePlaneUrl}/async/jobs`,
+        request,
+      );
       const body = (await response.json().catch(() => ({}))) as {
         executionId?: string;
         error?: string;
@@ -208,6 +215,79 @@ export class RunnerService {
         error: `Error comunicándose con compute-plane: ${errorMessage}`,
       };
     }
+  }
+
+  /**
+   * POST to the compute plane with a client span and a W3C traceparent.
+   * The span is a child of whatever the invoke middleware (or a caller) set.
+   */
+  private tracedFetch(
+    mode: 'sync' | 'async',
+    functionId: string,
+    url: string,
+    body: unknown,
+  ): Promise<globalThis.Response> {
+    const tracer = trace.getTracer('nimbus-control-plane');
+    // nimbus.invoke is started here, not only in middleware, so the client
+    // call and the Go spans stay on one trace even if AsyncLocalStorage does
+    // not cross the Nest handler boundary.
+    return tracer.startActiveSpan(
+      'nimbus.invoke',
+      {
+        kind: SpanKind.SERVER,
+        attributes: {
+          'nimbus.mode': mode,
+          'nimbus.function_id': functionId,
+        },
+      },
+      async (invokeSpan) => {
+        try {
+          return await tracer.startActiveSpan(
+            'nimbus.compute.call',
+            {
+              kind: SpanKind.CLIENT,
+              attributes: {
+                'nimbus.mode': mode,
+                'nimbus.function_id': functionId,
+                'http.request.method': 'POST',
+                'url.path': mode === 'async' ? '/async/jobs' : '/executions',
+              },
+            },
+            async (span) => {
+              try {
+                const headers: Record<string, string> = {
+                  'Content-Type': 'application/json',
+                };
+                propagation.inject(context.active(), headers);
+                const response = await fetch(url, {
+                  method: 'POST',
+                  headers,
+                  body: JSON.stringify(body),
+                });
+                span.setAttribute('http.response.status_code', response.status);
+                if (response.status >= 500) {
+                  span.setStatus({ code: SpanStatusCode.ERROR });
+                }
+                return response;
+              } catch (error) {
+                if (error instanceof Error) {
+                  span.recordException(error);
+                }
+                span.setStatus({ code: SpanStatusCode.ERROR });
+                throw error;
+              } finally {
+                span.end();
+              }
+            },
+          );
+        } catch (error) {
+          invokeSpan.setStatus({ code: SpanStatusCode.ERROR });
+          throw error;
+        } finally {
+          invokeSpan.end();
+        }
+      },
+    );
   }
 
   /**

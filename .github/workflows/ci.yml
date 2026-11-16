@@ -90,6 +90,8 @@ jobs:
         run: make warm-check
       - name: make async-check
         run: make async-check
+      # make obs-check baja Prometheus, Grafana, Jaeger y el collector.
+      # No corre en CI: el job de compose se queda con el stack del MVP.
       - name: Logs on failure
         if: failure()
         run: docker compose logs --no-color > compose-logs.txt || true

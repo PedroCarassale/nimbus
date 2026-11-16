@@ -19,8 +19,11 @@ import (
 
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/fnconfig"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/logs"
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/metrics"
+	ntrace "github.com/PedroCarassale/nimbus/compute-plane/internal/trace"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/warm"
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // artifactDownloader fetches a function zip into a local directory.
@@ -126,11 +129,16 @@ func (e *Executor) executeCold(ctx context.Context, req *ExecutionRequest) *Exec
 	logWriter := logs.NewStreamWriter(e.rdb, req.ExecutionID)
 	defer logWriter.Close(ctx)
 
-	log.Printf("[executor] Iniciando ejecución %s (fn: %s, version: %s)", req.ExecutionID, req.FunctionID, req.Version)
+	ntrace.Logf(ctx, "[executor] Iniciando ejecución %s (fn: %s, version: %s)", req.ExecutionID, req.FunctionID, req.Version)
 	logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Iniciando ejecución %s", req.ExecutionID))
+	writeTraceLog(ctx, logWriter)
 
-	tempDir, err := e.store.DownloadArtifact(ctx, req.FunctionID, req.Version)
+	dlCtx, dlSpan := ntrace.Start(ctx, "artifact.download")
+	defer dlSpan.End()
+	dlSpan.SetAttributes(attribute.String("nimbus.function_id", req.FunctionID))
+	tempDir, err := e.store.DownloadArtifact(dlCtx, req.FunctionID, req.Version)
 	if err != nil {
+		ntrace.Fail(dlSpan, err)
 		result.Error = fmt.Sprintf("Error descargando artifact: %v", err)
 		result.DurationMs = time.Since(startTime).Milliseconds()
 		logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Error: %s", result.Error))
@@ -148,11 +156,13 @@ func (e *Executor) executeCold(ctx context.Context, req *ExecutionRequest) *Exec
 	}
 
 	if err := unzip(zipPath, workDir); err != nil {
+		ntrace.Fail(dlSpan, err)
 		result.Error = fmt.Sprintf("Error extrayendo zip: %v", err)
 		result.DurationMs = time.Since(startTime).Milliseconds()
 		logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Error: %s", result.Error))
 		return result
 	}
+	dlSpan.End()
 
 	eventPath := filepath.Join(workDir, "event.json")
 	eventBytes, _ := json.Marshal(req.Event)
@@ -214,7 +224,7 @@ type dockerResult struct {
 
 func (e *Executor) runDockerWithStreaming(ctx context.Context, executionID, workDir string, cfg fnconfig.Resolved, logWriter *logs.StreamWriter) dockerResult {
 	name := containerName(executionID)
-	args := dockerRunArgs(name, workDir, e.defaultImage, cfg)
+	args := withExtraEnv(dockerRunArgs(name, workDir, e.defaultImage, cfg), traceEnvs(ctx))
 	// User env values are secrets. The log line keeps the keys and redacts the values.
 	log.Printf("[executor] docker %s", formatArgsForLog(args))
 
@@ -234,9 +244,24 @@ func (e *Executor) runDockerWithStreaming(ctx context.Context, executionID, work
 		return dockerResult{exitCode: 1, stderr: fmt.Sprintf("Error creating stderr pipe: %v", err)}
 	}
 
+	_, acquireSpan := ntrace.Start(ctx, "container.acquire")
+	acquireSpan.SetAttributes(
+		attribute.String("nimbus.execution_id", executionID),
+		attribute.Bool("nimbus.cold_start", true),
+	)
 	if err := cmd.Start(); err != nil {
+		ntrace.Fail(acquireSpan, err)
+		acquireSpan.End()
 		return dockerResult{exitCode: 1, stderr: fmt.Sprintf("Error starting command: %v", err)}
 	}
+	acquireSpan.End()
+
+	ctx, runSpan := ntrace.Start(ctx, "container.run")
+	runSpan.SetAttributes(
+		attribute.String("nimbus.execution_id", executionID),
+		attribute.Bool("nimbus.cold_start", true),
+	)
+	defer runSpan.End()
 
 	var stdoutBuf, stderrBuf bytes.Buffer
 	var wg sync.WaitGroup
@@ -341,6 +366,8 @@ var platformEnvKeys = map[string]struct{}{
 	"NIMBUS_TIMEOUT_SEC":      {},
 	"NIMBUS_FUNCTION_NAME":    {},
 	"NIMBUS_WARM":             {},
+	"NIMBUS_TRACE_ID":         {},
+	"TRACEPARENT":             {},
 	"HOME":                    {},
 }
 
@@ -514,6 +541,15 @@ func (e *Executor) ensureImage(ctx context.Context) error {
 	return nil
 }
 
+// A zip is extracted on the host, under NIMBUS_WORK_DIR, before the container
+// exists. These caps stop a zip bomb from filling that disk. They are larger
+// than the example functions and smaller than a payload that is only useful
+// as a bomb.
+const (
+	maxZipEntries      = 4096
+	maxZipUncompressed = 32 << 20
+)
+
 func unzip(src, dest string) error {
 	r, err := zip.OpenReader(src)
 	if err != nil {
@@ -521,10 +557,22 @@ func unzip(src, dest string) error {
 	}
 	defer r.Close()
 
+	if len(r.File) > maxZipEntries {
+		return fmt.Errorf("el zip tiene demasiados archivos (%d)", len(r.File))
+	}
+
 	destClean := filepath.Clean(dest)
 	prefix := destClean + string(os.PathSeparator)
+	var written int64
 
 	for _, f := range r.File {
+		if f.FileInfo().Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("el zip contiene un symlink: %s", f.Name)
+		}
+		if f.UncompressedSize64 > maxZipUncompressed {
+			return fmt.Errorf("el zip descomprimido supera %d bytes", maxZipUncompressed)
+		}
+
 		fpath := filepath.Join(destClean, f.Name)
 		if fpath != destClean && !strings.HasPrefix(fpath, prefix) {
 			return fmt.Errorf("illegal file path: %s", fpath)
@@ -541,7 +589,10 @@ func unzip(src, dest string) error {
 			return err
 		}
 
-		outFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
+		// Permissions come from the zip. The tree is mounted read-only and
+		// the warm process is not root, so a setuid bit in the archive does
+		// not become a host setuid binary. Still drop anything but 0644.
+		outFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 		if err != nil {
 			return err
 		}
@@ -552,16 +603,72 @@ func unzip(src, dest string) error {
 			return err
 		}
 
-		_, err = io.Copy(outFile, rc)
+		n, err := io.Copy(outFile, io.LimitReader(rc, maxZipUncompressed-written+1))
 		outFile.Close()
 		rc.Close()
-
 		if err != nil {
 			return err
+		}
+		written += n
+		if written > maxZipUncompressed {
+			return fmt.Errorf("el zip descomprimido supera %d bytes", maxZipUncompressed)
 		}
 	}
 
 	return nil
+}
+
+// withExtraEnv inserts -e pairs before the image, which is the last argument.
+func withExtraEnv(args []string, env []string) []string {
+	if len(env) == 0 || len(args) == 0 {
+		return args
+	}
+	out := make([]string, 0, len(args)+len(env)*2)
+	out = append(out, args[:len(args)-1]...)
+	for _, e := range env {
+		if e == "" {
+			continue
+		}
+		out = append(out, "-e", e)
+	}
+	return append(out, args[len(args)-1])
+}
+
+// traceEnvs is what the user process sees. Empty when the invocation has no span.
+func traceEnvs(ctx context.Context) []string {
+	var env []string
+	if id := ntrace.ID(ctx); id != "" {
+		env = append(env, "NIMBUS_TRACE_ID="+id)
+	}
+	if tp := ntrace.Header(ctx); tp != "" {
+		env = append(env, "TRACEPARENT="+tp)
+	}
+	return env
+}
+
+func writeTraceLog(ctx context.Context, logWriter *logs.StreamWriter) {
+	id := ntrace.ID(ctx)
+	if id == "" {
+		return
+	}
+	logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] traceId=%s traceparent=%s", id, ntrace.Header(ctx)))
+}
+
+// WarmPool reports idle and busy warm containers for the metrics scrape.
+func (e *Executor) WarmPool() []metrics.WarmSample {
+	if e == nil || e.pool == nil {
+		return nil
+	}
+	var out []metrics.WarmSample
+	for id, usage := range e.pool.Usage() {
+		if usage.Busy > 0 {
+			out = append(out, metrics.WarmSample{FunctionID: id, State: "busy", Count: usage.Busy})
+		}
+		if usage.Idle > 0 {
+			out = append(out, metrics.WarmSample{FunctionID: id, State: "idle", Count: usage.Idle})
+		}
+	}
+	return out
 }
 
 func getEnv(key, defaultValue string) string {

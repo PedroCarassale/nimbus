@@ -8,7 +8,11 @@ import (
 	"net/http"
 
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/async"
+	ntrace "github.com/PedroCarassale/nimbus/compute-plane/internal/trace"
 	"github.com/go-chi/chi/v5"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type asyncEnqueueRequest struct {
@@ -51,13 +55,24 @@ func (h *Handler) EnqueueAsync(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, status, payload)
 		return
 	}
-	executionID, duplicate, err := h.queue.Enqueue(r.Context(), body.InvocationID, body.ExecutionID, raw)
+	ctx := ntrace.ExtractHTTP(r.Context(), r.Header)
+	ctx, span := ntrace.Start(ctx, "nimbus.async.enqueue", trace.WithSpanKind(trace.SpanKindServer))
+	span.SetAttributes(
+		attribute.String("nimbus.function_id", body.FunctionID),
+		attribute.String("nimbus.invocation_id", body.InvocationID),
+		attribute.String("nimbus.mode", "async"),
+	)
+	defer span.End()
+	executionID, duplicate, err := h.queue.Enqueue(ctx, body.InvocationID, body.ExecutionID, raw)
 	if err != nil {
+		ntrace.Fail(span, err)
+		span.SetStatus(codes.Error, "enqueue")
 		writeJSON(w, http.StatusInternalServerError, map[string]string{
 			"error": "No se pudo encolar la invocación",
 		})
 		return
 	}
+	span.SetAttributes(attribute.Int("http.response.status_code", http.StatusAccepted))
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"invocationId": body.InvocationID,
 		"executionId":  executionID,
@@ -128,7 +143,7 @@ func (h *Handler) RunJob(ctx context.Context, body json.RawMessage) async.RunRes
 	if err := json.Unmarshal(body, &req); err != nil {
 		return async.RunResult{Kind: async.KindValidation, Error: "JSON inválido"}
 	}
-	status, payload := h.dispatch(ctx, req)
+	status, payload := h.dispatch(ctx, req, "async")
 	return classify(status, payload)
 }
 

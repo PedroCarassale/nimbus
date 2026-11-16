@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	ntrace "github.com/PedroCarassale/nimbus/compute-plane/internal/trace"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -79,6 +80,8 @@ func (q *Queue) Enqueue(ctx context.Context, invocationID, executionID string, b
 		MaxAttempts:  maxAttempts,
 		EnqueuedAt:   now,
 		Body:         body,
+		TraceParent:  ntrace.Header(ctx),
+		TraceState:   ntrace.State(ctx),
 	}
 	jobJSON, err := json.Marshal(job)
 	if err != nil {
@@ -88,11 +91,13 @@ func (q *Queue) Enqueue(ctx context.Context, invocationID, executionID string, b
 	if err != nil {
 		return "", false, err
 	}
+	meta := peekBody(body)
 	res, err := enqueueScript.Run(ctx, q.rdb, []string{
 		acceptKey(invocationID),
 		streamJobs,
 		stateKey(invocationID),
-	}, executionID, string(jobJSON), string(stJSON)).Result()
+		execKey(executionID),
+	}, executionID, string(jobJSON), string(stJSON), meta.FunctionID, now, pendingExecTTL.Milliseconds()).Result()
 	if err != nil {
 		return "", false, err
 	}
@@ -230,8 +235,9 @@ func (q *Queue) ScheduleRetry(ctx context.Context, job Job, delay time.Duration,
 		return err
 	}
 	due := q.Now().Add(delay).UnixMilli()
-	return scheduleScript.Run(ctx, q.rdb, []string{retryKey, stateKey(job.InvocationID)},
-		due, string(rawJob), string(rawState)).Err()
+	meta := peekBody(job.Body)
+	return scheduleScript.Run(ctx, q.rdb, []string{retryKey, stateKey(job.InvocationID), execKey(meta.ExecutionID)},
+		due, string(rawJob), string(rawState), meta.FunctionID, q.Now().UnixMilli(), pendingExecTTL.Milliseconds()).Err()
 }
 
 // NextSeq reserves the next result sequence for one invocation.
@@ -282,6 +288,11 @@ func (q *Queue) CommitTerminal(ctx context.Context, invocationID string, st Stat
 		streamDLQ,
 		stateKey(invocationID),
 	}, entry.ID, string(rawEntry), string(rawState)).Err()
+}
+
+// DLQLen is the number of invocations waiting in the dead-letter hash.
+func (q *Queue) DLQLen(ctx context.Context) (int64, error) {
+	return q.rdb.HLen(ctx, dlqItemsKey).Result()
 }
 
 func (q *Queue) ListDLQ(ctx context.Context) ([]DLQEntry, error) {
@@ -347,7 +358,8 @@ func (q *Queue) Redrive(ctx context.Context, id string) (DLQEntry, error) {
 		streamDLQ,
 		streamJobs,
 		stateKey(id),
-	}, id, string(jobJSON), string(stJSON)).Result()
+		execKey(entry.ExecutionID),
+	}, id, string(jobJSON), string(stJSON), entry.FunctionID, now, pendingExecTTL.Milliseconds()).Result()
 	if err != nil {
 		return DLQEntry{}, err
 	}
@@ -442,10 +454,28 @@ func peekBody(body json.RawMessage) bodyMeta {
 	return meta
 }
 
+// pendingExecTTL keeps the cancel flag alive while the job sits on the
+// stream. The concurrency hash created at admit time expires with the slot
+// lease, which is shorter than a backlog of async work.
+const pendingExecTTL = 24 * time.Hour
+
+// execKey matches concurrency.Manager. A worker cannot have started before
+// this script returns, so writing the hash here lets POST /executions/:id/cancel
+// see a job that is still waiting for a worker.
+func execKey(executionID string) string { return "nimbus:exec:" + executionID }
+
 const enqueueLua = `
 local existing = redis.call('GET', KEYS[1])
 if existing and existing ~= false then
   return {'duplicate', existing}
+end
+if redis.call('EXISTS', KEYS[4]) == 0 then
+  redis.call('HSET', KEYS[4],
+    'functionId', ARGV[4],
+    'status', 'pending',
+    'cancelled', 'false',
+    'heartbeat', tostring(ARGV[5]))
+  redis.call('PEXPIRE', KEYS[4], ARGV[6])
 end
 redis.call('SET', KEYS[1], ARGV[1])
 redis.call('SET', KEYS[3], ARGV[3])
@@ -468,6 +498,14 @@ return n
 const scheduleLua = `
 redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
 redis.call('SET', KEYS[2], ARGV[3])
+if redis.call('EXISTS', KEYS[3]) == 0 then
+  redis.call('HSET', KEYS[3],
+    'functionId', ARGV[4],
+    'status', 'pending',
+    'cancelled', 'false',
+    'heartbeat', tostring(ARGV[5]))
+  redis.call('PEXPIRE', KEYS[3], ARGV[6])
+end
 return 1
 `
 
@@ -505,6 +543,14 @@ if sid and sid ~= false then
   redis.call('HDEL', KEYS[2], ARGV[1])
 end
 redis.call('SET', KEYS[5], ARGV[3])
+if redis.call('EXISTS', KEYS[6]) == 0 then
+  redis.call('HSET', KEYS[6],
+    'functionId', ARGV[4],
+    'status', 'pending',
+    'cancelled', 'false',
+    'heartbeat', tostring(ARGV[5]))
+  redis.call('PEXPIRE', KEYS[6], ARGV[6])
+end
 redis.call('XADD', KEYS[4], '*', 'data', ARGV[2])
 return raw
 `

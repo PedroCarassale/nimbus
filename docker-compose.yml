@@ -122,6 +122,11 @@ services:
       NIMBUS_ASYNC_CLAIM_IDLE_MS: ${NIMBUS_ASYNC_CLAIM_IDLE_MS:-20000}
       NIMBUS_ASYNC_LOCK_MS: ${NIMBUS_ASYNC_LOCK_MS:-15000}
       NIMBUS_ASYNC_WORKERS: ${NIMBUS_ASYNC_WORKERS:-4}
+      # Tracing is on by default and exports in the background. make up does
+      # not start the collector; a down collector must not fail invocations.
+      NIMBUS_TRACING: ${NIMBUS_TRACING:-1}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318}
+      OTEL_SERVICE_NAME: nimbus-compute-plane
     depends_on:
       redis:
         condition: service_healthy
@@ -161,6 +166,9 @@ services:
       NIMBUS_TIMEOUT_SEC: ${NIMBUS_TIMEOUT_SEC:-5}
       NIMBUS_MEMORY: ${NIMBUS_MEMORY:-128m}
       NIMBUS_HANDLER: ${NIMBUS_HANDLER:-handler}
+      NIMBUS_TRACING: ${NIMBUS_TRACING:-1}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318}
+      OTEL_SERVICE_NAME: nimbus-control-plane
       NODE_ENV: development
     depends_on:
       postgres:
@@ -191,11 +199,73 @@ services:
       control-plane:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:80"]
+      # wget resuelve localhost a ::1 y nginx escucha en IPv4. 127.0.0.1 evita
+      # un healthcheck que falla para siempre con "connection refused".
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:80"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 10s
+
+  # Observabilidad (Paso 5). No entra en `make up`: `make obs` o `make obs-check`.
+  otel-collector:
+    image: otel/opentelemetry-collector:0.114.0
+    container_name: nimbus-otel-collector
+    profiles: ["obs"]
+    command: ["--config=/etc/otel/collector.yaml"]
+    volumes:
+      - ./observability/otel/collector.yaml:/etc/otel/collector.yaml:ro
+    ports:
+      - "4318:4318"
+    depends_on:
+      - jaeger
+    mem_limit: 128m
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    container_name: nimbus-jaeger
+    profiles: ["obs"]
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+    mem_limit: 384m
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: nimbus-prometheus
+    profiles: ["obs"]
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=24h"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    mem_limit: 256m
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: nimbus-grafana
+    profiles: ["obs"]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_AUTH_DISABLE_LOGIN_FORM: "false"
+      GF_USERS_DEFAULT_THEME: dark
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+    mem_limit: 256m
 
 volumes:
   postgres-data:

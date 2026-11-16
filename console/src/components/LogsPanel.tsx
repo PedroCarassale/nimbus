@@ -12,6 +12,7 @@ export function LogsPanel({ invocationId, onClose }: LogsPanelProps) {
   const [status, setStatus] = useState<'connecting' | 'connected' | 'ended' | 'error'>('connecting');
   const [error, setError] = useState<string | null>(null);
   const logsEndRef = useRef<HTMLDivElement>(null);
+  const streamClosed = useRef(false);
 
   useEffect(() => {
     if (!invocationId) return;
@@ -19,6 +20,7 @@ export function LogsPanel({ invocationId, onClose }: LogsPanelProps) {
     setLogs([]);
     setStatus('connecting');
     setError(null);
+    streamClosed.current = false;
 
     const eventSource = new EventSource(getLogsUrl(invocationId));
 
@@ -34,28 +36,35 @@ export function LogsPanel({ invocationId, onClose }: LogsPanelProps) {
     });
 
     eventSource.addEventListener('end', () => {
+      streamClosed.current = true;
       setStatus('ended');
       eventSource.close();
     });
 
     eventSource.addEventListener('error', (e) => {
+      if (streamClosed.current) return;
       if (e instanceof MessageEvent) {
+        streamClosed.current = true;
         const data = JSON.parse(e.data);
         setError(data.message || 'Error en el stream de logs');
+        setStatus('error');
+        eventSource.close();
       }
-      setStatus('error');
-      eventSource.close();
     });
 
+    // EventSource dispara onerror también cuando el servidor cierra el stream
+    // después del evento end. El status del render queda viejo dentro del
+    // efecto, así que la marca va en un ref.
     eventSource.onerror = () => {
-      if (status !== 'ended') {
-        setStatus('error');
-        setError('Conexión perdida con el servidor');
-      }
+      if (streamClosed.current) return;
+      streamClosed.current = true;
+      setStatus('error');
+      setError('Conexión perdida con el servidor');
       eventSource.close();
     };
 
     return () => {
+      streamClosed.current = true;
       eventSource.close();
     };
   }, [invocationId]);

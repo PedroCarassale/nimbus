@@ -75,23 +75,47 @@ export class FunctionsService {
       throw new NotFoundException(`Función ${id} no encontrada`);
     }
 
-    const versionTag = this.generateVersionTag();
-    const artifactKey = await this.minio.uploadArtifact(id, versionTag, zipBuffer);
+    // El tag viejo era YYYYMMDD-HHMMSS. Dos deploys de la misma función en el
+    // mismo segundo chocaban con @@unique(functionId, version) y el segundo
+    // PutObject pisaba el zip de la versión que ya estaba en la base.
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const versionTag = this.generateVersionTag();
+      const taken = await this.prisma.version.findFirst({
+        where: { functionId: id, version: versionTag },
+        select: { id: true },
+      });
+      if (taken) continue;
 
-    const version = await this.prisma.version.create({
-      data: {
-        functionId: id,
-        version: versionTag,
-        artifactKey,
-      },
-    });
+      const artifactKey = await this.minio.uploadArtifact(id, versionTag, zipBuffer);
+      try {
+        const version = await this.prisma.version.create({
+          data: {
+            functionId: id,
+            version: versionTag,
+            artifactKey,
+          },
+        });
 
-    console.log(`[functions] Deploy: ${fn.name} v${versionTag}`);
+        console.log(`[functions] Deploy: ${fn.name} v${versionTag}`);
 
-    return {
-      function: fn,
-      version,
-    };
+        return {
+          function: fn,
+          version,
+        };
+      } catch (err) {
+        if (
+          err instanceof Prisma.PrismaClientKnownRequestError &&
+          err.code === 'P2002'
+        ) {
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    throw new ConflictException(
+      `No se pudo asignar un tag de versión libre para '${fn.name}'`,
+    );
   }
 
   async getLatestVersion(functionId: string) {
@@ -173,7 +197,12 @@ export class FunctionsService {
 
   private generateVersionTag(): string {
     const now = new Date();
-    const pad = (n: number) => n.toString().padStart(2, '0');
-    return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+    const pad = (n: number, width = 2) => n.toString().padStart(width, '0');
+    const stamp =
+      `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}` +
+      `-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}` +
+      pad(now.getMilliseconds(), 3);
+    const suffix = Math.random().toString(36).slice(2, 6);
+    return `${stamp}-${suffix}`;
   }
 }

@@ -9,7 +9,10 @@ import (
 	"strings"
 	"testing"
 
+	"time"
+
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/async"
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/concurrency"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/executor"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/go-chi/chi/v5"
@@ -109,6 +112,54 @@ func TestEnqueueReturns202AndSyncStillRuns(t *testing.T) {
 	}
 	if runner.calls != 1 {
 		t.Fatalf("sync calls=%d", runner.calls)
+	}
+}
+
+func TestCancelPendingAsyncDoesNotRun(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	q := async.New(rdb, async.Config{
+		Enabled:     true,
+		MaxAttempts: 3,
+		LockTTL:     time.Hour,
+		ClaimIdle:   time.Hour,
+	})
+	if err := q.EnsureGroup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	mgr := concurrency.NewManager(rdb, concurrency.Config{
+		MaxConcurrency: 2,
+		QueueMax:       4,
+		GlobalMax:      8,
+		MaxWait:        time.Second,
+		Lease:          time.Minute,
+	})
+	runner := &fakeRunner{result: &executor.ExecutionResult{Success: true, ExitCode: 0}}
+	h := &Handler{executor: runner, concurrency: mgr, queue: q}
+	r := chi.NewRouter()
+	r.Post("/async/jobs", h.EnqueueAsync)
+	r.Post("/executions/{id}/cancel", h.CancelExecution)
+
+	rr := postJSON(t, r, "/async/jobs", `{
+		"invocationId":"inv-1","executionId":"exec-1","functionId":"fn","version":"v1","event":{"sleepMs":1000}
+	}`)
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("enqueue %d %s", rr.Code, rr.Body.String())
+	}
+	cancel := httptest.NewRecorder()
+	r.ServeHTTP(cancel, httptest.NewRequest(http.MethodPost, "/executions/exec-1/cancel", nil))
+	if cancel.Code != http.StatusOK || !strings.Contains(cancel.Body.String(), `"cancelled":true`) {
+		t.Fatalf("cancel %d %s", cancel.Code, cancel.Body.String())
+	}
+
+	msgs, err := q.Read(context.Background(), 5, -1)
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("read %+v err=%v", msgs, err)
+	}
+	async.NewWorker(q, h.RunJob).Handle(context.Background(), msgs[0])
+	if runner.calls != 0 {
+		t.Fatalf("cancelled async job ran %d times", runner.calls)
 	}
 }
 

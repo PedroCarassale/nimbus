@@ -10,7 +10,7 @@
 #   make logs    — Muestra logs de todos los servicios
 #   make console — Abre la consola web en el navegador
 
-.PHONY: up down hello smoke load config-check warm-check async-check logs build clean wait-healthy help
+.PHONY: up down hello smoke load config-check warm-check async-check obs obs-check qa logs build clean wait-healthy help
 
 # Variables
 COMPOSE := docker compose
@@ -86,6 +86,30 @@ warm-check: ## Mide cold start vs warm start y el descarte por idle, timeout y O
 async-check: ## Invocación async, reintentos, DLQ, redrive y reclaim tras un kill
 	@echo "$(YELLOW)>>> Prueba de invocación async...$(NC)"
 	@./scripts/async-check.sh
+
+obs: ## Prometheus, Grafana, Jaeger y el collector (perfil obs, aparte de make up)
+	@echo "$(YELLOW)>>> Levantando observabilidad...$(NC)"
+	$(COMPOSE) --profile obs up -d
+	@echo "$(YELLOW)>>> Esperando Prometheus, Grafana y Jaeger...$(NC)"
+	@for i in $$(seq 1 90); do \
+		if curl -sf http://localhost:9090/-/ready >/dev/null 2>&1 \
+			&& curl -sf http://localhost:3001/api/health >/dev/null 2>&1 \
+			&& curl -sf http://localhost:16686/ >/dev/null 2>&1; then \
+			echo "$(GREEN)>>> Grafana en http://localhost:3001  Jaeger en http://localhost:16686  Prometheus en http://localhost:9090$(NC)"; \
+			exit 0; \
+		fi; \
+		sleep 1; \
+	done; \
+	echo "$(RED)>>> Timeout esperando el perfil obs$(NC)"; \
+	exit 1
+
+obs-check: ## Tráfico real y consulta a Prometheus, Grafana y Jaeger
+	@echo "$(YELLOW)>>> Prueba de observabilidad...$(NC)"
+	@./scripts/obs-check.sh
+
+qa: ## QA profundo de los pasos 0–5 (consola, stress, restarts, seguridad)
+	@echo "$(YELLOW)>>> QA profundo...$(NC)"
+	@./scripts/qa-deep.sh
 
 logs: ## Muestra logs de todos los servicios (follow)
 	$(COMPOSE) logs -f

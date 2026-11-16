@@ -11,7 +11,10 @@ import (
 	"time"
 
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/logs"
+	ntrace "github.com/PedroCarassale/nimbus/compute-plane/internal/trace"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/warm"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 func (e *Executor) executeWarm(ctx context.Context, req *ExecutionRequest) *ExecutionResult {
@@ -28,8 +31,9 @@ func (e *Executor) executeWarm(ctx context.Context, req *ExecutionRequest) *Exec
 		logWriter.Close(ctx)
 	}()
 
-	log.Printf("[executor] Iniciando ejecución %s (fn: %s, version: %s)", req.ExecutionID, req.FunctionID, req.Version)
+	ntrace.Logf(ctx, "[executor] Iniciando ejecución %s (fn: %s, version: %s)", req.ExecutionID, req.FunctionID, req.Version)
 	logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Iniciando ejecución %s", req.ExecutionID))
+	writeTraceLog(ctx, logWriter)
 
 	cfg, cfgErr := req.Config.Complete()
 	if cfgErr != nil {
@@ -38,12 +42,17 @@ func (e *Executor) executeWarm(ctx context.Context, req *ExecutionRequest) *Exec
 		return result
 	}
 
-	workDir, err := e.prepareWarmCode(ctx, req.FunctionID, req.Version)
+	dlCtx, dlSpan := ntrace.Start(ctx, "artifact.download")
+	dlSpan.SetAttributes(attribute.String("nimbus.function_id", req.FunctionID))
+	workDir, err := e.prepareWarmCode(dlCtx, req.FunctionID, req.Version)
 	if err != nil {
+		ntrace.Fail(dlSpan, err)
+		dlSpan.End()
 		result.Error = fmt.Sprintf("Error %s", err.Error())
 		logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Error: %s", result.Error))
 		return result
 	}
+	dlSpan.End()
 
 	if err := e.ensureImage(ctx); err != nil {
 		result.Error = fmt.Sprintf("Error con imagen Docker: %v", err)
@@ -61,23 +70,49 @@ func (e *Executor) executeWarm(ctx context.Context, req *ExecutionRequest) *Exec
 	if event == nil {
 		event = map[string]interface{}{}
 	}
+
+	_, acquireSpan := ntrace.Start(ctx, "container.acquire")
+	acquireSpan.SetAttributes(attribute.String("nimbus.function_id", req.FunctionID))
+	var runSpan trace.Span
+	runStarted := false
 	out, meta := e.pool.Run(timeoutCtx, warm.Spec{
-		Key:        warm.PoolKey(req.FunctionID, req.Version, cfg),
-		FunctionID: req.FunctionID,
-		Version:    req.Version,
-		WorkDir:    workDir,
-		Image:      e.defaultImage,
-		Config:     cfg,
+		Key:         warm.PoolKey(req.FunctionID, req.Version, cfg),
+		FunctionID:  req.FunctionID,
+		Version:     req.Version,
+		WorkDir:     workDir,
+		Image:       e.defaultImage,
+		Config:      cfg,
+		TraceID:     ntrace.ID(ctx),
+		TraceParent: ntrace.Header(ctx),
 	}, warm.Invocation{
 		ExecutionID: req.ExecutionID,
 		Event:       event,
+		TraceID:     ntrace.ID(ctx),
+		TraceParent: ntrace.Header(ctx),
 		Log: func(stream, line string) {
 			writeUserLog(ctx, logWriter, stream, line)
 		},
 		Begin: func(m warm.Meta) {
+			acquireSpan.SetAttributes(
+				attribute.Bool("nimbus.cold_start", m.ColdStart),
+				attribute.Int64("nimbus.init_ms", m.InitMs),
+			)
+			acquireSpan.End()
+			_, runSpan = ntrace.Start(ctx, "container.run")
+			runSpan.SetAttributes(
+				attribute.String("nimbus.function_id", req.FunctionID),
+				attribute.String("nimbus.execution_id", req.ExecutionID),
+				attribute.Bool("nimbus.cold_start", m.ColdStart),
+			)
+			runStarted = true
 			logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] coldStart=%t initMs=%d", m.ColdStart, m.InitMs))
 		},
 	})
+	if !runStarted {
+		acquireSpan.End()
+	} else {
+		runSpan.End()
+	}
 
 	result.ColdStart = meta.ColdStart
 	result.InitMs = meta.InitMs

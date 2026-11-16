@@ -7,6 +7,10 @@ import (
 	"log"
 	"sync"
 	"time"
+
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/metrics"
+	ntrace "github.com/PedroCarassale/nimbus/compute-plane/internal/trace"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // Runner executes one attempt. The compute plane passes the same function
@@ -155,13 +159,17 @@ func (w *Worker) Handle(ctx context.Context, d Delivery) {
 	case ActionAck:
 		_ = w.q.Ack(ctx, d.ID)
 	case ActionDead:
-		w.dead(ctx, d, job, st, st.Attempt, firstNonEmpty(st.LastError, "el worker se cayó durante el intento"), st.ExitCode)
+		w.dead(ctx, d, job, st, st.Attempt, firstNonEmpty(st.LastError, "el worker se cayó durante el intento"), st.ExitCode, 0)
 	default:
 		w.runAttempt(ctx, d, job, st, attempt)
 	}
 }
 
 func (w *Worker) runAttempt(ctx context.Context, d Delivery, job Job, st State, attempt int) {
+	ctx = ntrace.Continue(ctx, job.TraceParent, job.TraceState)
+	ctx, span := ntrace.Start(ctx, "async.attempt")
+	defer span.End()
+
 	times := append([]int64{}, st.AttemptTimes...)
 	times = append(times, w.q.Now().UnixMilli())
 	running := State{
@@ -177,6 +185,11 @@ func (w *Worker) runAttempt(ctx context.Context, d Delivery, job Job, st State, 
 		return
 	}
 	meta := peekBody(job.Body)
+	span.SetAttributes(
+		attribute.String("nimbus.function_id", meta.FunctionID),
+		attribute.String("nimbus.invocation_id", job.InvocationID),
+		attribute.Int("nimbus.attempt", attempt),
+	)
 	_ = w.q.Publish(ctx, Result{
 		InvocationID: job.InvocationID,
 		ExecutionID:  meta.ExecutionID,
@@ -233,7 +246,7 @@ func (w *Worker) runAttempt(ctx context.Context, d Delivery, job Job, st State, 
 			result.Error = "la ejecución falló"
 		}
 		if attempt >= job.MaxAttempts {
-			w.dead(ctx, d, job, running, attempt, result.Error, result.ExitCode)
+			w.dead(ctx, d, job, running, attempt, result.Error, result.ExitCode, result.DurationMs)
 			return
 		}
 		next := job
@@ -251,6 +264,7 @@ func (w *Worker) runAttempt(ctx context.Context, d Delivery, job Job, st State, 
 			log.Printf("[async] no se pudo programar el reintento %s: %v", job.InvocationID, err)
 			return
 		}
+		metrics.AsyncRetry(meta.FunctionID)
 		_ = w.q.Publish(ctx, Result{
 			InvocationID: job.InvocationID,
 			ExecutionID:  meta.ExecutionID,
@@ -265,7 +279,7 @@ func (w *Worker) runAttempt(ctx context.Context, d Delivery, job Job, st State, 
 	}
 }
 
-func (w *Worker) dead(ctx context.Context, d Delivery, job Job, st State, attempts int, lastError string, exitCode int) {
+func (w *Worker) dead(ctx context.Context, d Delivery, job Job, st State, attempts int, lastError string, exitCode int, durationMs int64) {
 	meta := peekBody(job.Body)
 	now := w.q.Now().UnixMilli()
 	if attempts < 1 {
@@ -281,6 +295,7 @@ func (w *Worker) dead(ctx context.Context, d Delivery, job Job, st State, attemp
 		Status:       status,
 		Error:        lastError,
 		ExitCode:     exitCode,
+		DurationMs:   durationMs,
 		Attempts:     attempts,
 		At:           now,
 	}

@@ -34,7 +34,7 @@ func (d dockerStarter) Start(ctx context.Context, spec warm.Spec) (warm.Session,
 		image = d.image
 	}
 	name := warmContainerName()
-	args := dockerWarmArgs(name, spec.WorkDir, image, spec.Config, spec.FunctionID, spec.Version)
+	args := withExtraEnv(dockerWarmArgs(name, spec.WorkDir, image, spec.Config, spec.FunctionID, spec.Version), specTraceEnv(spec))
 	log.Printf("[executor] docker %s", formatArgsForLog(args))
 
 	sess, err := launchWarm(name, args)
@@ -88,6 +88,17 @@ func dockerWarmArgs(name, workDir, image string, cfg fnconfig.Resolved, function
 		image,
 	)
 	return args
+}
+
+func specTraceEnv(spec warm.Spec) []string {
+	var env []string
+	if spec.TraceID != "" {
+		env = append(env, "NIMBUS_TRACE_ID="+spec.TraceID)
+	}
+	if spec.TraceParent != "" {
+		env = append(env, "TRACEPARENT="+spec.TraceParent)
+	}
+	return env
 }
 
 func warmContainerName() string {
@@ -219,11 +230,18 @@ func (s *dockerWarmSession) Invoke(ctx context.Context, inv warm.Invocation) war
 	if event == nil {
 		event = map[string]interface{}{}
 	}
-	payload, err := json.Marshal(map[string]interface{}{
+	frame := map[string]interface{}{
 		"type":        "invoke",
 		"executionId": inv.ExecutionID,
 		"event":       event,
-	})
+	}
+	if inv.TraceID != "" {
+		frame["traceId"] = inv.TraceID
+	}
+	if inv.TraceParent != "" {
+		frame["traceparent"] = inv.TraceParent
+	}
+	payload, err := json.Marshal(frame)
 	if err != nil {
 		return warm.Outcome{ExitCode: 1, Tainted: true, Error: "No se pudo armar el pedido warm"}
 	}

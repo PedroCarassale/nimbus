@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -30,7 +31,7 @@ func TestWarmBootstrapProtocol(t *testing.T) {
 			if (event.boom) {
 				throw new Error("boom");
 			}
-			return { n, name: event.name };
+			return { n, name: event.name, traceId: process.env.NIMBUS_TRACE_ID || "" };
 		};
 	`)
 	if err := os.WriteFile(filepath.Join(root, "index.js"), source, 0o644); err != nil {
@@ -167,5 +168,33 @@ func TestWarmBootstrapProtocol(t *testing.T) {
 	// The failed call still incremented n before throwing. The process stayed up.
 	if out["n"].(float64) != 4 {
 		t.Fatalf("handler error discarded the process: %#v", out)
+	}
+
+	traceID := "0123456789abcdef0123456789abcdef"
+	traceParent := "00-" + traceID + "-0123456789abcdef-01"
+	payload, _ := json.Marshal(map[string]interface{}{
+		"type":        "invoke",
+		"executionId": "exec-e",
+		"event":       map[string]interface{}{"name": "Eve"},
+		"traceId":     traceID,
+		"traceparent": traceParent,
+	})
+	if _, err := stdin.Write(append(payload, '\n')); err != nil {
+		t.Fatal(err)
+	}
+	logs, done = collect("exec-e")
+	found = false
+	for _, frame := range logs {
+		line, _ := frame["line"].(string)
+		if strings.Contains(line, "traceId="+traceID) && strings.Contains(line, "traceparent="+traceParent) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("missing trace log: %#v", logs)
+	}
+	out = done["output"].(map[string]interface{})
+	if out["traceId"] != traceID || out["n"].(float64) != 5 {
+		t.Fatalf("trace env was not visible to the handler: %#v", out)
 	}
 }
