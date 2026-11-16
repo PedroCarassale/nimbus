@@ -66,6 +66,7 @@ make smoke        # Test completo: invoke, logs SSE, error y timeout
 make load         # 6 invokes en paralelo: 2 corren, 3 esperan, 1 recibe 429
 make config-check # timeout, memoria, env, handler y cpus contra el compute plane
 make warm-check   # cold start vs warm start, idle, timeout y OOM
+make async-check  # 202, reintentos, DLQ, redrive y reclaim si el compute plane muere
 make logs         # Ver logs de todos los servicios
 make down         # Detener el stack
 make down-clean   # Detener y eliminar volúmenes
@@ -193,8 +194,8 @@ curl -X POST http://localhost:3000/functions/{FN_ID}/invoke \
 | GET | `/functions` | Listar funciones |
 | GET | `/functions/:id` | Obtener detalles |
 | POST | `/functions/:id/deploy` | Desplegar zip |
-| POST | `/functions/:id/invoke` | Invocar función |
-| GET | `/invocations/:id` | Obtener detalles de invocación |
+| POST | `/functions/:id/invoke` | Invocar función. `?async=true` o `X-Invocation-Type: Event` responde 202 |
+| GET | `/invocations/:id` | Obtener detalles de invocación (`attempts` si ya corrió) |
 | GET | `/invocations/:id/logs` | Stream SSE de logs en vivo |
 
 #### Endpoints del Compute Plane (interno)
@@ -204,6 +205,9 @@ curl -X POST http://localhost:3000/functions/{FN_ID}/invoke \
 | GET | `/health` | Health check |
 | POST | `/executions` | Ejecutar función (Nest → Go) |
 | POST | `/executions/:id/cancel` | Cancelar ejecución |
+| POST | `/async/jobs` | Encolar una invocación async (Nest → Go). Responde 202 |
+| GET | `/dlq` | Listar la DLQ |
+| POST | `/dlq/:id/redrive` | Volver a encolar una entrada de la DLQ |
 
 ### Live Logs con SSE (Slice 5)
 
@@ -313,6 +317,8 @@ Cliente HTTP
 
 `coldStart` e `initMs` son opcionales para el cliente: dicen si el compute plane arrancó un container nuevo y cuánto tardó en estar listo. Con un container reutilizado, `coldStart` es `false` e `initMs` es `0`. Nest no reenvía esos campos todavía. Detalle en [docs/warm.md](docs/warm.md).
 
+**Async.** `POST /functions/:id/invoke?async=true` (o `X-Invocation-Type: Event`) responde 202 con el id y ejecuta en background. El resultado se lee con `GET /invocations/:id`. Reintentos, DLQ y variables: [docs/async.md](docs/async.md). Sin ese flag la respuesta sigue siendo 200 cuando termina.
+
 **Error 429 (cola llena o espera agotada).** El compute plane responde 429 y el control plane lo reexpone como `429 Too Many Requests`. Detalle, variables y el campo opcional `maxConcurrency` en [docs/concurrencia.md](docs/concurrencia.md).
 
 ```json
@@ -381,6 +387,10 @@ Cliente HTTP
 | `NIMBUS_SLOT_LEASE_SEC` | `30` | Vencimiento de un slot si el proceso deja de renovarlo |
 | `NIMBUS_WARM` | `1` | `0`, `false`, `off` o `no` desactivan el pool y vuelven a un container por invoke |
 | `NIMBUS_WARM_IDLE_SEC` | `60` | Tiempo que un container ocioso permanece en el pool |
+| `NIMBUS_ASYNC_MAX_ATTEMPTS` | `3` | Intentos de una invocación async (el primero más los reintentos) |
+| `NIMBUS_ASYNC_BACKOFF_BASE_MS` | `500` | Espera después del primer fallo. Después se duplica, con tope y jitter |
+| `NIMBUS_ASYNC_CLAIM_IDLE_MS` | `20000` | Idle para reclamar un mensaje cuyo worker murió |
+| `NIMBUS_ASYNC_LOCK_MS` | `15000` | Lock para no ejecutar la misma invocación dos veces a la vez |
 
 **Control Plane — Redis (Slice 5):**
 

@@ -18,7 +18,7 @@ compute-plane/
 ```
 - Cada función admite N ejecuciones a la vez (`NIMBUS_FN_CONCURRENCY`, default 2). El resto espera en una cola FIFO de Redis, con tope (`NIMBUS_FN_QUEUE_MAX`) y 429 si se llena. Hay un tope global de ejecuciones por proceso (`NIMBUS_MAX_CONTAINERS`). Detalle en [`concurrencia.md`](concurrencia.md).
 - Un container ya iniciado se reutiliza para la misma función, versión y config efectiva. Si está frío, idle o vino sucio (timeout, crash, OOM), se arranca uno nuevo. Detalle en [`warm.md`](warm.md).
-- Todas las invocaciones son sincrónicas.
+- El invoke sync sigue igual. Con `?async=true` o `X-Invocation-Type: Event` Nest responde 202 y un worker del compute plane ejecuta el mismo camino (semáforo, cola, config, warm, logs). Reintentos con backoff y DLQ en Redis. Detalle en [`async.md`](async.md).
 
 ### Paso 0 — Base estable
 - [x] Correr `make up` + `make hello` con Docker real y arreglar lo que rompa.
@@ -44,9 +44,11 @@ Detalle de campos, defaults y límites: [`configuracion.md`](configuracion.md).
 Detalle del protocolo, las variables y los números: [`warm.md`](warm.md).
 
 ### Paso 4 — Invocación async + reintentos + DLQ
-- [ ] Invocación async: responde enseguida con un id y ejecuta en segundo plano.
-- [ ] Reintentos con backoff cuando falla.
-- [ ] DLQ: las invocaciones que fallan todos los reintentos quedan guardadas para revisar.
+- [x] Invocación async: responde enseguida con un id y ejecuta en segundo plano.
+- [x] Reintentos con backoff cuando falla.
+- [x] DLQ: las invocaciones que fallan todos los reintentos quedan guardadas para revisar.
+
+Detalle de la cola, las variables y la operación de la DLQ: [`async.md`](async.md).
 
 ### Paso 5 — Observabilidad
 - [ ] Métricas en Prometheus: invocaciones, errores, duración, cold starts, tamaño de la cola.

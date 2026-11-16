@@ -88,6 +88,8 @@ jobs:
         run: make config-check
       - name: make warm-check
         run: make warm-check
+      - name: make async-check
+        run: make async-check
       - name: Logs on failure
         if: failure()
         run: docker compose logs --no-color > compose-logs.txt || true

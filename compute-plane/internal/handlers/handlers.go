@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/async"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/concurrency"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/executor"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/fnconfig"
@@ -29,6 +30,7 @@ type Handler struct {
 	executor    runner
 	concurrency locker
 	defaults    fnconfig.Defaults
+	queue       *async.Queue
 }
 
 func New(exec *executor.Executor, concMgr *concurrency.Manager) *Handler {
@@ -41,6 +43,12 @@ func NewWithDefaults(exec *executor.Executor, concMgr *concurrency.Manager, defa
 		concurrency: concMgr,
 		defaults:    defaults,
 	}
+}
+
+// SetQueue attaches the durable async queue. Without it the async endpoints
+// answer 503 and the sync path is unchanged.
+func (h *Handler) SetQueue(q *async.Queue) {
+	h.queue = q
 }
 
 func (h *Handler) effectiveDefaults() fnconfig.Defaults {
@@ -93,33 +101,19 @@ func (h *Handler) StartExecution(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.ExecutionID == "" || req.FunctionID == "" || req.Version == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "executionId, functionId y version son requeridos",
-		})
-		return
+	status, payload := h.dispatch(r.Context(), req)
+	if status == http.StatusTooManyRequests {
+		w.Header().Set("Retry-After", "5")
 	}
+	writeJSON(w, status, payload)
+}
 
-	resolved, err := fnconfig.Resolve(fnconfig.Raw{
-		TimeoutSec: req.TimeoutSec,
-		MemoryMB:   req.MemoryMB,
-		CPUs:       req.CPUs,
-		Handler:    req.Handler,
-		EnvVars:    req.EnvVars,
-	}, h.effectiveDefaults())
-	if err != nil {
-		var ferr *fnconfig.FieldError
-		if errors.As(err, &ferr) {
-			log.Printf("[handler] Configuración rechazada para %s: %s", req.ExecutionID, ferr.Message)
-			writeJSON(w, http.StatusBadRequest, map[string]string{
-				"error": ferr.Message,
-				"field": ferr.Field,
-			})
-			return
-		}
-		log.Printf("[handler] Configuración rechazada para %s", req.ExecutionID)
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Configuración inválida"})
-		return
+// dispatch validates, takes a concurrency slot and runs the container.
+// Sync HTTP and the async worker both go through here.
+func (h *Handler) dispatch(ctx context.Context, req StartExecutionRequest) (int, any) {
+	resolved, status, payload := h.validate(req)
+	if status != 0 {
+		return status, payload
 	}
 
 	log.Printf("[handler] StartExecution: %s (fn: %s, v: %s, timeout: %ds, memory: %dMB, cpus: %s, handler: %s, env: %d)",
@@ -129,14 +123,13 @@ func (h *Handler) StartExecution(w http.ResponseWriter, r *http.Request) {
 	if maxConcurrency < 0 {
 		maxConcurrency = 0
 	}
-	queuedMs, err := h.concurrency.Acquire(r.Context(), req.FunctionID, req.ExecutionID, maxConcurrency)
+	queuedMs, err := h.concurrency.Acquire(ctx, req.FunctionID, req.ExecutionID, maxConcurrency)
 	if err != nil {
-		writeAdmissionError(w, req.ExecutionID, queuedMs, err)
-		return
+		return admissionResult(req.ExecutionID, queuedMs, err)
 	}
 
 	defer func() {
-		if releaseErr := h.concurrency.Release(context.WithoutCancel(r.Context()), req.FunctionID, req.ExecutionID); releaseErr != nil {
+		if releaseErr := h.concurrency.Release(context.WithoutCancel(ctx), req.FunctionID, req.ExecutionID); releaseErr != nil {
 			log.Printf("[handler] Error liberando slot: %v", releaseErr)
 		}
 	}()
@@ -149,8 +142,7 @@ func (h *Handler) StartExecution(w http.ResponseWriter, r *http.Request) {
 		Config:      resolved,
 	}
 
-	result := h.executor.Execute(r.Context(), execReq)
-
+	result := h.executor.Execute(ctx, execReq)
 	resp := StartExecutionResponse{
 		ExecutionID: result.ExecutionID,
 		Success:     result.Success,
@@ -162,16 +154,38 @@ func (h *Handler) StartExecution(w http.ResponseWriter, r *http.Request) {
 		ColdStart:   result.ColdStart,
 		InitMs:      result.InitMs,
 	}
+	if !result.Success && result.ExitCode == 124 {
+		return http.StatusGatewayTimeout, resp
+	}
+	return http.StatusOK, resp
+}
 
-	w.Header().Set("Content-Type", "application/json")
-	if !result.Success {
-		if result.ExitCode == 124 {
-			w.WriteHeader(http.StatusGatewayTimeout)
-		} else {
-			w.WriteHeader(http.StatusOK)
+func (h *Handler) validate(req StartExecutionRequest) (fnconfig.Resolved, int, any) {
+	if req.ExecutionID == "" || req.FunctionID == "" || req.Version == "" {
+		return fnconfig.Resolved{}, http.StatusBadRequest, map[string]string{
+			"error": "executionId, functionId y version son requeridos",
 		}
 	}
-	json.NewEncoder(w).Encode(resp)
+	resolved, err := fnconfig.Resolve(fnconfig.Raw{
+		TimeoutSec: req.TimeoutSec,
+		MemoryMB:   req.MemoryMB,
+		CPUs:       req.CPUs,
+		Handler:    req.Handler,
+		EnvVars:    req.EnvVars,
+	}, h.effectiveDefaults())
+	if err != nil {
+		var ferr *fnconfig.FieldError
+		if errors.As(err, &ferr) {
+			log.Printf("[handler] Configuración rechazada para %s: %s", req.ExecutionID, ferr.Message)
+			return fnconfig.Resolved{}, http.StatusBadRequest, map[string]string{
+				"error": ferr.Message,
+				"field": ferr.Field,
+			}
+		}
+		log.Printf("[handler] Configuración rechazada para %s", req.ExecutionID)
+		return fnconfig.Resolved{}, http.StatusBadRequest, map[string]string{"error": "Configuración inválida"}
+	}
+	return resolved, 0, nil
 }
 
 type CancelExecutionResponse struct {
@@ -193,53 +207,45 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	json.NewEncoder(w).Encode(payload)
 }
 
-func writeAdmissionError(w http.ResponseWriter, executionID string, queuedMs int64, err error) {
-	w.Header().Set("Content-Type", "application/json")
+func admissionResult(executionID string, queuedMs int64, err error) (int, any) {
 	switch {
 	case errors.Is(err, concurrency.ErrQueueFull):
 		log.Printf("[handler] Cola llena, ejecución %s rechazada", executionID)
-		w.Header().Set("Retry-After", "5")
-		w.WriteHeader(http.StatusTooManyRequests)
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		return http.StatusTooManyRequests, map[string]interface{}{
 			"error":       "Cola llena para esta función",
 			"executionId": executionID,
 			"retryAfter":  5,
 			"reason":      "queue_full",
 			"queuedMs":    queuedMs,
-		})
+		}
 	case errors.Is(err, concurrency.ErrWaitTimeout):
 		log.Printf("[handler] Tiempo de espera en cola agotado para %s", executionID)
-		w.Header().Set("Retry-After", "5")
-		w.WriteHeader(http.StatusTooManyRequests)
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		return http.StatusTooManyRequests, map[string]interface{}{
 			"error":       "Tiempo máximo de espera en cola excedido",
 			"executionId": executionID,
 			"retryAfter":  5,
 			"reason":      "queue_timeout",
 			"queuedMs":    queuedMs,
-		})
+		}
 	case errors.Is(err, concurrency.ErrCancelled):
 		log.Printf("[handler] Ejecución %s cancelada en la cola", executionID)
-		w.WriteHeader(http.StatusConflict)
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		return http.StatusConflict, map[string]interface{}{
 			"error":       "Ejecución cancelada mientras esperaba en la cola",
 			"executionId": executionID,
 			"queuedMs":    queuedMs,
-		})
+		}
 	case errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
-		w.WriteHeader(http.StatusRequestTimeout)
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		return http.StatusRequestTimeout, map[string]interface{}{
 			"error":       "La solicitud de ejecución fue cancelada",
 			"executionId": executionID,
 			"queuedMs":    queuedMs,
-		})
+		}
 	default:
 		log.Printf("[handler] Error de admisión: %v", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		return http.StatusInternalServerError, map[string]interface{}{
 			"error":       "Error interno de admisión",
 			"executionId": executionID,
-		})
+		}
 	}
 }
 

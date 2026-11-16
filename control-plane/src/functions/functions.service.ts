@@ -3,6 +3,7 @@ import {
   NotFoundException,
   ConflictException,
 } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { MinioService } from '../minio/minio.service';
 import { CreateFunctionDto } from './dto/create-function.dto';
@@ -127,25 +128,46 @@ export class FunctionsService {
     });
   }
 
+  async findInvocation(id: string) {
+    return this.prisma.invocation.findUnique({ where: { id } });
+  }
+
   async updateInvocation(
     id: string,
     data: {
-      status: 'RUNNING' | 'SUCCESS' | 'ERROR' | 'TIMEOUT';
+      status: 'PENDING' | 'RUNNING' | 'SUCCESS' | 'ERROR' | 'TIMEOUT';
       executionId?: string;
       output?: unknown;
-      error?: string;
-      durationMs?: number;
+      error?: string | null;
+      durationMs?: number | null;
+      attempts?: number | null;
+      clearOutput?: boolean;
     },
   ) {
+    const patch: Prisma.InvocationUpdateInput = { status: data.status };
+    if (data.executionId !== undefined) {
+      patch.executionId = data.executionId;
+    }
+    if (data.clearOutput) {
+      patch.output = Prisma.DbNull;
+    } else if (data.output !== undefined) {
+      patch.output =
+        data.output === null
+          ? Prisma.DbNull
+          : (data.output as Prisma.InputJsonValue);
+    }
+    if (data.error !== undefined) {
+      patch.error = data.error;
+    }
+    if (data.durationMs !== undefined) {
+      patch.durationMs = data.durationMs;
+    }
+    if (data.attempts !== undefined) {
+      patch.attempts = data.attempts;
+    }
     return this.prisma.invocation.update({
       where: { id },
-      data: {
-        status: data.status,
-        executionId: data.executionId,
-        output: data.output as object | undefined,
-        error: data.error,
-        durationMs: data.durationMs,
-      },
+      data: patch,
     });
   }
 
