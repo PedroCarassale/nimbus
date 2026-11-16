@@ -6,6 +6,7 @@ Plataforma serverless (estilo Lambda) de Pedro Carassale y Federico Tessadro.
 
 - **Stack técnico del MVP:** [docs/stack.md](docs/stack.md)
 - **Roadmap hasta el MVP:** [docs/roadmap.md](docs/roadmap.md)
+- **Observabilidad:** [docs/observabilidad.md](docs/observabilidad.md)
 - **Auditoría IA (cátedra):** [AI-DECISIONS.md](AI-DECISIONS.md)
 - **Instrucciones para agentes:** [agents.md](agents.md)
 
@@ -30,6 +31,10 @@ make console
 ```
 
 **Consola Web:** http://localhost:8088
+
+`make up` construye la imagen `nimbus-node` y crea `/tmp/nimbus-work`. Ese directorio va montado con el mismo path en el compute plane y en el host: el daemon de Docker resuelve ahí el código de la función.
+
+El servicio S3 del compose es Silo (`pgsty/silo`), compatible con la API de MinIO. Las imágenes `minio/minio` y `minio/mc` ya no se pueden descargar sin cuenta.
 
 Esto demuestra el flujo completo del MVP:
 - **Control Plane** (NestJS): crea función, almacena metadata en Postgres, sube código a MinIO
@@ -58,7 +63,13 @@ Esto demuestra el flujo completo del MVP:
 ```bash
 make help         # Ver todos los comandos disponibles
 make console      # Abrir consola web en http://localhost:8088
-make smoke        # Test completo con verificación de logs SSE
+make smoke        # Test completo: invoke, logs SSE, error y timeout
+make load         # 6 invokes en paralelo: 2 corren, 3 esperan, 1 recibe 429
+make config-check # timeout, memoria, env, handler y cpus contra el compute plane
+make warm-check   # cold start vs warm start, idle, timeout y OOM
+make async-check  # 202, reintentos, DLQ, redrive y reclaim si el compute plane muere
+make obs          # Prometheus, Grafana y Jaeger (no entra en make up)
+make obs-check    # tráfico real y consulta a las APIs de Prometheus, Grafana y Jaeger
 make logs         # Ver logs de todos los servicios
 make down         # Detener el stack
 make down-clean   # Detener y eliminar volúmenes
@@ -182,12 +193,13 @@ curl -X POST http://localhost:3000/functions/{FN_ID}/invoke \
 | Método | Endpoint | Descripción |
 |--------|----------|-------------|
 | GET | `/health` | Health check |
+| GET | `/metrics` | Métricas HTTP de Prometheus |
 | POST | `/functions` | Crear función |
 | GET | `/functions` | Listar funciones |
 | GET | `/functions/:id` | Obtener detalles |
 | POST | `/functions/:id/deploy` | Desplegar zip |
-| POST | `/functions/:id/invoke` | Invocar función |
-| GET | `/invocations/:id` | Obtener detalles de invocación |
+| POST | `/functions/:id/invoke` | Invocar función. `?async=true` o `X-Invocation-Type: Event` responde 202 |
+| GET | `/invocations/:id` | Obtener detalles de invocación (`attempts` si ya corrió) |
 | GET | `/invocations/:id/logs` | Stream SSE de logs en vivo |
 
 #### Endpoints del Compute Plane (interno)
@@ -195,8 +207,12 @@ curl -X POST http://localhost:3000/functions/{FN_ID}/invoke \
 | Método | Endpoint | Descripción |
 |--------|----------|-------------|
 | GET | `/health` | Health check |
+| GET | `/metrics` | Métricas Prometheus |
 | POST | `/executions` | Ejecutar función (Nest → Go) |
 | POST | `/executions/:id/cancel` | Cancelar ejecución |
+| POST | `/async/jobs` | Encolar una invocación async (Nest → Go). Responde 202 |
+| GET | `/dlq` | Listar la DLQ |
+| POST | `/dlq/:id/redrive` | Volver a encolar una entrada de la DLQ |
 
 ### Live Logs con SSE (Slice 5)
 
@@ -254,10 +270,11 @@ Cliente HTTP
                ▼
 ┌─────────────────────────────────────┐
 │   Compute Plane (Go :8080)          │
-│   - Adquiere lock Redis por función │
+│   - Admite N ejecuciones por función│
+│   - Si está llena, espera en cola   │
 │   - Descarga artifact de MinIO      │
 │   - Ejecuta Docker (isolated)       │
-│   - Libera lock y retorna resultado │
+│   - Libera el slot y responde       │
 └─────────────────────────────────────┘
                │
                ▼
@@ -279,9 +296,14 @@ Cliente HTTP
   "event": { "key": "value" },
   "timeoutSec": 5,
   "memoryMb": 128,
-  "handler": "handler"
+  "cpus": 0.5,
+  "handler": "index.handler",
+  "envVars": { "GREETING": "hola" },
+  "maxConcurrency": 2
 }
 ```
+
+`timeoutSec`, `memoryMb`, `cpus`, `handler` y `envVars` son opcionales. Un valor fuera de rango responde 400. Límites, defaults y el formato `archivo.export` del handler: [docs/configuracion.md](docs/configuracion.md). Nest hoy manda timeout, memoria y handler desde variables de entorno, y no manda `cpus` ni `envVars`.
 
 **Response:**
 ```json
@@ -291,16 +313,26 @@ Cliente HTTP
   "output": { "resultado": "..." },
   "error": "",
   "exitCode": 0,
-  "durationMs": 150
+  "durationMs": 150,
+  "queuedMs": 0,
+  "coldStart": true,
+  "initMs": 420
 }
 ```
 
-**Error 429 (función ocupada):**
+`coldStart` e `initMs` son opcionales para el cliente: dicen si el compute plane arrancó un container nuevo y cuánto tardó en estar listo. Con un container reutilizado, `coldStart` es `false` e `initMs` es `0`. Nest no reenvía esos campos todavía. Detalle en [docs/warm.md](docs/warm.md).
+
+**Async.** `POST /functions/:id/invoke?async=true` (o `X-Invocation-Type: Event`) responde 202 con el id y ejecuta en background. El resultado se lee con `GET /invocations/:id`. Reintentos, DLQ y variables: [docs/async.md](docs/async.md). Sin ese flag la respuesta sigue siendo 200 cuando termina.
+
+**Error 429 (cola llena o espera agotada).** El compute plane responde 429 y el control plane lo reexpone como `429 Too Many Requests`. Detalle, variables y el campo opcional `maxConcurrency` en [docs/concurrencia.md](docs/concurrencia.md).
+
 ```json
 {
-  "error": "Función ocupada, reintente más tarde",
+  "error": "Cola llena para esta función",
   "executionId": "uuid",
-  "retryAfter": 5
+  "retryAfter": 5,
+  "reason": "queue_full",
+  "queuedMs": 0
 }
 ```
 
@@ -310,9 +342,11 @@ Cliente HTTP
 
 | Variable | Default | Descripción |
 |----------|---------|-------------|
-| `NIMBUS_MEMORY` | `128m` | Límite de memoria Docker |
-| `NIMBUS_TIMEOUT_SEC` | `5` | Timeout de ejecución en segundos |
-| `NIMBUS_HANDLER` | `handler` | Nombre de la función exportada |
+| `NIMBUS_MEMORY` | `128m` | Límite de memoria Docker (`scripts/run-zip.sh`) |
+| `NIMBUS_MEMORY_MB` | `128` | Default de `memoryMb` en el compute plane (64..2048) |
+| `NIMBUS_TIMEOUT_SEC` | `5` | Timeout de ejecución en segundos (1..300 en el compute plane) |
+| `NIMBUS_HANDLER` | `handler` | Handler `archivo.export` (default: export `handler` de `index.js`) |
+| `NIMBUS_CPUS` | vacío | Default de `--cpus` (0.1..4). Vacío: sin cuota |
 | `NIMBUS_IMAGE` | `nimbus-node` | Nombre de la imagen Docker |
 
 **MinIO (Slice 2):**
@@ -346,6 +380,26 @@ Cliente HTTP
 |----------|---------|-------------|
 | `COMPUTE_PLANE_URL` | `http://compute-plane:8080` | URL del compute plane (para Nest) |
 | `COMPUTE_PLANE_PORT` | `8080` | Puerto del compute plane |
+| `NIMBUS_WORK_DIR` | `/tmp/nimbus-work` | Directorio de trabajo compartido con el daemon de Docker. El path tiene que coincidir dentro del contenedor y en el host |
+| `NIMBUS_TIMEOUT_SEC` | `5` | Default de `timeoutSec` si el request no lo manda |
+| `NIMBUS_MEMORY_MB` | `128` | Default de `memoryMb` si el request no lo manda |
+| `NIMBUS_HANDLER` | `handler` | Default del handler si el request no lo manda |
+| `NIMBUS_CPUS` | vacío | Default de CPU. Vacío: no se pasa `--cpus` |
+| `NIMBUS_FN_CONCURRENCY` | `2` | Ejecuciones simultáneas por función |
+| `NIMBUS_FN_QUEUE_MAX` | `32` | Tamaño de la cola por función (`0` = sin espera, 429 al tope) |
+| `NIMBUS_FN_QUEUE_WAIT_SEC` | `30` | Espera máxima en la cola antes de un 429 |
+| `NIMBUS_MAX_CONTAINERS` | `8` | Tope de ejecuciones vivas y de containers warm en este compute plane |
+| `NIMBUS_SLOT_LEASE_SEC` | `30` | Vencimiento de un slot si el proceso deja de renovarlo |
+| `NIMBUS_WARM` | `1` | `0`, `false`, `off` o `no` desactivan el pool y vuelven a un container por invoke |
+| `NIMBUS_WARM_IDLE_SEC` | `60` | Tiempo que un container ocioso permanece en el pool |
+| `NIMBUS_ASYNC_MAX_ATTEMPTS` | `3` | Intentos de una invocación async (el primero más los reintentos) |
+| `NIMBUS_ASYNC_BACKOFF_BASE_MS` | `500` | Espera después del primer fallo. Después se duplica, con tope y jitter |
+| `NIMBUS_ASYNC_CLAIM_IDLE_MS` | `20000` | Idle para reclamar un mensaje cuyo worker murió |
+| `NIMBUS_ASYNC_LOCK_MS` | `15000` | Lock para no ejecutar la misma invocación dos veces a la vez |
+| `NIMBUS_TRACING` | `1` | `0`, `false`, `off` o `no` apagan la exportación de trazas |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://otel-collector:4318` | Collector OTLP. Si no está, la invocación sigue |
+
+Métricas, dashboard y Jaeger: [docs/observabilidad.md](docs/observabilidad.md). `make obs` los levanta. `make up` no.
 
 **Control Plane — Redis (Slice 5):**
 
@@ -387,7 +441,7 @@ nimbus-functions/
 │   ├── internal/
 │   │   ├── handlers/      # HTTP handlers (StartExecution, Cancel)
 │   │   ├── executor/      # Descarga MinIO + Docker run
-│   │   ├── concurrency/   # Redis locks distribuidos
+│   │   ├── concurrency/   # Semáforo y cola FIFO en Redis
 │   │   └── minio/         # Cliente MinIO
 │   ├── Dockerfile         # Imagen del compute plane
 │   └── go.mod             # Dependencias Go

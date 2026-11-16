@@ -31,6 +31,7 @@ log_fail() { echo -e "${RED}[✗]${NC} $1"; exit 1; }
 # Verificar dependencias
 command -v curl >/dev/null 2>&1 || log_fail "curl requerido"
 command -v jq >/dev/null 2>&1 || log_fail "jq requerido"
+command -v zip >/dev/null 2>&1 || log_fail "zip requerido"
 
 # Esperar a que el compute-plane esté listo
 log_info "Esperando compute-plane en $COMPUTE_URL..."
@@ -108,30 +109,92 @@ echo "=== Resultado de Invocación ==="
 echo "$INVOKE_RESPONSE" | jq '.'
 echo ""
 
-if [ "$STATUS" == "SUCCESS" ]; then
-  log_ok "Invocación exitosa (${DURATION}ms, requestId: $REQUEST_ID)"
-  
-  # 4. Verificar logs SSE
-  log_info "Verificando logs SSE para invocación $INVOCATION_ID..."
-  
-  LOGS_RESPONSE=$(curl -sf -N "$API_URL/invocations/$INVOCATION_ID/logs?follow=false" 2>&1 | head -20)
-  
-  if echo "$LOGS_RESPONSE" | grep -q "event: log"; then
-    log_ok "Logs SSE disponibles (stream key: nimbus:logs:$EXECUTION_ID)"
-    echo ""
-    echo "=== Ejemplo de logs SSE ==="
-    echo "$LOGS_RESPONSE" | head -10
-    echo "..."
-  else
-    log_info "Logs SSE: stream puede haber expirado o no generado aún"
-  fi
-  
-  echo ""
-  echo -e "${GREEN}=== SMOKE TEST PASSED ===${NC}"
-  echo ""
-  echo "Para ver logs en vivo de futuras invocaciones:"
-  echo "  curl -N $API_URL/invocations/{invocationId}/logs"
-  exit 0
-else
-  log_fail "Invocación falló con status: $STATUS"
+if [ "$STATUS" != "SUCCESS" ]; then
+  log_fail "Invocación falló con status: $STATUS — $INVOKE_RESPONSE"
 fi
+
+MESSAGE=$(echo "$INVOKE_RESPONSE" | jq -r '.output.body.message // empty')
+if ! echo "$MESSAGE" | grep -q "Hola"; then
+  log_fail "La salida no es el JSON del handler: $INVOKE_RESPONSE"
+fi
+log_ok "Invocación exitosa (${DURATION}ms, requestId: $REQUEST_ID, mensaje: $MESSAGE)"
+
+# 4. Verificar logs SSE (snapshot y follow)
+log_info "Verificando logs SSE para invocación $INVOCATION_ID..."
+
+LOGS_RESPONSE=$(curl -sf --max-time 20 "$API_URL/invocations/$INVOCATION_ID/logs?follow=false")
+if ! echo "$LOGS_RESPONSE" | grep -q "event: log"; then
+  log_fail "No hay eventos de log SSE: $LOGS_RESPONSE"
+fi
+if ! echo "$LOGS_RESPONSE" | grep -q "event: end"; then
+  log_fail "El stream SSE no cerró con event: end: $LOGS_RESPONSE"
+fi
+log_ok "Logs SSE (follow=false) disponibles (stream key: nimbus:logs:$EXECUTION_ID)"
+
+log_info "Siguiendo logs con curl -N ..."
+LIVE_LOGS=$(curl -sf -N --max-time 20 "$API_URL/invocations/$INVOCATION_ID/logs")
+if ! echo "$LIVE_LOGS" | grep -q "event: log"; then
+  log_fail "curl -N no recibió logs: $LIVE_LOGS"
+fi
+log_ok "Logs SSE en vivo (curl -N) OK"
+
+# 5. Caso de error del handler
+log_info "Probando un handler que falla..."
+ERR_NAME="smoke-error-$(date +%s)"
+ERR_DIR=$(mktemp -d)
+cat > "$ERR_DIR/index.js" <<'EOF'
+exports.handler = async () => {
+  throw new Error("fallo de prueba");
+};
+EOF
+(cd "$ERR_DIR" && zip -q -r "$ERR_DIR/code.zip" index.js)
+ERR_CREATE=$(curl -sf -X POST "$API_URL/functions" \
+  -H "Content-Type: application/json" \
+  -d "{\"name\": \"$ERR_NAME\"}")
+ERR_FN=$(echo "$ERR_CREATE" | jq -r '.id')
+curl -sf -X POST "$API_URL/functions/$ERR_FN/deploy" -F "file=@$ERR_DIR/code.zip" >/dev/null
+ERR_INVOKE=$(curl -sf -X POST "$API_URL/functions/$ERR_FN/invoke" \
+  -H "Content-Type: application/json" \
+  -d '{"event": {}}')
+ERR_STATUS=$(echo "$ERR_INVOKE" | jq -r '.status')
+ERR_TEXT=$(echo "$ERR_INVOKE" | jq -r '.error // empty')
+if [ "$ERR_STATUS" != "ERROR" ]; then
+  log_fail "Se esperaba ERROR y llegó $ERR_STATUS: $ERR_INVOKE"
+fi
+if ! echo "$ERR_TEXT" | grep -q "fallo de prueba"; then
+  log_fail "El error no incluye el mensaje del handler: $ERR_INVOKE"
+fi
+log_ok "Handler con error devuelve ERROR"
+rm -rf "$ERR_DIR"
+
+# 6. Caso de timeout (el timeout del stack incluye el arranque del container)
+log_info "Probando timeout..."
+TO_NAME="smoke-timeout-$(date +%s)"
+TO_DIR=$(mktemp -d)
+cat > "$TO_DIR/index.js" <<'EOF'
+exports.handler = async () => {
+  await new Promise((resolve) => setTimeout(resolve, 30000));
+  return { ok: true };
+};
+EOF
+(cd "$TO_DIR" && zip -q -r "$TO_DIR/code.zip" index.js)
+TO_CREATE=$(curl -sf -X POST "$API_URL/functions" \
+  -H "Content-Type: application/json" \
+  -d "{\"name\": \"$TO_NAME\"}")
+TO_FN=$(echo "$TO_CREATE" | jq -r '.id')
+curl -sf -X POST "$API_URL/functions/$TO_FN/deploy" -F "file=@$TO_DIR/code.zip" >/dev/null
+TO_INVOKE=$(curl -sf --max-time 60 -X POST "$API_URL/functions/$TO_FN/invoke" \
+  -H "Content-Type: application/json" \
+  -d '{"event": {}}')
+TO_STATUS=$(echo "$TO_INVOKE" | jq -r '.status')
+if [ "$TO_STATUS" != "TIMEOUT" ]; then
+  log_fail "Se esperaba TIMEOUT y llegó $TO_STATUS: $TO_INVOKE"
+fi
+log_ok "Timeout devuelve TIMEOUT"
+rm -rf "$TO_DIR"
+
+echo ""
+echo -e "${GREEN}=== SMOKE TEST PASSED ===${NC}"
+echo ""
+echo "Para ver logs en vivo de futuras invocaciones:"
+echo "  curl -N $API_URL/invocations/{invocationId}/logs"

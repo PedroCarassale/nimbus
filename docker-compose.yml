@@ -39,8 +39,10 @@ services:
       retries: 5
       start_period: 5s
 
+  # Silo es un fork S3 compatible con MinIO. Las imágenes minio/minio y
+  # minio/mc ya no se pueden bajar sin cuenta (Docker Hub y quay.io).
   minio:
-    image: minio/minio:latest
+    image: pgsty/silo:RELEASE.2026-10-26T00-00-00Z@sha256:7bb2aff6b89efe1cb1303c10fc21d579447434ed06649ac9ec05a5e2dbf30ad7
     container_name: nimbus-minio
     ports:
       - "9000:9000"   # API S3
@@ -52,14 +54,14 @@ services:
       - minio-data:/data
     command: server /data --console-address ":9001"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 10s
+      test: ["CMD", "silo", "healthcheck", "live"]
+      interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
       start_period: 5s
 
   minio-init:
-    image: minio/mc:latest
+    image: pgsty/mc:latest@sha256:b532278b7a3747dbab6fe45eebb40a653efa704e6758e24e9d9ec54fc96c1800
     container_name: nimbus-minio-init
     depends_on:
       minio:
@@ -70,10 +72,18 @@ services:
       MINIO_BUCKET: ${MINIO_BUCKET:-nimbus-artifacts}
     entrypoint: >
       /bin/sh -c "
-        mc alias set nimbus http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD};
+        i=0;
+        until mc alias set nimbus http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD}; do
+          i=$$((i+1));
+          if [ $$i -ge 30 ]; then
+            echo 'No se pudo configurar el alias de Silo/MinIO';
+            exit 1;
+          fi;
+          sleep 1;
+        done;
         mc mb nimbus/$${MINIO_BUCKET} --ignore-existing;
         mc anonymous set download nimbus/$${MINIO_BUCKET};
-        echo 'Bucket $${MINIO_BUCKET} listo';
+        echo Bucket $${MINIO_BUCKET} listo;
       "
 
   compute-plane:
@@ -91,20 +101,52 @@ services:
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
       MINIO_BUCKET: ${MINIO_BUCKET:-nimbus-artifacts}
       NIMBUS_IMAGE: nimbus-node
+      # Mismo path en el contenedor y en el host: el daemon resuelve -v.
+      NIMBUS_WORK_DIR: /tmp/nimbus-work
+      NIMBUS_TIMEOUT_SEC: ${NIMBUS_TIMEOUT_SEC:-5}
+      NIMBUS_MEMORY_MB: ${NIMBUS_MEMORY_MB:-128}
+      NIMBUS_HANDLER: ${NIMBUS_HANDLER:-handler}
+      NIMBUS_CPUS: ${NIMBUS_CPUS:-}
+      NIMBUS_FN_CONCURRENCY: ${NIMBUS_FN_CONCURRENCY:-2}
+      NIMBUS_FN_QUEUE_MAX: ${NIMBUS_FN_QUEUE_MAX:-32}
+      NIMBUS_FN_QUEUE_WAIT_SEC: ${NIMBUS_FN_QUEUE_WAIT_SEC:-30}
+      NIMBUS_MAX_CONTAINERS: ${NIMBUS_MAX_CONTAINERS:-8}
+      NIMBUS_SLOT_LEASE_SEC: ${NIMBUS_SLOT_LEASE_SEC:-30}
+      NIMBUS_WARM: ${NIMBUS_WARM:-1}
+      NIMBUS_WARM_IDLE_SEC: ${NIMBUS_WARM_IDLE_SEC:-60}
+      NIMBUS_ASYNC_ENABLED: ${NIMBUS_ASYNC_ENABLED:-1}
+      NIMBUS_ASYNC_MAX_ATTEMPTS: ${NIMBUS_ASYNC_MAX_ATTEMPTS:-3}
+      NIMBUS_ASYNC_BACKOFF_BASE_MS: ${NIMBUS_ASYNC_BACKOFF_BASE_MS:-500}
+      NIMBUS_ASYNC_BACKOFF_MAX_MS: ${NIMBUS_ASYNC_BACKOFF_MAX_MS:-30000}
+      NIMBUS_ASYNC_BACKOFF_JITTER_MS: ${NIMBUS_ASYNC_BACKOFF_JITTER_MS:-250}
+      NIMBUS_ASYNC_CLAIM_IDLE_MS: ${NIMBUS_ASYNC_CLAIM_IDLE_MS:-20000}
+      NIMBUS_ASYNC_LOCK_MS: ${NIMBUS_ASYNC_LOCK_MS:-15000}
+      NIMBUS_ASYNC_WORKERS: ${NIMBUS_ASYNC_WORKERS:-4}
+      # Tracing is on by default and exports in the background. make up does
+      # not start the collector; a down collector must not fail invocations.
+      NIMBUS_TRACING: ${NIMBUS_TRACING:-1}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318}
+      OTEL_SERVICE_NAME: nimbus-compute-plane
     depends_on:
       redis:
         condition: service_healthy
       minio:
         condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      # Bind mount con el mismo path adentro y afuera. Un volume con nombre
+      # no sirve: el daemon vería otra ruta al hacer docker run -v.
+      - /tmp/nimbus-work:/tmp/nimbus-work
       - ./runtime-node:/app/runtime-node:ro
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      # wget --spider manda HEAD y chi no enruta HEAD en GET. Hay que hacer GET.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/health"]
       interval: 10s
       timeout: 5s
-      retries: 5
-      start_period: 10s
+      retries: 8
+      start_period: 20s
 
   control-plane:
     build:
@@ -124,6 +166,9 @@ services:
       NIMBUS_TIMEOUT_SEC: ${NIMBUS_TIMEOUT_SEC:-5}
       NIMBUS_MEMORY: ${NIMBUS_MEMORY:-128m}
       NIMBUS_HANDLER: ${NIMBUS_HANDLER:-handler}
+      NIMBUS_TRACING: ${NIMBUS_TRACING:-1}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318}
+      OTEL_SERVICE_NAME: nimbus-control-plane
       NODE_ENV: development
     depends_on:
       postgres:
@@ -132,14 +177,16 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
       compute-plane:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
       interval: 10s
       timeout: 5s
-      retries: 5
-      start_period: 30s
+      retries: 8
+      start_period: 40s
 
   console:
     build:
@@ -152,11 +199,73 @@ services:
       control-plane:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:80"]
+      # wget resuelve localhost a ::1 y nginx escucha en IPv4. 127.0.0.1 evita
+      # un healthcheck que falla para siempre con "connection refused".
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:80"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 10s
+
+  # Observabilidad (Paso 5). No entra en `make up`: `make obs` o `make obs-check`.
+  otel-collector:
+    image: otel/opentelemetry-collector:0.114.0
+    container_name: nimbus-otel-collector
+    profiles: ["obs"]
+    command: ["--config=/etc/otel/collector.yaml"]
+    volumes:
+      - ./observability/otel/collector.yaml:/etc/otel/collector.yaml:ro
+    ports:
+      - "4318:4318"
+    depends_on:
+      - jaeger
+    mem_limit: 128m
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    container_name: nimbus-jaeger
+    profiles: ["obs"]
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+    mem_limit: 384m
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: nimbus-prometheus
+    profiles: ["obs"]
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=24h"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    mem_limit: 256m
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: nimbus-grafana
+    profiles: ["obs"]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_AUTH_DISABLE_LOGIN_FORM: "false"
+      GF_USERS_DEFAULT_THEME: dark
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+    mem_limit: 256m
 
 volumes:
   postgres-data:

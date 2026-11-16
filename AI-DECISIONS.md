@@ -309,3 +309,226 @@ Formato pedido por la cátedra (AI-DECISIONS.md).
 
 División: el compute plane es la parte más compleja (procesos, aislamiento, concurrencia); el control plane concentra el producto que ve el usuario. El punto de integración es el contrato `POST /executions`, que se cambia de forma compatible hacia atrás y documentada en `docs/`.
 
+---
+
+## Paso 0 — Base estable del compute plane
+
+**Problema abordado:** El stack del MVP (`make up`, `make hello`, logs SSE) no se había ejecutado de punta a punta con Docker. El compute plane no podía ver el código del usuario desde el daemon, no interpretaba el JSON multilínea del runtime, el timeout no devolvía el exit code 124 del contrato, el healthcheck hacía HEAD contra una ruta que solo acepta GET, y las imágenes oficiales de MinIO ya no se pueden bajar.
+
+**Prompt / Herramienta utilizada:** Cursor Cloud Agent (Grok 4.7), sobre el pedido de Paso 0 del roadmap de Pedro: Docker real, `make up` / `make hello` / `make smoke`, logs SSE, casos de timeout y error, tests Go y GitHub Actions.
+
+**Código / Arquitectura generada:**
+
+1. **Ejecución (compute plane)**
+   - `NIMBUS_WORK_DIR=/tmp/nimbus-work` se monta con el mismo path en el contenedor y en el host, porque `docker run -v` lo resuelve el daemon.
+   - El resultado del handler se parsea aunque el bootstrap lo imprima en varias líneas.
+   - El timeout lo aplica el contexto de Go, mata el container con `docker rm -f` y responde exit code 124.
+   - El cliente de artifacts crea el bucket si todavía no existe y guarda el zip bajo el directorio compartido.
+   - CLI de Docker 27 (Alpine 3.21) para hablar con Engine 29.
+   - Tests con miniredis de locks, streams de logs, handlers HTTP y helpers del executor.
+
+2. **Infra**
+   - Compose usa Silo (`pgsty/silo`) y `pgsty/mc` en lugar de `minio/minio` y `minio/mc`, con digest fijo.
+   - `make up` construye `nimbus-node`, crea el directorio de trabajo y espera también a la consola.
+   - `make smoke` exige logs SSE (`follow=false` y `curl -N`), un handler que lanza error y un timeout.
+   - GitHub Actions: build/vet/test de Go, build de Nest, build de la consola y job de compose smoke.
+
+3. **Ajustes mínimos fuera del compute plane, necesarios para el flujo**
+   - Control plane: OpenSSL 3 y `binaryTargets` de Prisma para que `migrate` arranque en Alpine; el `XREAD` de ioredis se normaliza porque `call()` devuelve un solo stream y el SSE en vivo no cerraba.
+   - El contrato `POST /executions` no cambia.
+
+**Validación y Corrección Humana:** Riesgos que quedan en el diseño: el compute plane monta el socket de Docker del host; `/tmp/nimbus-work` contiene el código de las funciones en el host; el timeout cuenta desde que arranca `docker run`, incluido el cold start del container.
+
+---
+
+## Paso 1 — Concurrencia real y cola
+
+**Problema abordado:** El compute plane tomaba un lock Redis `nimbus:lock:fn:{functionId}` y la segunda invocación de la misma función no esperaba: competía unos segundos y, si el lock seguía tomado, respondía 429. Hacía falta N ejecuciones simultáneas, una cola con límite, un tope de containers por máquina, y que cancelar también saque de la cola a quien todavía no arrancó.
+
+**Prompt / Herramienta utilizada:** Cursor Cloud Agent (Grok 4.7), pedido de Paso 1 del roadmap de Pedro, apilado sobre la rama de Paso 0.
+
+**Código / Arquitectura generada:**
+
+1. **Admisión en Redis (compute plane)**
+   - El lock `SET NX` se reemplaza por un semáforo: sorted set `nimbus:slots:fn:{functionId}` con lease (score = vencimiento). El proceso renueva el lease hasta `Release`. Si el proceso muere, la próxima admisión borra los scores vencidos.
+   - La cola es otro sorted set, `nimbus:queue:fn:{functionId}`, ordenado por un ticket `INCR` (FIFO). Solo la cabeza toma un slot cuando hay lugar. Quien espera refresca un `heartbeat`; si deja de hacerlo durante la espera máxima, se lo saca de la cola.
+   - El tope global es `nimbus:slots:machine:{hostname}` contra `NIMBUS_MAX_CONTAINERS`. Cuenta ejecuciones con slot, antes de `docker run`.
+   - La decisión (entrar, encolar o rechazar) es un script Lua.
+   - Env: `NIMBUS_FN_CONCURRENCY` (default 2), `NIMBUS_FN_QUEUE_MAX` (32), `NIMBUS_FN_QUEUE_WAIT_SEC` (30), `NIMBUS_MAX_CONTAINERS` (8), `NIMBUS_SLOT_LEASE_SEC` (30).
+   - `POST /executions` acepta `maxConcurrency` opcional. La respuesta suma `queuedMs`.
+   - Cola llena o espera vencida: HTTP 429 con `reason` `queue_full` o `queue_timeout`.
+   - `POST /executions/:id/cancel` saca al queued de la cola (el request bloqueado responde 409). Una ejecución que ya corre queda marcada y conserva el slot hasta el release.
+
+2. **Control plane, cambio chico**
+   - `runner.service.ts` propaga el 429.
+   - `functions.controller.ts` lo responde como `429 Too Many Requests`, y guarda la invocación en `ERROR`.
+
+3. **Prueba**
+   - Tests con miniredis (N en paralelo, FIFO, cola llena, timeout de espera, lease vencido, cabeza de cola muerta, tope global, cancel de queued) y `go test -race` en CI.
+   - `make load` dispara 6 invokes de `examples/slow` con concurrencia 2 y cola 3.
+
+El contrato queda en `docs/concurrencia.md`.
+
+**Validación y Corrección Humana:** Riesgos que quedan en el diseño: el tope global es por proceso (hostname), no por un conteo de `docker ps`; un container huérfano puede seguir vivo después de que el lease venció. Cancelar una ejecución que ya corre no mata el container, solo deja el flag. `maxConcurrency` en el request aplica a esa admisión: dos requests en vuelo con valores distintos pueden llegar al mayor de los dos, siempre bajo `NIMBUS_MAX_CONTAINERS`. El slot vencido se recupera en la próxima admisión, con una ventana de `NIMBUS_SLOT_LEASE_SEC`.
+
+---
+
+## Paso 2 — Configuración por función en el compute plane
+
+**Problema abordado:** `POST /executions` ya recibía `timeoutSec`, `memoryMb` y `handler`, pero el handler era solo el nombre del export sobre `index.js` (`index.handler` no resolvía un archivo), no había variables de entorno ni CPU, y un valor absurdo (timeout 0 o memoria enorme) se aceptaba o se reemplazaba en silencio. La config por función del control plane la sigue guardando Federico; Go tiene que aplicar el contrato cuando el body la trae.
+
+**Prompt / Herramienta utilizada:** Cursor Cloud Agent (Grok 4.7), pedido de Paso 2 del roadmap de Pedro, apilado sobre la rama de Paso 1.
+
+**Código / Arquitectura generada:**
+
+1. **Contrato en el compute plane**
+   - `internal/fnconfig` valida cada request. Campos opcionales: `timeoutSec` (1..300, default `NIMBUS_TIMEOUT_SEC` o 5), `memoryMb` (64..2048, default `NIMBUS_MEMORY_MB` o 128), `cpus` (0.1..4, default `NIMBUS_CPUS`; vacío = sin `--cpus`), `handler` y `envVars`.
+   - `0` o ausente usa el default, igual que antes. Cualquier otro valor fuera de rango responde 400 con `error` y `field`, antes de tomar un slot.
+   - `envVars`: hasta 32 variables, nombre `[A-Za-z_][A-Za-z0-9_]*`, valor hasta 4096 bytes, total 16 KiB, sin saltos de línea. Un nombre `NIMBUS_*` se rechaza. Los valores no se escriben en el log del proceso: el `docker run` queda como `CLAVE=***`.
+   - El handler es `archivo.export`. `handler` sigue siendo el export `handler` de `index.js`. `index.handler` y `src/app.main` eligen archivo y export. El bootstrap deja de fijar el archivo en `index.js` cuando viene `NIMBUS_HANDLER`.
+
+2. **Docker**
+   - `--memory` y `--memory-swap` con el mismo tope, `--cpus` si hay cuota, y las variables de la plataforma después de las del usuario.
+   - El container no usa `--rm`. Al terminar, Go lee `OOMKilled` y lo borra. Si el cgroup lo mató (137) o Node abortó por el heap (134), la respuesta dice que superó `memoryMb`.
+   - El timeout de 124 no cambia: el plazo incluye el arranque del container. El deadline HTTP del server cubre 300s más la espera de cola.
+
+3. **Control plane**
+   - Sin campos Prisma y sin cambios en Nest. `runner.service.ts` sigue mandando timeout, memoria y handler desde el entorno, y no manda `envVars` ni `cpus`. El body que tiene que pasar a mandar está en `docs/configuracion.md`.
+
+4. **Prueba**
+   - Tests de Go de los límites y de los argumentos de `docker run`, con `-race`.
+   - `make config-check` pega directo a `:8080` después de subir el zip por Nest: 400, defaults, `process.env`, log sin el secreto, `src/app.main`, timeout 2s sobre un sleep de 5s, OOM y `docker inspect` de `--cpus`.
+
+**Validación y Corrección Humana:** Riesgos que quedan en el diseño: los valores de `envVars` viajan en el argv de `docker run` y `docker inspect` los muestra mientras el container existe. El log del compute plane los redacta; si el handler los imprime, quedan en su stdout y en el stream de logs. `getRemainingTimeInMillis` sigue en 0. El timeout cuenta el cold start. Nest todavía no persiste ni reenvía la config por función, así que `make hello` sigue con los defaults del entorno.
+
+## Paso 3 — Containers warm en el compute plane
+
+**Problema abordado:** Cada `POST /executions` hacía `docker run` de un container nuevo. El tiempo de la invocación incluía siempre el arranque de Node, aunque la función, la versión y la config efectiva no hubieran cambiado. Había que reutilizar containers ya prendidos sin aflojar el aislamiento del slice 1, sin mezclar logs de dos ejecuciones, y sin volver a usar un container que hizo timeout, se cayó o lo mató el OOM.
+
+**Prompt / Herramienta utilizada:** Cursor Cloud Agent (Grok 4.7), pedido de Paso 3 del roadmap de Pedro, apilado sobre la rama de Paso 2.
+
+**Código / Arquitectura generada:**
+
+1. **Protocolo dentro de `runtime-node`**
+   - Con `NIMBUS_WARM=1` el bootstrap carga el handler una vez y se queda leyendo una línea JSON por stdin. Responde por stdout líneas `{type:ready}`, `{type:log}`, `{type:done}` o `{type:fatal}`.
+   - `console.log` / `console.error` se reemiten como frames de log. El protocolo escribe con `fs.writeSync(1)` para no envolverse a sí mismo.
+   - Se eligió stdin/stdout y no HTTP ni un socket unix: el container sigue con `--network=none` y sin un mount extra de permisos. Un `docker run -i` deja un solo proceso.
+   - Una excepción del handler se reporta en `done` con `ok:false` y el proceso sigue. El estado de módulo entre invokes del mismo container se conserva, como en Lambda.
+   - Escribir directo al fd 1 desde el código del usuario desincroniza el protocolo: ese container se descarta.
+
+2. **Pool en el compute plane**
+   - `internal/warm` guarda slots en memoria del proceso. La clave es función + versión + handler + `memoryMb` + `cpus` + hash de `envVars`. El timeout no entra en la clave: cada invoke corta con su propio deadline de Go.
+   - Tope por función = `NIMBUS_FN_CONCURRENCY` (default 2), acotado por `NIMBUS_MAX_CONTAINERS` (default 8). Los containers ociosos cuentan para ese tope. Si no entra otro slot, se desaloja el ocioso más viejo (LRU). Si todos están ocupados, esa invocación usa un container efímero que se borra al terminar.
+   - Un ocioso vive `NIMBUS_WARM_IDLE_SEC` (default 60). Un reaper lo borra. `NIMBUS_WARM=0|false|off|no` apaga el pool y vuelve al `docker run` de un solo uso.
+   - Timeout (124), crash, OOM o un frame que no cierra dejan el slot marcado y el container se borra con `docker rm -f`. No se reutiliza.
+   - Durante el invoke el container se renombra a `nimbus-{executionId}` para que `docker inspect` de la prueba de CPU lo encuentre, y después vuelve al nombre del pool.
+   - Labels `nimbus.warm=1`, `nimbus.functionId` y `nimbus.version`. Al arrancar se hace `docker rm -f` de los que quedaron con ese label. Al apagar el proceso se destruyen los del pool.
+   - El código descomprimido vive en `NIMBUS_WORK_DIR/warm-code/` y se monta en `/var/task:ro`. El container warm corre `--user node`, con `--read-only`, `--tmpfs /tmp` y `HOME=/tmp`. El camino frío no cambia de usuario.
+   - La respuesta de `POST /executions` suma `coldStart` e `initMs`. `initMs` mide desde `docker start` hasta el frame `ready` (mínimo 1 si el reloj da 0). En un acierto warm, `initMs` es 0. En el camino frío de un solo uso, `coldStart` es true e `initMs` es 0 porque ese camino no separa el arranque. Un 429 de cola no lleva esos campos. Nest no los reenvía.
+
+3. **Aislamiento que se mantiene**
+   - `--memory` y `--memory-swap` iguales, `--pids-limit=256`, `--network=none`, filesystem de solo lectura, límites de CPU si vinieron en la config. Los logs de cada invoke siguen yendo a `nimbus:logs:{executionId}`.
+
+4. **Prueba**
+   - Tests de Go del pool con reloj inyectado y sesiones falsas: reuso, clave, descarte, TTL, LRU, tope por función, efímero, shutdown, carrera. `go test -race ./...`.
+   - `make warm-check` pega a `:8080`: series cold/warm, streams de log separados, `docker ps` vacío después del idle, timeout y OOM que obligan un cold siguiente.
+   - En esta máquina la mediana de `durationMs` fue 166 ms en cold y 41 ms en warm; la mediana de `initMs` del cold fue 118 ms. La primera invocación, con descarga del zip, tardó 163 ms.
+
+**Validación y Corrección Humana:** Riesgos que quedan en el diseño: el estado de módulo (y cualquier cosa en `/tmp`) se filtra entre invokes del mismo container. Un `write` directo al fd 1 rompe el framing y obliga a tirar el container. Los valores de `envVars` siguen visibles en `docker inspect` mientras el container vive. `NIMBUS_TIMEOUT_SEC` dentro del container es el del invoke que lo creó; el corte real lo hace Go. Cancelar una ejecución que ya corre sigue sin matar el container. Los ociosos cuentan para `NIMBUS_MAX_CONTAINERS`. El tmpfs de `/tmp` entra en la cuenta de memoria del cgroup. El camino frío sigue arrancando como root de la imagen. Nest no reenvía `coldStart` ni `initMs`.
+
+---
+
+## Paso 4 — Invocación async, reintentos y DLQ
+
+**Problema abordado:** Todas las invocaciones bloqueaban al cliente hasta que el container terminaba. No había reintento si el handler fallaba o el proceso moría a mitad, ni un lugar donde quedara lo que agotó los intentos. La fila de Postgres tiene que terminar con el estado, el output y la cantidad de intentos, y el invoke síncrono tiene que seguir respondiendo igual.
+
+**Prompt / Herramienta utilizada:** Cursor Cloud Agent (Grok 4.7), pedido de Paso 4 del roadmap de Pedro, apilado sobre la rama de Paso 3.
+
+**Código / Arquitectura generada:**
+
+1. **Cola durable en el compute plane**
+   - `POST /async/jobs` valida la config (un 400 no se encola y no va a la DLQ) y hace `XADD` a `nimbus:async:jobs`. El mismo `invocationId` no entra dos veces.
+   - Workers del proceso leen con un consumer group. `XAUTOCLAIM` recupera mensajes cuyo consumer murió. Un lock con renovación impide que la misma invocación corra dos veces a la vez. Si el lock venció, ese intento se cuenta y el siguiente arranca.
+   - El worker llama al mismo `dispatch` que `POST /executions`: semáforo, cola FIFO, config, pool warm y logs.
+   - Un fallo reintentable (handler, timeout, crash, 429) se confirma y se guarda en el sorted set `nimbus:async:retry` con el vencimiento del backoff. El backoff es exponencial con tope y jitter. Default: 3 intentos (el primero más dos reintentos).
+   - Al agotar los intentos, la entrada va a la DLQ (hash + stream) con payload, último error, intentos y timestamps. `GET /dlq` la lista. `POST /dlq/:id/redrive` la vuelve a encolar como intento 1.
+   - Cada resultado se publica en `nimbus:async:results` con un `seq` por invocación.
+
+2. **Control plane, cambio chico**
+   - `POST /functions/:id/invoke?async=true` o `X-Invocation-Type: Event` crea la fila y responde 202 con el id. Sin el flag, la respuesta sigue siendo 200 cuando termina.
+   - El sync marca `RUNNING` antes de llamar a Go. El async lo marca cuando el worker arranca el intento.
+   - Columna opcional `invocations.attempts`. `GET /invocations/:id` la devuelve.
+   - Un consumidor de Nest aplica el stream de resultados. Go no escribe Postgres.
+
+3. **Prueba**
+   - Tests de Go con miniredis: backoff, retry diferido, DLQ, redrive, `XAUTOCLAIM`, el lock y que un 400 no reintenta. `go test -race ./...`.
+   - `make async-check` cubre el 202, el SUCCESS posterior, el sync, la DLQ con timestamps, el redrive y un `SIGKILL` del compute plane a mitad de un sleep.
+
+El contrato queda en `docs/async.md`.
+
+**Validación y Corrección Humana:** Riesgos que quedan en el diseño: el reclaim y el contenedor huérfano pueden solaparse unos segundos después de un kill, hasta que el arranque borra los warm. Los intentos de una misma invocación comparten `executionId` y el stream de logs, así que un `_end` de un intento puede aparecer antes que las líneas del siguiente. El 429 de la cola de concurrencia gasta un intento. `NIMBUS_ASYNC_CLAIM_IDLE_MS` más corto que una ejecución larga hace que otro worker vea el mensaje pendiente; el lock evita correrlo dos veces, pero el idle se reinicia. Nest aplica resultados en orden de `seq`; si ese consumidor está caído, la fila se actualiza cuando vuelve.
+
+---
+
+## Paso 5 — Observabilidad del compute plane
+
+**Problema abordado:** No había forma de ver, fuera de los logs, cuántas invocaciones corrían, cuántas fallaban, cuánto duraban, cuántas fueron cold o warm, ni qué tan llena estaba la cola o la DLQ. Tampoco se podía seguir un invoke desde Nest hasta el container.
+
+**Prompt / Herramienta utilizada:** Cursor Cloud Agent (Grok 4.7), pedido de Paso 5 del roadmap de Pedro, apilado sobre la rama de Paso 4.
+
+**Código / Arquitectura generada:**
+
+1. **Métricas en el compute plane**
+   - `GET /metrics` con `prometheus/client_golang`. Contadores de invocaciones por `function_id`, `status` (`success`, `error`, `timeout`, `oom`) y `mode` (`sync`, `async`), más series aparte de errores, timeouts y OOM.
+   - Histograma de duración, cold vs warm, e histograma de `initMs`.
+   - Espera de cola, profundidad de la cola por función (scrape a Redis), ejecuciones activas, tamaño del pool warm, slots globales y el tope `NIMBUS_MAX_CONTAINERS`.
+   - Rechazos 429 (`queue_full`, `queue_timeout`), reintentos async y el tamaño de la DLQ.
+   - `function_id` es etiqueta. `execution_id` no: una serie por ejecución no se queda quieta.
+
+2. **Trazas OpenTelemetry**
+   - Go exporta OTLP HTTP con un batch processor. `NIMBUS_TRACING=0` (o `OTEL_SDK_DISABLED=true`) no instala el exporter. Si el collector no responde, el error se loguea como mucho cada 30s y la invocación no falla.
+   - Nest abre `nimbus.invoke` y `nimbus.compute.call`, e inyecta `traceparent` en `POST /executions` y `POST /async/jobs`.
+   - El job de Redis guarda `traceparent` y `tracestate`. El worker abre `async.attempt` en esa traza, también en los reintentos.
+   - Los spans de Go son `queue.wait`, `artifact.download`, `container.acquire` y `container.run`.
+   - El container recibe `NIMBUS_TRACE_ID` y `TRACEPARENT`. En el camino frío van en `docker -e`. En el warm el proceso se reutiliza, así que cada invoke los manda en el frame de stdin y el bootstrap los publica en `process.env` para esa llamada, y los escribe en el log.
+
+3. **Perfil de Compose**
+   - `make up` no levanta observabilidad. `make obs` prende Prometheus (`:9090`), Grafana (`:3001`, viewer anónimo, dashboard provisionado), Jaeger (`:16686`) y un collector OTLP (`:4318`) que reenvía a Jaeger.
+   - `make obs-check` genera sync, async, error, timeout, OOM, DLQ y un 429, y consulta las APIs. CI no corre ese target.
+
+4. **Control plane, cambio chico**
+   - `GET /metrics` con dos series HTTP (`nimbus_http_requests_total`, `nimbus_http_request_duration_seconds`). Los UUID del path se reemplazan por `:id`.
+   - `runner.service.ts` propaga el traceparent. No hay columnas nuevas. El body de `POST /executions` no cambia.
+
+**Validación y Corrección Humana:** Riesgos que quedan en el diseño: el trace id dentro de un container warm se actualiza por invoke en `process.env`, pero `docker inspect` sigue mostrando el valor del `docker run` que creó el proceso. Un collector caído descarta spans; no hay cola durable de trazas. La profundidad de cola y la DLQ se leen en el scrape, así que un pico más corto que el intervalo de 5s puede no aparecer. `nimbus_containers_in_use` cuenta slots de Redis, no `docker ps`. Las etiquetas por `function_id` crecen con la cantidad de funciones del proceso.
+
+---
+
+## QA de los pasos 0 a 5
+
+**Problema abordado:** El stack de los pasos 0 a 5 (concurrencia, config, warm, async y observabilidad) estaba entero en ramas sin mergear. Había que correrlo junto, buscar interacciones que los checks de cada paso no cubren, y corregir lo que se rompiera.
+
+**Prompt / Herramienta utilizada:** Cursor Cloud Agent (Grok 4.7). Pedido de QA profundo del stack #9–#15, con Docker en la VM, la suite de `make` dos veces, un flujo de consola con Chrome headless, stress, restarts, zips maliciosos y compatibilidad (`NIMBUS_WARM=0`, `NIMBUS_TRACING=0`, body mínimo de `POST /executions`).
+
+**Código / Arquitectura generada:**
+
+1. **Unzip del artifact en el host**
+   - Tope de 32 MiB descomprimidos, 4096 entradas, y rechazo de symlinks. El path `..` ya se rechazaba. El fallo sigue siendo `Error extrayendo zip`.
+
+2. **Cancel de un async que todavía no fue admitido**
+   - `XADD`, el retry y el redrive crean `nimbus:exec:{id}` en `pending` (TTL 24 h). El admit, si ve `cancelled`, no ejecuta. Un 409 es fatal: no reintenta y no entra a la DLQ.
+
+3. **DLQ**
+   - `dead()` copia `DurationMs` del intento. Antes el JSON lo perdía (`omitempty`).
+
+4. **Tag de versión**
+   - Dejó de ser `YYYYMMDD-HHMMSS`. Ahora lleva milisegundos y un sufijo aleatorio, y un choque del unique reintenta con otro tag. El tag viejo hacía que un segundo deploy del mismo segundo pisara el zip en MinIO y devolviera 500.
+
+5. **Consola**
+   - El healthcheck de nginx usa `127.0.0.1` (wget resolvía `localhost` a `::1`). El panel SSE no marca error cuando el stream cierra después de `end`.
+
+6. **`make qa`**
+   - `scripts/qa-deep.sh` y `scripts/qa-console.mjs`. El informe está en `docs/qa-pasos-0-5.md`.
+
+**Validación y Corrección Humana:** Riesgos que quedan en el diseño: cancelar una ejecución que ya corre no mata el container. El camino frío (`NIMBUS_WARM=0`) sigue como root de la imagen. `docker inspect` muestra los env mientras el container vive. Las keys `nimbus:slots:machine:{hostname}` de un proceso muerto quedan con miembros ya vencidos. Multer no limita el tamaño del upload; el tope del zip aplica al descomprimir. Nest no reenvía `envVars` ni `cpus`, y no hay auth.
+

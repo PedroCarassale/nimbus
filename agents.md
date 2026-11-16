@@ -104,9 +104,19 @@ Ver `docs/roadmap.md` para el orden de slices. No adelantar:
 | Variable | Default | Descripción |
 |----------|---------|-------------|
 | `NIMBUS_MEMORY` | `128m` | Límite de memoria Docker |
+| `NIMBUS_MEMORY_MB` | `128` | Default de memoria del compute plane |
 | `NIMBUS_TIMEOUT_SEC` | `5` | Timeout de ejecución |
-| `NIMBUS_HANDLER` | `handler` | Nombre de la función exportada |
+| `NIMBUS_HANDLER` | `handler` | Spec `archivo.export` (default: export `handler` en `index.js`) |
+| `NIMBUS_CPUS` | vacío | Default de `--cpus`. Vacío: sin cuota |
 | `NIMBUS_IMAGE` | `nimbus-node` | Nombre de la imagen Docker |
+| `NIMBUS_WARM` | `1` | Pool de containers. `0` / `off` fuerza el camino frío |
+| `NIMBUS_WARM_IDLE_SEC` | `60` | Vida de un container ocioso en el pool |
+
+Pool warm (reuso, descarte por timeout/OOM, `coldStart`): [docs/warm.md](docs/warm.md).
+
+Configuración por invocación (`timeoutSec`, `memoryMb`, `cpus`, `handler`, `envVars`): [docs/configuracion.md](docs/configuracion.md).
+
+Concurrencia del compute plane (`NIMBUS_FN_CONCURRENCY`, cola, tope global): [docs/concurrencia.md](docs/concurrencia.md).
 
 ## Testing Local
 

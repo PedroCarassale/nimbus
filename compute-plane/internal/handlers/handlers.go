@@ -1,25 +1,66 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/async"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/concurrency"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/executor"
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/fnconfig"
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/metrics"
+	ntrace "github.com/PedroCarassale/nimbus/compute-plane/internal/trace"
 	"github.com/go-chi/chi/v5"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
+// runner executes user code. *executor.Executor implements it.
+type runner interface {
+	Execute(ctx context.Context, req *executor.ExecutionRequest) *executor.ExecutionResult
+}
+
+// locker admits executions through the Redis semaphore. *concurrency.Manager implements it.
+type locker interface {
+	Acquire(ctx context.Context, functionID, executionID string, maxConcurrency int) (queuedMs int64, err error)
+	Release(ctx context.Context, functionID, executionID string) error
+	MarkForCancellation(ctx context.Context, executionID string) error
+}
+
 type Handler struct {
-	executor    *executor.Executor
-	concurrency *concurrency.Manager
+	executor    runner
+	concurrency locker
+	defaults    fnconfig.Defaults
+	queue       *async.Queue
 }
 
 func New(exec *executor.Executor, concMgr *concurrency.Manager) *Handler {
+	return NewWithDefaults(exec, concMgr, fnconfig.LoadDefaults())
+}
+
+func NewWithDefaults(exec *executor.Executor, concMgr *concurrency.Manager, defaults fnconfig.Defaults) *Handler {
 	return &Handler{
 		executor:    exec,
 		concurrency: concMgr,
+		defaults:    defaults,
 	}
+}
+
+// SetQueue attaches the durable async queue. Without it the async endpoints
+// answer 503 and the sync path is unchanged.
+func (h *Handler) SetQueue(q *async.Queue) {
+	h.queue = q
+}
+
+func (h *Handler) effectiveDefaults() fnconfig.Defaults {
+	if h.defaults.TimeoutSec == 0 || h.defaults.MemoryMB == 0 || h.defaults.Handler == "" {
+		return fnconfig.Builtin()
+	}
+	return h.defaults
 }
 
 func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
@@ -28,13 +69,16 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 }
 
 type StartExecutionRequest struct {
-	ExecutionID string                 `json:"executionId"`
-	FunctionID  string                 `json:"functionId"`
-	Version     string                 `json:"version"`
-	Event       map[string]interface{} `json:"event"`
-	TimeoutSec  int                    `json:"timeoutSec"`
-	MemoryMB    int                    `json:"memoryMb"`
-	Handler     string                 `json:"handler"`
+	ExecutionID    string                 `json:"executionId"`
+	FunctionID     string                 `json:"functionId"`
+	Version        string                 `json:"version"`
+	Event          map[string]interface{} `json:"event"`
+	TimeoutSec     json.RawMessage        `json:"timeoutSec"`
+	MemoryMB       json.RawMessage        `json:"memoryMb"`
+	CPUs           json.RawMessage        `json:"cpus"`
+	Handler        json.RawMessage        `json:"handler"`
+	EnvVars        json.RawMessage        `json:"envVars"`
+	MaxConcurrency int                    `json:"maxConcurrency,omitempty"`
 }
 
 type StartExecutionResponse struct {
@@ -44,54 +88,95 @@ type StartExecutionResponse struct {
 	Error       string      `json:"error,omitempty"`
 	ExitCode    int         `json:"exitCode"`
 	DurationMs  int64       `json:"durationMs"`
+	QueuedMs    int64       `json:"queuedMs"`
+	ColdStart   bool        `json:"coldStart"`
+	InitMs      int64       `json:"initMs"`
 }
 
 func (h *Handler) StartExecution(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var req StartExecutionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error": "JSON inválido"}`, http.StatusBadRequest)
+		msg := "JSON inválido"
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			msg = "El cuerpo de la solicitud supera 1 MB"
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": msg})
 		return
 	}
 
-	if req.ExecutionID == "" || req.FunctionID == "" || req.Version == "" {
-		http.Error(w, `{"error": "executionId, functionId y version son requeridos"}`, http.StatusBadRequest)
-		return
+	ctx := ntrace.ExtractHTTP(r.Context(), r.Header)
+	ctx, span := ntrace.Start(ctx, "nimbus.executions", trace.WithSpanKind(trace.SpanKindServer))
+	span.SetAttributes(
+		attribute.String("nimbus.function_id", req.FunctionID),
+		attribute.String("nimbus.mode", "sync"),
+	)
+	defer span.End()
+
+	status, payload := h.dispatch(ctx, req, "sync")
+	span.SetAttributes(attribute.Int("http.response.status_code", status))
+	if status >= 500 {
+		span.SetStatus(codes.Error, http.StatusText(status))
+	}
+	if status == http.StatusTooManyRequests {
+		w.Header().Set("Retry-After", "5")
+	}
+	writeJSON(w, status, payload)
+}
+
+// dispatch validates, takes a concurrency slot and runs the container.
+// Sync HTTP and the async worker both go through here.
+// mode is "sync" or "async" and is a metric label, not a trace id.
+func (h *Handler) dispatch(ctx context.Context, req StartExecutionRequest, mode string) (int, any) {
+	resolved, status, payload := h.validate(req)
+	if status != 0 {
+		return status, payload
 	}
 
-	log.Printf("[handler] StartExecution: %s (fn: %s, v: %s)", req.ExecutionID, req.FunctionID, req.Version)
+	ntrace.Logf(ctx, "[handler] StartExecution: %s (fn: %s, v: %s, timeout: %ds, memory: %dMB, cpus: %s, handler: %s, env: %d, mode: %s)",
+		req.ExecutionID, req.FunctionID, req.Version, resolved.TimeoutSec, resolved.MemoryMB, cpusLabel(resolved), resolved.Handler, len(resolved.Env), mode)
 
-	acquired, err := h.concurrency.AcquireLock(r.Context(), req.FunctionID, req.ExecutionID)
+	maxConcurrency := req.MaxConcurrency
+	if maxConcurrency < 0 {
+		maxConcurrency = 0
+	}
+	qctx, qspan := ntrace.Start(ctx, "queue.wait")
+	qspan.SetAttributes(attribute.String("nimbus.function_id", req.FunctionID))
+	queuedMs, err := h.concurrency.Acquire(qctx, req.FunctionID, req.ExecutionID, maxConcurrency)
+	qspan.SetAttributes(attribute.Int64("nimbus.queued_ms", queuedMs))
 	if err != nil {
-		log.Printf("[handler] Error adquiriendo lock: %v", err)
-		http.Error(w, `{"error": "Error interno adquiriendo lock"}`, http.StatusInternalServerError)
-		return
+		ntrace.Fail(qspan, err)
 	}
-	if !acquired {
-		log.Printf("[handler] No se pudo adquirir lock para función %s (concurrencia máxima)", req.FunctionID)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusTooManyRequests)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"error":       "Función ocupada, reintente más tarde",
-			"executionId": req.ExecutionID,
-			"retryAfter":  5,
-		})
-		return
+	qspan.End()
+	metrics.ObserveQueueWait(req.FunctionID, queuedMs)
+	if err != nil {
+		switch {
+		case errors.Is(err, concurrency.ErrQueueFull):
+			metrics.Rejection(req.FunctionID, "queue_full")
+		case errors.Is(err, concurrency.ErrWaitTimeout):
+			metrics.Rejection(req.FunctionID, "queue_timeout")
+		}
+		return admissionResult(req.ExecutionID, queuedMs, err)
 	}
 
-	defer h.concurrency.ReleaseLock(r.Context(), req.FunctionID, req.ExecutionID)
+	metrics.ActiveInc(req.FunctionID)
+	defer func() {
+		metrics.ActiveDec(req.FunctionID)
+		if releaseErr := h.concurrency.Release(context.WithoutCancel(ctx), req.FunctionID, req.ExecutionID); releaseErr != nil {
+			log.Printf("[handler] Error liberando slot: %v", releaseErr)
+		}
+	}()
 
 	execReq := &executor.ExecutionRequest{
 		ExecutionID: req.ExecutionID,
 		FunctionID:  req.FunctionID,
 		Version:     req.Version,
 		Event:       req.Event,
-		TimeoutSec:  req.TimeoutSec,
-		MemoryMB:    req.MemoryMB,
-		Handler:     req.Handler,
+		Config:      resolved,
 	}
 
-	result := h.executor.Execute(r.Context(), execReq)
-
+	result := h.executor.Execute(ctx, execReq)
 	resp := StartExecutionResponse{
 		ExecutionID: result.ExecutionID,
 		Success:     result.Success,
@@ -99,23 +184,105 @@ func (h *Handler) StartExecution(w http.ResponseWriter, r *http.Request) {
 		Error:       result.Error,
 		ExitCode:    result.ExitCode,
 		DurationMs:  result.DurationMs,
+		QueuedMs:    queuedMs,
+		ColdStart:   result.ColdStart,
+		InitMs:      result.InitMs,
 	}
+	outcome := metrics.Classify(result.Success, result.ExitCode, result.Error)
+	metrics.RecordInvocation(req.FunctionID, mode, outcome, result.DurationMs, result.ColdStart, result.InitMs)
+	if !result.Success && result.ExitCode == 124 {
+		return http.StatusGatewayTimeout, resp
+	}
+	return http.StatusOK, resp
+}
 
-	w.Header().Set("Content-Type", "application/json")
-	if !result.Success {
-		if result.ExitCode == 124 {
-			w.WriteHeader(http.StatusGatewayTimeout)
-		} else {
-			w.WriteHeader(http.StatusOK)
+func (h *Handler) validate(req StartExecutionRequest) (fnconfig.Resolved, int, any) {
+	if req.ExecutionID == "" || req.FunctionID == "" || req.Version == "" {
+		return fnconfig.Resolved{}, http.StatusBadRequest, map[string]string{
+			"error": "executionId, functionId y version son requeridos",
 		}
 	}
-	json.NewEncoder(w).Encode(resp)
+	resolved, err := fnconfig.Resolve(fnconfig.Raw{
+		TimeoutSec: req.TimeoutSec,
+		MemoryMB:   req.MemoryMB,
+		CPUs:       req.CPUs,
+		Handler:    req.Handler,
+		EnvVars:    req.EnvVars,
+	}, h.effectiveDefaults())
+	if err != nil {
+		var ferr *fnconfig.FieldError
+		if errors.As(err, &ferr) {
+			log.Printf("[handler] Configuración rechazada para %s: %s", req.ExecutionID, ferr.Message)
+			return fnconfig.Resolved{}, http.StatusBadRequest, map[string]string{
+				"error": ferr.Message,
+				"field": ferr.Field,
+			}
+		}
+		log.Printf("[handler] Configuración rechazada para %s", req.ExecutionID)
+		return fnconfig.Resolved{}, http.StatusBadRequest, map[string]string{"error": "Configuración inválida"}
+	}
+	return resolved, 0, nil
 }
 
 type CancelExecutionResponse struct {
 	ExecutionID string `json:"executionId"`
 	Cancelled   bool   `json:"cancelled"`
 	Message     string `json:"message"`
+}
+
+func cpusLabel(cfg fnconfig.Resolved) string {
+	if cfg.CPUsFlag == "" {
+		return "sin límite"
+	}
+	return cfg.CPUsFlag
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(payload)
+}
+
+func admissionResult(executionID string, queuedMs int64, err error) (int, any) {
+	switch {
+	case errors.Is(err, concurrency.ErrQueueFull):
+		log.Printf("[handler] Cola llena, ejecución %s rechazada", executionID)
+		return http.StatusTooManyRequests, map[string]interface{}{
+			"error":       "Cola llena para esta función",
+			"executionId": executionID,
+			"retryAfter":  5,
+			"reason":      "queue_full",
+			"queuedMs":    queuedMs,
+		}
+	case errors.Is(err, concurrency.ErrWaitTimeout):
+		log.Printf("[handler] Tiempo de espera en cola agotado para %s", executionID)
+		return http.StatusTooManyRequests, map[string]interface{}{
+			"error":       "Tiempo máximo de espera en cola excedido",
+			"executionId": executionID,
+			"retryAfter":  5,
+			"reason":      "queue_timeout",
+			"queuedMs":    queuedMs,
+		}
+	case errors.Is(err, concurrency.ErrCancelled):
+		log.Printf("[handler] Ejecución %s cancelada en la cola", executionID)
+		return http.StatusConflict, map[string]interface{}{
+			"error":       "Ejecución cancelada mientras esperaba en la cola",
+			"executionId": executionID,
+			"queuedMs":    queuedMs,
+		}
+	case errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
+		return http.StatusRequestTimeout, map[string]interface{}{
+			"error":       "La solicitud de ejecución fue cancelada",
+			"executionId": executionID,
+			"queuedMs":    queuedMs,
+		}
+	default:
+		log.Printf("[handler] Error de admisión: %v", err)
+		return http.StatusInternalServerError, map[string]interface{}{
+			"error":       "Error interno de admisión",
+			"executionId": executionID,
+		}
+	}
 }
 
 func (h *Handler) CancelExecution(w http.ResponseWriter, r *http.Request) {

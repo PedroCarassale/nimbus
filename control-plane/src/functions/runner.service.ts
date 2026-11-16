@@ -1,5 +1,12 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { v4 as uuidv4 } from 'uuid';
+import {
+  context,
+  propagation,
+  SpanKind,
+  SpanStatusCode,
+  trace,
+} from '@opentelemetry/api';
 
 export interface RunnerResult {
   executionId: string;
@@ -8,6 +15,16 @@ export interface RunnerResult {
   error?: string;
   exitCode: number;
   durationMs: number;
+  queuedMs?: number;
+  /** Set when the compute plane rejected the invocation (HTTP 429). */
+  httpStatus?: number;
+}
+
+export interface EnqueueResult {
+  executionId: string;
+  httpStatus: number;
+  error?: string;
+  field?: string;
 }
 
 interface ComputePlaneRequest {
@@ -18,6 +35,7 @@ interface ComputePlaneRequest {
   timeoutSec?: number;
   memoryMb?: number;
   handler?: string;
+  maxConcurrency?: number;
 }
 
 interface ComputePlaneResponse {
@@ -27,6 +45,7 @@ interface ComputePlaneResponse {
   error?: string;
   exitCode: number;
   durationMs: number;
+  queuedMs?: number;
 }
 
 /**
@@ -80,23 +99,29 @@ export class RunnerService {
         handler: process.env.NIMBUS_HANDLER || 'handler',
       };
 
-      const response = await fetch(`${this.computePlaneUrl}/executions`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(request),
-      });
+      const response = await this.tracedFetch(
+        'sync',
+        functionId,
+        `${this.computePlaneUrl}/executions`,
+        request,
+      );
 
       if (response.status === 429) {
-        const errorBody = await response.json();
+        const errorBody = (await response.json().catch(() => ({}))) as {
+          error?: string;
+          queuedMs?: number;
+        };
         return {
           executionId,
           success: false,
           output: null,
-          error: errorBody.error || 'Función ocupada, reintente más tarde',
-          exitCode: 1,
+          error:
+            errorBody.error ||
+            'Demasiadas invocaciones en cola. Reintentá más tarde.',
+          exitCode: 429,
           durationMs: Date.now() - startTime,
+          queuedMs: errorBody.queuedMs,
+          httpStatus: 429,
         };
       }
 
@@ -113,6 +138,7 @@ export class RunnerService {
         error: result.error,
         exitCode: result.exitCode,
         durationMs: result.durationMs,
+        queuedMs: result.queuedMs,
       };
     } catch (error) {
       const errorMessage =
@@ -128,6 +154,140 @@ export class RunnerService {
         durationMs: Date.now() - startTime,
       };
     }
+  }
+
+  /**
+   * Encola una invocación async. Go responde en cuanto Redis acepta el job.
+   * El mismo body que POST /executions, más invocationId.
+   */
+  async enqueue(
+    invocationId: string,
+    functionId: string,
+    version: string,
+    event: Record<string, unknown>,
+  ): Promise<EnqueueResult> {
+    const executionId = uuidv4();
+    const request: ComputePlaneRequest & { invocationId: string } = {
+      invocationId,
+      executionId,
+      functionId,
+      version,
+      event,
+      timeoutSec: parseInt(process.env.NIMBUS_TIMEOUT_SEC || '5', 10),
+      memoryMb: parseInt(
+        (process.env.NIMBUS_MEMORY || '128m').replace('m', ''),
+        10,
+      ),
+      handler: process.env.NIMBUS_HANDLER || 'handler',
+    };
+
+    try {
+      const response = await this.tracedFetch(
+        'async',
+        functionId,
+        `${this.computePlaneUrl}/async/jobs`,
+        request,
+      );
+      const body = (await response.json().catch(() => ({}))) as {
+        executionId?: string;
+        error?: string;
+        field?: string;
+      };
+      if (response.status === 202) {
+        return {
+          executionId: body.executionId || executionId,
+          httpStatus: 202,
+        };
+      }
+      return {
+        executionId,
+        httpStatus: response.status,
+        error: body.error || 'No se pudo encolar la invocación',
+        field: body.field,
+      };
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : 'Error desconocido';
+      this.logger.error(`Error encolando en compute-plane: ${errorMessage}`);
+      return {
+        executionId,
+        httpStatus: 502,
+        error: `Error comunicándose con compute-plane: ${errorMessage}`,
+      };
+    }
+  }
+
+  /**
+   * POST to the compute plane with a client span and a W3C traceparent.
+   * The span is a child of whatever the invoke middleware (or a caller) set.
+   */
+  private tracedFetch(
+    mode: 'sync' | 'async',
+    functionId: string,
+    url: string,
+    body: unknown,
+  ): Promise<globalThis.Response> {
+    const tracer = trace.getTracer('nimbus-control-plane');
+    // nimbus.invoke is started here, not only in middleware, so the client
+    // call and the Go spans stay on one trace even if AsyncLocalStorage does
+    // not cross the Nest handler boundary.
+    return tracer.startActiveSpan(
+      'nimbus.invoke',
+      {
+        kind: SpanKind.SERVER,
+        attributes: {
+          'nimbus.mode': mode,
+          'nimbus.function_id': functionId,
+        },
+      },
+      async (invokeSpan) => {
+        try {
+          return await tracer.startActiveSpan(
+            'nimbus.compute.call',
+            {
+              kind: SpanKind.CLIENT,
+              attributes: {
+                'nimbus.mode': mode,
+                'nimbus.function_id': functionId,
+                'http.request.method': 'POST',
+                'url.path': mode === 'async' ? '/async/jobs' : '/executions',
+              },
+            },
+            async (span) => {
+              try {
+                const headers: Record<string, string> = {
+                  'Content-Type': 'application/json',
+                };
+                propagation.inject(context.active(), headers);
+                const response = await fetch(url, {
+                  method: 'POST',
+                  headers,
+                  body: JSON.stringify(body),
+                });
+                span.setAttribute('http.response.status_code', response.status);
+                if (response.status >= 500) {
+                  span.setStatus({ code: SpanStatusCode.ERROR });
+                }
+                return response;
+              } catch (error) {
+                if (error instanceof Error) {
+                  span.recordException(error);
+                }
+                span.setStatus({ code: SpanStatusCode.ERROR });
+                throw error;
+              } finally {
+                span.end();
+              }
+            },
+          );
+        } catch (error) {
+          invokeSpan.setStatus({ code: SpanStatusCode.ERROR });
+          throw error;
+        } finally {
+          invokeSpan.end();
+        }
+      },
+    );
   }
 
   /**

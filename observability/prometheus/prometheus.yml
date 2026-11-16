@@ -1,0 +1,13 @@
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+
+scrape_configs:
+  - job_name: compute-plane
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["compute-plane:8080"]
+  - job_name: control-plane
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["control-plane:3000"]
