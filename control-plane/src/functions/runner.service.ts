@@ -8,6 +8,9 @@ export interface RunnerResult {
   error?: string;
   exitCode: number;
   durationMs: number;
+  queuedMs?: number;
+  /** Set when the compute plane rejected the invocation (HTTP 429). */
+  httpStatus?: number;
 }
 
 interface ComputePlaneRequest {
@@ -18,6 +21,7 @@ interface ComputePlaneRequest {
   timeoutSec?: number;
   memoryMb?: number;
   handler?: string;
+  maxConcurrency?: number;
 }
 
 interface ComputePlaneResponse {
@@ -27,6 +31,7 @@ interface ComputePlaneResponse {
   error?: string;
   exitCode: number;
   durationMs: number;
+  queuedMs?: number;
 }
 
 /**
@@ -89,14 +94,21 @@ export class RunnerService {
       });
 
       if (response.status === 429) {
-        const errorBody = await response.json();
+        const errorBody = (await response.json().catch(() => ({}))) as {
+          error?: string;
+          queuedMs?: number;
+        };
         return {
           executionId,
           success: false,
           output: null,
-          error: errorBody.error || 'Función ocupada, reintente más tarde',
-          exitCode: 1,
+          error:
+            errorBody.error ||
+            'Demasiadas invocaciones en cola. Reintentá más tarde.',
+          exitCode: 429,
           durationMs: Date.now() - startTime,
+          queuedMs: errorBody.queuedMs,
+          httpStatus: 429,
         };
       }
 
@@ -113,6 +125,7 @@ export class RunnerService {
         error: result.error,
         exitCode: result.exitCode,
         durationMs: result.durationMs,
+        queuedMs: result.queuedMs,
       };
     } catch (error) {
       const errorMessage =

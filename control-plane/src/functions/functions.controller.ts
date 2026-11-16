@@ -8,6 +8,8 @@ import {
   UseInterceptors,
   BadRequestException,
   HttpCode,
+  HttpException,
+  HttpStatus,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { FunctionsService } from './functions.service';
@@ -155,6 +157,29 @@ export class FunctionsController {
       event,
     );
 
+    if (result.httpStatus === 429) {
+      await this.functionsService.updateInvocation(invocation.id, {
+        status: 'ERROR',
+        executionId: result.executionId,
+        error: result.error,
+        durationMs: result.durationMs,
+      });
+      throw new HttpException(
+        {
+          statusCode: HttpStatus.TOO_MANY_REQUESTS,
+          error: 'Too Many Requests',
+          message:
+            result.error ||
+            'Demasiadas invocaciones en cola. Reintentá más tarde.',
+          invocationId: invocation.id,
+          requestId: invocation.requestId,
+          executionId: result.executionId,
+          queuedMs: result.queuedMs ?? 0,
+        },
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+
     await this.functionsService.updateInvocation(invocation.id, {
       status: 'RUNNING',
       executionId: result.executionId,
@@ -181,6 +206,7 @@ export class FunctionsController {
       durationMs: result.durationMs,
       output: result.output,
       error: result.error,
+      queuedMs: result.queuedMs ?? 0,
       logsUrl: `/invocations/${invocation.id}/logs`,
     };
   }

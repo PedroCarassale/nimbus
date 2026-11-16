@@ -112,7 +112,7 @@ Criterio de done: `docker compose up`, subir un zip, `POST` invoke por HTTP, rec
 El trabajo post-MVP está dividido en dos roadmaps:
 
 - [`roadmap-federico.md`](roadmap-federico.md): control plane + consola (auth, config por función, versiones/alias, historial, URL pública).
-- [`roadmap-pedro.md`](roadmap-pedro.md): compute plane + infra (concurrencia y cola, warm containers, async/DLQ, observabilidad).
+- [`roadmap-pedro.md`](roadmap-pedro.md): compute plane + infra (concurrencia y cola, warm containers, async/DLQ, observabilidad). El Paso 1 (N ejecuciones, cola FIFO y tope global) está descrito en [`concurrencia.md`](concurrencia.md).
 
 ## Fuera del MVP
 

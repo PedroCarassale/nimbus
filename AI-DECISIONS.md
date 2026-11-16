@@ -339,3 +339,35 @@ División: el compute plane es la parte más compleja (procesos, aislamiento, co
 
 **Validación y Corrección Humana:** Riesgos que quedan en el diseño: el compute plane monta el socket de Docker del host; `/tmp/nimbus-work` contiene el código de las funciones en el host; el timeout cuenta desde que arranca `docker run`, incluido el cold start del container.
 
+---
+
+## Paso 1 — Concurrencia real y cola
+
+**Problema abordado:** El compute plane tomaba un lock Redis `nimbus:lock:fn:{functionId}` y la segunda invocación de la misma función no esperaba: competía unos segundos y, si el lock seguía tomado, respondía 429. Hacía falta N ejecuciones simultáneas, una cola con límite, un tope de containers por máquina, y que cancelar también saque de la cola a quien todavía no arrancó.
+
+**Prompt / Herramienta utilizada:** Cursor Cloud Agent (Grok 4.7), pedido de Paso 1 del roadmap de Pedro, apilado sobre la rama de Paso 0.
+
+**Código / Arquitectura generada:**
+
+1. **Admisión en Redis (compute plane)**
+   - El lock `SET NX` se reemplaza por un semáforo: sorted set `nimbus:slots:fn:{functionId}` con lease (score = vencimiento). El proceso renueva el lease hasta `Release`. Si el proceso muere, la próxima admisión borra los scores vencidos.
+   - La cola es otro sorted set, `nimbus:queue:fn:{functionId}`, ordenado por un ticket `INCR` (FIFO). Solo la cabeza toma un slot cuando hay lugar. Quien espera refresca un `heartbeat`; si deja de hacerlo durante la espera máxima, se lo saca de la cola.
+   - El tope global es `nimbus:slots:machine:{hostname}` contra `NIMBUS_MAX_CONTAINERS`. Cuenta ejecuciones con slot, antes de `docker run`.
+   - La decisión (entrar, encolar o rechazar) es un script Lua.
+   - Env: `NIMBUS_FN_CONCURRENCY` (default 2), `NIMBUS_FN_QUEUE_MAX` (32), `NIMBUS_FN_QUEUE_WAIT_SEC` (30), `NIMBUS_MAX_CONTAINERS` (8), `NIMBUS_SLOT_LEASE_SEC` (30).
+   - `POST /executions` acepta `maxConcurrency` opcional. La respuesta suma `queuedMs`.
+   - Cola llena o espera vencida: HTTP 429 con `reason` `queue_full` o `queue_timeout`.
+   - `POST /executions/:id/cancel` saca al queued de la cola (el request bloqueado responde 409). Una ejecución que ya corre queda marcada y conserva el slot hasta el release.
+
+2. **Control plane, cambio chico**
+   - `runner.service.ts` propaga el 429.
+   - `functions.controller.ts` lo responde como `429 Too Many Requests`, y guarda la invocación en `ERROR`.
+
+3. **Prueba**
+   - Tests con miniredis (N en paralelo, FIFO, cola llena, timeout de espera, lease vencido, cabeza de cola muerta, tope global, cancel de queued) y `go test -race` en CI.
+   - `make load` dispara 6 invokes de `examples/slow` con concurrencia 2 y cola 3.
+
+El contrato queda en `docs/concurrencia.md`.
+
+**Validación y Corrección Humana:** Riesgos que quedan en el diseño: el tope global es por proceso (hostname), no por un conteo de `docker ps`; un container huérfano puede seguir vivo después de que el lease venció. Cancelar una ejecución que ya corre no mata el container, solo deja el flag. `maxConcurrency` en el request aplica a esa admisión: dos requests en vuelo con valores distintos pueden llegar al mayor de los dos, siempre bajo `NIMBUS_MAX_CONTAINERS`. El slot vencido se recupera en la próxima admisión, con una ventana de `NIMBUS_SLOT_LEASE_SEC`.
+

@@ -108,6 +108,8 @@ Ver `docs/roadmap.md` para el orden de slices. No adelantar:
 | `NIMBUS_HANDLER` | `handler` | Nombre de la función exportada |
 | `NIMBUS_IMAGE` | `nimbus-node` | Nombre de la imagen Docker |
 
+Concurrencia del compute plane (`NIMBUS_FN_CONCURRENCY`, cola, tope global): [docs/concurrencia.md](docs/concurrencia.md).
+
 ## Testing Local
 
 ```bash

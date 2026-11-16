@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/concurrency"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/executor"
 	"github.com/go-chi/chi/v5"
 )
@@ -41,19 +42,27 @@ type fakeLocker struct {
 	mu           sync.Mutex
 	acquire      bool
 	acquireErr   error
+	queuedMs     int64
+	lastMax      int
 	releaseCalls int
 	cancelErr    error
 	cancelled    []string
 }
 
-func (f *fakeLocker) AcquireLock(context.Context, string, string) (bool, error) {
+func (f *fakeLocker) Acquire(_ context.Context, _, _ string, maxConcurrency int) (int64, error) {
+	f.mu.Lock()
+	f.lastMax = maxConcurrency
+	f.mu.Unlock()
 	if f.acquireErr != nil {
-		return false, f.acquireErr
+		return f.queuedMs, f.acquireErr
 	}
-	return f.acquire, nil
+	if !f.acquire {
+		return f.queuedMs, concurrency.ErrQueueFull
+	}
+	return f.queuedMs, nil
 }
 
-func (f *fakeLocker) ReleaseLock(context.Context, string, string) error {
+func (f *fakeLocker) Release(context.Context, string, string) error {
 	f.mu.Lock()
 	f.releaseCalls++
 	f.mu.Unlock()
@@ -159,7 +168,10 @@ func TestStartExecutionBusy(t *testing.T) {
 	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if body["retryAfter"].(float64) != 5 {
+	if body["retryAfter"].(float64) != 5 || body["reason"] != "queue_full" {
+		t.Fatalf("body %#v", body)
+	}
+	if body["error"] != "Cola llena para esta función" {
 		t.Fatalf("body %#v", body)
 	}
 	if runner.calls != 0 || locker.releaseCalls != 0 {
@@ -175,8 +187,93 @@ func TestStartExecutionLockError(t *testing.T) {
 	rr := postJSON(t, newRouter(h), "/executions", `{
 		"executionId":"e1","functionId":"f1","version":"v1"
 	}`)
+	if rr.Code != http.StatusRequestTimeout {
+		t.Fatalf("status %d body %s", rr.Code, rr.Body.String())
+	}
+
+	h = &Handler{
+		executor:    &fakeRunner{},
+		concurrency: &fakeLocker{acquireErr: context.Canceled},
+	}
+	rr = postJSON(t, newRouter(h), "/executions", `{
+		"executionId":"e1","functionId":"f1","version":"v1"
+	}`)
+	if rr.Code != http.StatusRequestTimeout {
+		t.Fatalf("cancel status %d", rr.Code)
+	}
+
+	h = &Handler{
+		executor:    &fakeRunner{},
+		concurrency: &fakeLocker{acquireErr: io.EOF},
+	}
+	rr = postJSON(t, newRouter(h), "/executions", `{
+		"executionId":"e1","functionId":"f1","version":"v1"
+	}`)
 	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("internal status %d", rr.Code)
+	}
+}
+
+func TestStartExecutionQueueTimeoutAndCancel(t *testing.T) {
+	h := &Handler{
+		executor:    &fakeRunner{},
+		concurrency: &fakeLocker{acquireErr: concurrency.ErrWaitTimeout, queuedMs: 40},
+	}
+	rr := postJSON(t, newRouter(h), "/executions", `{
+		"executionId":"e1","functionId":"f1","version":"v1"
+	}`)
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("timeout status %d", rr.Code)
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["reason"] != "queue_timeout" || body["queuedMs"].(float64) != 40 {
+		t.Fatalf("body %#v", body)
+	}
+
+	h = &Handler{
+		executor:    &fakeRunner{},
+		concurrency: &fakeLocker{acquireErr: concurrency.ErrCancelled},
+	}
+	rr = postJSON(t, newRouter(h), "/executions", `{
+		"executionId":"e1","functionId":"f1","version":"v1"
+	}`)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("cancel status %d %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestStartExecutionMaxConcurrencyOverride(t *testing.T) {
+	locker := &fakeLocker{acquire: true, queuedMs: 12}
+	h := &Handler{executor: &fakeRunner{}, concurrency: locker}
+	rr := postJSON(t, newRouter(h), "/executions", `{
+		"executionId":"e1","functionId":"f1","version":"v1","maxConcurrency":4
+	}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status %d %s", rr.Code, rr.Body.String())
+	}
+	if locker.lastMax != 4 {
+		t.Fatalf("maxConcurrency forwarded as %d", locker.lastMax)
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["queuedMs"].(float64) != 12 {
+		t.Fatalf("body %#v", body)
+	}
+
+	locker.lastMax = -1
+	rr = postJSON(t, newRouter(h), "/executions", `{
+		"executionId":"e2","functionId":"f1","version":"v1","maxConcurrency":-3
+	}`)
+	if rr.Code != http.StatusOK {
 		t.Fatalf("status %d", rr.Code)
+	}
+	if locker.lastMax != 0 {
+		t.Fatalf("negative override = %d, want default (0)", locker.lastMax)
 	}
 }
 

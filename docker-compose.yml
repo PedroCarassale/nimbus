@@ -103,6 +103,11 @@ services:
       NIMBUS_IMAGE: nimbus-node
       # Mismo path en el contenedor y en el host: el daemon resuelve -v.
       NIMBUS_WORK_DIR: /tmp/nimbus-work
+      NIMBUS_FN_CONCURRENCY: ${NIMBUS_FN_CONCURRENCY:-2}
+      NIMBUS_FN_QUEUE_MAX: ${NIMBUS_FN_QUEUE_MAX:-32}
+      NIMBUS_FN_QUEUE_WAIT_SEC: ${NIMBUS_FN_QUEUE_WAIT_SEC:-30}
+      NIMBUS_MAX_CONTAINERS: ${NIMBUS_MAX_CONTAINERS:-8}
+      NIMBUS_SLOT_LEASE_SEC: ${NIMBUS_SLOT_LEASE_SEC:-30}
     depends_on:
       redis:
         condition: service_healthy

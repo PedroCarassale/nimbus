@@ -63,6 +63,7 @@ Esto demuestra el flujo completo del MVP:
 make help         # Ver todos los comandos disponibles
 make console      # Abrir consola web en http://localhost:8088
 make smoke        # Test completo: invoke, logs SSE, error y timeout
+make load         # 6 invokes en paralelo: 2 corren, 3 esperan, 1 recibe 429
 make logs         # Ver logs de todos los servicios
 make down         # Detener el stack
 make down-clean   # Detener y eliminar volúmenes
@@ -258,10 +259,11 @@ Cliente HTTP
                ▼
 ┌─────────────────────────────────────┐
 │   Compute Plane (Go :8080)          │
-│   - Adquiere lock Redis por función │
+│   - Admite N ejecuciones por función│
+│   - Si está llena, espera en cola   │
 │   - Descarga artifact de MinIO      │
 │   - Ejecuta Docker (isolated)       │
-│   - Libera lock y retorna resultado │
+│   - Libera el slot y responde       │
 └─────────────────────────────────────┘
                │
                ▼
@@ -283,7 +285,8 @@ Cliente HTTP
   "event": { "key": "value" },
   "timeoutSec": 5,
   "memoryMb": 128,
-  "handler": "handler"
+  "handler": "handler",
+  "maxConcurrency": 2
 }
 ```
 
@@ -295,16 +298,20 @@ Cliente HTTP
   "output": { "resultado": "..." },
   "error": "",
   "exitCode": 0,
-  "durationMs": 150
+  "durationMs": 150,
+  "queuedMs": 0
 }
 ```
 
-**Error 429 (función ocupada):**
+**Error 429 (cola llena o espera agotada).** El compute plane responde 429 y el control plane lo reexpone como `429 Too Many Requests`. Detalle, variables y el campo opcional `maxConcurrency` en [docs/concurrencia.md](docs/concurrencia.md).
+
 ```json
 {
-  "error": "Función ocupada, reintente más tarde",
+  "error": "Cola llena para esta función",
   "executionId": "uuid",
-  "retryAfter": 5
+  "retryAfter": 5,
+  "reason": "queue_full",
+  "queuedMs": 0
 }
 ```
 
@@ -351,6 +358,11 @@ Cliente HTTP
 | `COMPUTE_PLANE_URL` | `http://compute-plane:8080` | URL del compute plane (para Nest) |
 | `COMPUTE_PLANE_PORT` | `8080` | Puerto del compute plane |
 | `NIMBUS_WORK_DIR` | `/tmp/nimbus-work` | Directorio de trabajo compartido con el daemon de Docker. El path tiene que coincidir dentro del contenedor y en el host |
+| `NIMBUS_FN_CONCURRENCY` | `2` | Ejecuciones simultáneas por función |
+| `NIMBUS_FN_QUEUE_MAX` | `32` | Tamaño de la cola por función (`0` = sin espera, 429 al tope) |
+| `NIMBUS_FN_QUEUE_WAIT_SEC` | `30` | Espera máxima en la cola antes de un 429 |
+| `NIMBUS_MAX_CONTAINERS` | `8` | Tope de ejecuciones vivas en este compute plane |
+| `NIMBUS_SLOT_LEASE_SEC` | `30` | Vencimiento de un slot si el proceso deja de renovarlo |
 
 **Control Plane — Redis (Slice 5):**
 
@@ -392,7 +404,7 @@ nimbus-functions/
 │   ├── internal/
 │   │   ├── handlers/      # HTTP handlers (StartExecution, Cancel)
 │   │   ├── executor/      # Descarga MinIO + Docker run
-│   │   ├── concurrency/   # Redis locks distribuidos
+│   │   ├── concurrency/   # Semáforo y cola FIFO en Redis
 │   │   └── minio/         # Cliente MinIO
 │   ├── Dockerfile         # Imagen del compute plane
 │   └── go.mod             # Dependencias Go

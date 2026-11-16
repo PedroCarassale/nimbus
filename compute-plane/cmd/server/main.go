@@ -49,7 +49,10 @@ func main() {
 	}
 	log.Println("[compute-plane] Conectado a MinIO")
 
-	concurrencyMgr := concurrency.NewManager(rdb)
+	concCfg := concurrency.LoadConfig()
+	log.Printf("[compute-plane] Concurrencia por función=%d cola=%d espera=%s containers=%d lease=%s",
+		concCfg.MaxConcurrency, concCfg.QueueMax, concCfg.MaxWait, concCfg.GlobalMax, concCfg.Lease)
+	concurrencyMgr := concurrency.NewManager(rdb, concCfg)
 	exec := executor.New(mc, rdb)
 	handler := handlers.New(exec, concurrencyMgr)
 
