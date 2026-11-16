@@ -107,7 +107,7 @@ El mismo texto se usa si Node aborta con “JavaScript heap out of memory” (ex
 
 `--cpus=0.5` queda en `HostConfig.NanoCpus` (500000000). Sin `cpus` en el request y sin `NIMBUS_CPUS`, el container no tiene cuota de CPU.
 
-El aislamiento anterior no cambia: `--network=none`, `--read-only`, `--pids-limit=256`.
+El aislamiento anterior no cambia: `--network=none`, `--read-only`, `--pids-limit=256`. Con el pool warm el container además corre como el usuario `node` y acepta varios invokes; el contrato de memoria, CPU, handler y `envVars` es el mismo. Ver [`warm.md`](warm.md).
 
 ## Qué manda Nest hoy
 

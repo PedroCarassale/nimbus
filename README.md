@@ -65,6 +65,7 @@ make console      # Abrir consola web en http://localhost:8088
 make smoke        # Test completo: invoke, logs SSE, error y timeout
 make load         # 6 invokes en paralelo: 2 corren, 3 esperan, 1 recibe 429
 make config-check # timeout, memoria, env, handler y cpus contra el compute plane
+make warm-check   # cold start vs warm start, idle, timeout y OOM
 make logs         # Ver logs de todos los servicios
 make down         # Detener el stack
 make down-clean   # Detener y eliminar volúmenes
@@ -304,9 +305,13 @@ Cliente HTTP
   "error": "",
   "exitCode": 0,
   "durationMs": 150,
-  "queuedMs": 0
+  "queuedMs": 0,
+  "coldStart": true,
+  "initMs": 420
 }
 ```
+
+`coldStart` e `initMs` son opcionales para el cliente: dicen si el compute plane arrancó un container nuevo y cuánto tardó en estar listo. Con un container reutilizado, `coldStart` es `false` e `initMs` es `0`. Nest no reenvía esos campos todavía. Detalle en [docs/warm.md](docs/warm.md).
 
 **Error 429 (cola llena o espera agotada).** El compute plane responde 429 y el control plane lo reexpone como `429 Too Many Requests`. Detalle, variables y el campo opcional `maxConcurrency` en [docs/concurrencia.md](docs/concurrencia.md).
 
@@ -372,8 +377,10 @@ Cliente HTTP
 | `NIMBUS_FN_CONCURRENCY` | `2` | Ejecuciones simultáneas por función |
 | `NIMBUS_FN_QUEUE_MAX` | `32` | Tamaño de la cola por función (`0` = sin espera, 429 al tope) |
 | `NIMBUS_FN_QUEUE_WAIT_SEC` | `30` | Espera máxima en la cola antes de un 429 |
-| `NIMBUS_MAX_CONTAINERS` | `8` | Tope de ejecuciones vivas en este compute plane |
+| `NIMBUS_MAX_CONTAINERS` | `8` | Tope de ejecuciones vivas y de containers warm en este compute plane |
 | `NIMBUS_SLOT_LEASE_SEC` | `30` | Vencimiento de un slot si el proceso deja de renovarlo |
+| `NIMBUS_WARM` | `1` | `0`, `false`, `off` o `no` desactivan el pool y vuelven a un container por invoke |
+| `NIMBUS_WARM_IDLE_SEC` | `60` | Tiempo que un container ocioso permanece en el pool |
 
 **Control Plane — Redis (Slice 5):**
 

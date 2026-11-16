@@ -47,11 +47,13 @@ Respuesta de una ejecución que entró (el campo `queuedMs` es nuevo; `0` si no 
   "error": "",
   "exitCode": 0,
   "durationMs": 2100,
-  "queuedMs": 0
+  "queuedMs": 0,
+  "coldStart": false,
+  "initMs": 0
 }
 ```
 
-`durationMs` mide el trabajo después de conseguir el slot (descarga, arranque del container, handler). `queuedMs` mide solo la espera en la cola.
+`durationMs` mide el trabajo después de conseguir el slot (descarga, arranque del container, handler). `queuedMs` mide solo la espera en la cola. `coldStart` e `initMs` dicen si se reutilizó un container. Están en [`warm.md`](warm.md).
 
 ### Cola llena o espera agotada → HTTP 429
 

@@ -156,7 +156,7 @@ Hoy Nest **no** manda la config de la función. `runner.service.ts` sigue envian
 
 No envía `envVars` ni `cpus`. Cuando exista `PATCH /functions/:id`, el invoke tiene que reenviar esos campos con los mismos nombres. No hace falta cambiar el shape de más arriba. Los máximos del control plane pueden ser más chicos; Go rechaza igual lo que se pase de 300s, 2048 MB o 4 CPUs.
 
-`maxConcurrency` es opcional. Si no viene, Go usa `NIMBUS_FN_CONCURRENCY`. La respuesta de una ejecución que entró es `{ executionId, success, output, error, exitCode, durationMs, queuedMs }`. `queuedMs` son los milisegundos esperados en la cola (`0` si entró directo).
+`maxConcurrency` es opcional. Si no viene, Go usa `NIMBUS_FN_CONCURRENCY`. La respuesta de una ejecución que entró es `{ executionId, success, output, error, exitCode, durationMs, queuedMs, coldStart, initMs }`. `queuedMs` son los milisegundos esperados en la cola (`0` si entró directo). `coldStart` es `true` cuando Go arrancó un container para ese invoke, e `initMs` es el arranque de ese container (`0` si reutilizó uno). Nest hoy no reenvía esos dos campos. El detalle está en [`warm.md`](warm.md).
 
 Si la cola de la función está llena, o se vence la espera, Go responde **429** con `reason` `queue_full` o `queue_timeout`. El control plane lo traduce a **429 Too Many Requests** en `POST /functions/:id/invoke`. El detalle del semáforo, la cola y el tope global está en [`concurrencia.md`](concurrencia.md).
 

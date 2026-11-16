@@ -109,6 +109,10 @@ Ver `docs/roadmap.md` para el orden de slices. No adelantar:
 | `NIMBUS_HANDLER` | `handler` | Spec `archivo.export` (default: export `handler` en `index.js`) |
 | `NIMBUS_CPUS` | vacío | Default de `--cpus`. Vacío: sin cuota |
 | `NIMBUS_IMAGE` | `nimbus-node` | Nombre de la imagen Docker |
+| `NIMBUS_WARM` | `1` | Pool de containers. `0` / `off` fuerza el camino frío |
+| `NIMBUS_WARM_IDLE_SEC` | `60` | Vida de un container ocioso en el pool |
+
+Pool warm (reuso, descarte por timeout/OOM, `coldStart`): [docs/warm.md](docs/warm.md).
 
 Configuración por invocación (`timeoutSec`, `memoryMb`, `cpus`, `handler`, `envVars`): [docs/configuracion.md](docs/configuracion.md).
 
