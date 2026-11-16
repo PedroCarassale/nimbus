@@ -18,10 +18,13 @@ import (
 type fakeRunner struct {
 	result *executor.ExecutionResult
 	calls  int
+	last   *executor.ExecutionRequest
 }
 
 func (f *fakeRunner) Execute(_ context.Context, req *executor.ExecutionRequest) *executor.ExecutionResult {
 	f.calls++
+	cp := *req
+	f.last = &cp
 	if f.result != nil {
 		out := *f.result
 		if out.ExecutionID == "" {
@@ -42,6 +45,7 @@ type fakeLocker struct {
 	mu           sync.Mutex
 	acquire      bool
 	acquireErr   error
+	acquireCalls int
 	queuedMs     int64
 	lastMax      int
 	releaseCalls int
@@ -52,6 +56,7 @@ type fakeLocker struct {
 func (f *fakeLocker) Acquire(_ context.Context, _, _ string, maxConcurrency int) (int64, error) {
 	f.mu.Lock()
 	f.lastMax = maxConcurrency
+	f.acquireCalls++
 	f.mu.Unlock()
 	if f.acquireErr != nil {
 		return f.queuedMs, f.acquireErr
@@ -303,6 +308,72 @@ func TestStartExecutionTimeoutAndError(t *testing.T) {
 	}
 	if body["success"] != false || body["exitCode"].(float64) != 1 {
 		t.Fatalf("body %#v", body)
+	}
+}
+
+func TestStartExecutionRejectsInvalidConfig(t *testing.T) {
+	runner := &fakeRunner{}
+	locker := &fakeLocker{acquire: true}
+	h := &Handler{executor: runner, concurrency: locker}
+	router := newRouter(h)
+
+	cases := []struct {
+		body  string
+		field string
+	}{
+		{`{"executionId":"e1","functionId":"f1","version":"v1","timeoutSec":301}`, "timeoutSec"},
+		{`{"executionId":"e1","functionId":"f1","version":"v1","memoryMb":8}`, "memoryMb"},
+		{`{"executionId":"e1","functionId":"f1","version":"v1","cpus":9}`, "cpus"},
+		{`{"executionId":"e1","functionId":"f1","version":"v1","handler":"../x.main"}`, "handler"},
+		{`{"executionId":"e1","functionId":"f1","version":"v1","envVars":{"NIMBUS_SECRET":"super-secret-value"}}`, "envVars"},
+		{`{"executionId":"e1","functionId":"f1","version":"v1","envVars":{"BAD-NAME":"x"}}`, "envVars"},
+	}
+	for _, tc := range cases {
+		rr := postJSON(t, router, "/executions", tc.body)
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("status %d for %s body %s", rr.Code, tc.body, rr.Body.String())
+		}
+		var body map[string]string
+		if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		if body["field"] != tc.field || body["error"] == "" {
+			t.Fatalf("body %#v", body)
+		}
+		if strings.Contains(rr.Body.String(), "super-secret-value") {
+			t.Fatalf("response leaked env value: %s", rr.Body.String())
+		}
+	}
+	if runner.calls != 0 || locker.acquireCalls != 0 || locker.releaseCalls != 0 {
+		t.Fatalf("invalid config ran: calls=%d acquire=%d release=%d", runner.calls, locker.acquireCalls, locker.releaseCalls)
+	}
+}
+
+func TestStartExecutionForwardsRuntimeConfig(t *testing.T) {
+	runner := &fakeRunner{}
+	locker := &fakeLocker{acquire: true}
+	h := &Handler{executor: runner, concurrency: locker}
+	rr := postJSON(t, newRouter(h), "/executions", `{
+		"executionId":"e1","functionId":"f1","version":"v1",
+		"timeoutSec":10,"memoryMb":256,"cpus":0.25,
+		"handler":"src/app.main",
+		"envVars":{"GREETING":"super-secret-value"}
+	}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status %d %s", rr.Code, rr.Body.String())
+	}
+	if runner.last == nil {
+		t.Fatal("missing request")
+	}
+	cfg := runner.last.Config
+	if cfg.TimeoutSec != 10 || cfg.MemoryMB != 256 || cfg.CPUsFlag != "0.25" {
+		t.Fatalf("config %+v", cfg)
+	}
+	if cfg.Handler != "src/app.main" || cfg.HandlerFile != "src/app" || cfg.HandlerExport != "main" {
+		t.Fatalf("handler %+v", cfg)
+	}
+	if len(cfg.Env) != 1 || cfg.Env[0].Name != "GREETING" || cfg.Env[0].Value != "super-secret-value" {
+		t.Fatalf("env %+v", cfg.Env)
 	}
 }
 

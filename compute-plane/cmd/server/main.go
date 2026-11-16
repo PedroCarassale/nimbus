@@ -11,6 +11,7 @@ import (
 
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/concurrency"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/executor"
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/fnconfig"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/handlers"
 	minioClient "github.com/PedroCarassale/nimbus/compute-plane/internal/minio"
 	"github.com/go-chi/chi/v5"
@@ -52,14 +53,22 @@ func main() {
 	concCfg := concurrency.LoadConfig()
 	log.Printf("[compute-plane] Concurrencia por función=%d cola=%d espera=%s containers=%d lease=%s",
 		concCfg.MaxConcurrency, concCfg.QueueMax, concCfg.MaxWait, concCfg.GlobalMax, concCfg.Lease)
+	fnDefaults := fnconfig.LoadDefaults()
+	log.Printf("[compute-plane] Config por función: timeout=%ds memory=%dMB handler=%s cpus=%s",
+		fnDefaults.TimeoutSec, fnDefaults.MemoryMB, fnDefaults.Handler, fnDefaults.CPUsLabel())
 	concurrencyMgr := concurrency.NewManager(rdb, concCfg)
 	exec := executor.New(mc, rdb)
-	handler := handlers.New(exec, concurrencyMgr)
+	handler := handlers.NewWithDefaults(exec, concurrencyMgr, fnDefaults)
+
+	// The HTTP deadline has to outlive the longest accepted execution plus
+	// the queue wait. Chi's timeout cancels the request context, which is
+	// what kills docker run.
+	requestBudget := time.Duration(fnconfig.TimeoutMax)*time.Second + concCfg.MaxWait + 45*time.Second
 
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
-	r.Use(middleware.Timeout(120 * time.Second))
+	r.Use(middleware.Timeout(requestBudget))
 
 	r.Get("/health", handler.Health)
 	r.Head("/health", handler.Health)
@@ -70,7 +79,7 @@ func main() {
 		Addr:         ":" + port,
 		Handler:      r,
 		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 120 * time.Second,
+		WriteTimeout: requestBudget,
 		IdleTimeout:  60 * time.Second,
 	}
 

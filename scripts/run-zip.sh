@@ -84,6 +84,7 @@ DOCKER_ARGS=(
   --network=none
   --read-only
   -v "$WORK_DIR:/var/task:ro"
+  -e "NIMBUS_HANDLER=$NIMBUS_HANDLER" \
   -e "NIMBUS_HANDLER_FUNCTION=$NIMBUS_HANDLER"
 )
 

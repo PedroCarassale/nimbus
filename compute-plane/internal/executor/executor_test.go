@@ -10,43 +10,102 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/fnconfig"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/logs"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
 )
 
-func TestApplyDefaults(t *testing.T) {
-	timeout, memory, handler := applyDefaults(0, 0, "")
-	if timeout != 5 || memory != 128 || handler != "handler" {
-		t.Fatalf("defaults = %d %d %q", timeout, memory, handler)
+func testConfig(t *testing.T) fnconfig.Resolved {
+	t.Helper()
+	cfg, err := (fnconfig.Resolved{
+		TimeoutSec: 12,
+		MemoryMB:   256,
+		CPUsMilli:  500,
+		Handler:    "src/app.main",
+		Env: []fnconfig.EnvVar{
+			{Name: "GREETING", Value: "super-secret-value"},
+		},
+	}).Complete()
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	timeout, memory, handler = applyDefaults(12, 256, "main")
-	if timeout != 12 || memory != 256 || handler != "main" {
-		t.Fatalf("explicit = %d %d %q", timeout, memory, handler)
-	}
+	return cfg
 }
 
 func TestDockerRunArgsIsolation(t *testing.T) {
-	args := dockerRunArgs("nimbus-abc", "/tmp/nimbus-work/job/work", "nimbus-node", "handler", 128)
+	cfg := testConfig(t)
+	args := dockerRunArgs("nimbus-abc", "/tmp/nimbus-work/job/work", "nimbus-node", cfg)
 	joined := strings.Join(args, " ")
 
 	for _, want := range []string{
 		"run",
 		"--name nimbus-abc",
-		"--rm",
-		"--memory=128m",
+		"--memory=256m",
+		"--memory-swap=256m",
+		"--cpus=0.5",
 		"--pids-limit=256",
 		"--network=none",
 		"--read-only",
 		"-v /tmp/nimbus-work/job/work:/var/task:ro",
-		"-e NIMBUS_HANDLER_FUNCTION=handler",
+		"-e GREETING=super-secret-value",
+		"-e NIMBUS_HANDLER=src/app.main",
+		"-e NIMBUS_HANDLER_FUNCTION=main",
+		"-e NIMBUS_HANDLER_PATH=/var/task/src/app.js",
 		"-e NIMBUS_EVENT_PATH=/var/task/event.json",
+		"-e NIMBUS_MEMORY_MB=256",
+		"-e NIMBUS_TIMEOUT_SEC=12",
 		"nimbus-node",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("args missing %q in %s", want, joined)
 		}
+	}
+	for _, arg := range args {
+		if arg == "--rm" {
+			t.Fatal("container must stay until OOMKilled can be inspected")
+		}
+	}
+	if args[len(args)-1] != "nimbus-node" {
+		t.Fatalf("image is not last: %v", args)
+	}
+	secretAt := strings.Index(joined, "GREETING=super-secret-value")
+	handlerAt := strings.Index(joined, "NIMBUS_HANDLER=")
+	if secretAt < 0 || handlerAt < 0 || secretAt > handlerAt {
+		t.Fatal("platform env must be applied after user env")
+	}
+}
+
+func TestFormatArgsForLogRedactsEnvValues(t *testing.T) {
+	cfg := testConfig(t)
+	args := dockerRunArgs("nimbus-abc", "/tmp/work", "nimbus-node", cfg)
+	logged := formatArgsForLog(args)
+	if strings.Contains(logged, "super-secret-value") {
+		t.Fatalf("log line leaked env value: %s", logged)
+	}
+	if !strings.Contains(logged, "GREETING=***") {
+		t.Fatalf("redacted key missing: %s", logged)
+	}
+	if !strings.Contains(logged, "NIMBUS_HANDLER=src/app.main") || !strings.Contains(logged, "--cpus=0.5") {
+		t.Fatalf("platform settings should stay visible: %s", logged)
+	}
+}
+
+func TestOutcomeError(t *testing.T) {
+	if got := outcomeError(124, false, "ignored", 2, 128); got != "Timeout excedido (2s)" {
+		t.Fatalf("timeout: %s", got)
+	}
+	if got := outcomeError(137, true, "Killed", 10, 64); !strings.Contains(got, "memoria") || !strings.Contains(got, "64") {
+		t.Fatalf("oom: %s", got)
+	}
+	if got := outcomeError(134, true, "JavaScript heap out of memory", 10, 128); !strings.Contains(got, "memoria") {
+		t.Fatalf("heap: %s", got)
+	}
+	if !heapOOM("FATAL ERROR: Reached heap limit Allocation failed") {
+		t.Fatal("expected heap detection")
+	}
+	if got := outcomeError(1, false, "boom super-secret-value", 5, 128); got != "boom super-secret-value" {
+		t.Fatalf("stderr passthrough: %s", got)
 	}
 }
 

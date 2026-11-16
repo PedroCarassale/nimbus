@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/fnconfig"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/logs"
 	"github.com/redis/go-redis/v9"
 )
@@ -38,9 +39,7 @@ type ExecutionRequest struct {
 	FunctionID  string                 `json:"functionId"`
 	Version     string                 `json:"version"`
 	Event       map[string]interface{} `json:"event"`
-	TimeoutSec  int                    `json:"timeoutSec"`
-	MemoryMB    int                    `json:"memoryMb"`
-	Handler     string                 `json:"handler"`
+	Config      fnconfig.Resolved      `json:"-"`
 }
 
 type ExecutionResult struct {
@@ -116,10 +115,17 @@ func (e *Executor) Execute(ctx context.Context, req *ExecutionRequest) *Executio
 		return result
 	}
 
-	timeoutSec, memoryMB, handler := applyDefaults(req.TimeoutSec, req.MemoryMB, req.Handler)
+	cfg, cfgErr := req.Config.Complete()
+	if cfgErr != nil {
+		result.Error = fmt.Sprintf("Configuración inválida: %s", cfgErr.Error())
+		result.DurationMs = time.Since(startTime).Milliseconds()
+		logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Error: %s", result.Error))
+		return result
+	}
 
-	logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Ejecutando handler '%s' (timeout: %ds, memory: %dMB)", handler, timeoutSec, memoryMB))
-	dockerResult := e.runDockerWithStreaming(ctx, req.ExecutionID, workDir, timeoutSec, memoryMB, handler, logWriter)
+	logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Ejecutando handler '%s' (timeout: %ds, memory: %dMB, cpus: %s, env: %d)",
+		cfg.Handler, cfg.TimeoutSec, cfg.MemoryMB, cpusLabel(cfg), len(cfg.Env)))
+	dockerResult := e.runDockerWithStreaming(ctx, req.ExecutionID, workDir, cfg, logWriter)
 
 	result.Success = dockerResult.success
 	result.Output = dockerResult.output
@@ -129,17 +135,8 @@ func (e *Executor) Execute(ctx context.Context, req *ExecutionRequest) *Executio
 	result.DurationMs = time.Since(startTime).Milliseconds()
 
 	if !dockerResult.success && result.Error == "" {
-		switch {
-		case dockerResult.exitCode == 124:
-			result.Error = fmt.Sprintf("Timeout excedido (%ds)", timeoutSec)
-			logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Error: %s", result.Error))
-		case dockerResult.exitCode == 0:
-			result.Error = "La función terminó sin un JSON de salida"
-			logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Error: %s", result.Error))
-		case dockerResult.stderr != "":
-			result.Error = dockerResult.stderr
-		default:
-			result.Error = "Error en la ejecución"
+		result.Error = outcomeError(dockerResult.exitCode, dockerResult.oom, dockerResult.stderr, cfg.TimeoutSec, cfg.MemoryMB)
+		if dockerResult.oom || dockerResult.exitCode == 124 || dockerResult.exitCode == 0 || result.Error == "Error en la ejecución" {
 			logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Error: %s", result.Error))
 		}
 	}
@@ -157,14 +154,16 @@ type dockerResult struct {
 	exitCode int
 	stdout   string
 	stderr   string
+	oom      bool
 }
 
-func (e *Executor) runDockerWithStreaming(ctx context.Context, executionID, workDir string, timeoutSec, memoryMB int, handler string, logWriter *logs.StreamWriter) dockerResult {
+func (e *Executor) runDockerWithStreaming(ctx context.Context, executionID, workDir string, cfg fnconfig.Resolved, logWriter *logs.StreamWriter) dockerResult {
 	name := containerName(executionID)
-	args := dockerRunArgs(name, workDir, e.defaultImage, handler, memoryMB)
-	log.Printf("[executor] docker %s", strings.Join(args, " "))
+	args := dockerRunArgs(name, workDir, e.defaultImage, cfg)
+	// User env values are secrets. The log line keeps the keys and redacts the values.
+	log.Printf("[executor] docker %s", formatArgsForLog(args))
 
-	timeoutCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
+	timeoutCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.TimeoutSec)*time.Second)
 	defer cancel()
 
 	cmd := exec.CommandContext(timeoutCtx, "docker", args...)
@@ -213,22 +212,26 @@ func (e *Executor) runDockerWithStreaming(ctx context.Context, executionID, work
 
 	timedOut := errors.Is(timeoutCtx.Err(), context.DeadlineExceeded)
 	exitCode := exitCodeFrom(waitErr, timedOut)
-	if exitCode != 0 {
-		// Killing the docker CLI does not stop the container. --rm only runs
-		// if the CLI exits on its own.
-		removeContainer(name)
-	}
 
 	stdoutStr := stdoutBuf.String()
 	stderrStr := stderrBuf.String()
-	output, ok := parseOutput(stdoutStr)
+	// A deadline kill is SIGKILL too. Inspect OOM only when the deadline
+	// did not fire, then always remove the container (--rm would drop it
+	// before we can read OOMKilled).
+	oom := false
+	if !timedOut && exitCode != 0 {
+		oom = containerOOMKilled(name) || exitCode == 137 || heapOOM(stderrStr)
+	}
+	removeContainer(name)
 
+	output, ok := parseOutput(stdoutStr)
 	return dockerResult{
 		success:  exitCode == 0 && ok,
 		output:   output,
 		exitCode: exitCode,
 		stdout:   stdoutStr,
 		stderr:   stderrStr,
+		oom:      oom,
 	}
 }
 
@@ -236,20 +239,108 @@ func (e *Executor) runDockerWithStreaming(ctx context.Context, executionID, work
 // workDir must be a host path the Docker daemon can see. When the compute
 // plane itself runs in a container, NIMBUS_WORK_DIR has to be bind-mounted
 // at the same absolute path on the host.
-func dockerRunArgs(containerName, workDir, image, handler string, memoryMB int) []string {
-	return []string{
+//
+// The container is not started with --rm: the caller inspects OOMKilled
+// and then removes it. User environment variables are passed with -e and
+// must not be written to logs; use formatArgsForLog.
+func dockerRunArgs(containerName, workDir, image string, cfg fnconfig.Resolved) []string {
+	args := []string{
 		"run",
 		"--name", containerName,
-		"--rm",
-		fmt.Sprintf("--memory=%dm", memoryMB),
+		fmt.Sprintf("--memory=%dm", cfg.MemoryMB),
+		fmt.Sprintf("--memory-swap=%dm", cfg.MemoryMB),
 		"--pids-limit=256",
 		"--network=none",
 		"--read-only",
-		"-v", fmt.Sprintf("%s:/var/task:ro", workDir),
-		"-e", fmt.Sprintf("NIMBUS_HANDLER_FUNCTION=%s", handler),
-		"-e", "NIMBUS_EVENT_PATH=/var/task/event.json",
-		image,
 	}
+	if cfg.CPUsFlag != "" {
+		args = append(args, "--cpus="+cfg.CPUsFlag)
+	}
+	args = append(args,
+		"-v", fmt.Sprintf("%s:/var/task:ro", workDir),
+	)
+	// User variables go first. Platform variables go after them so a
+	// request cannot override NIMBUS_* even if validation missed one.
+	for _, ev := range cfg.Env {
+		args = append(args, "-e", ev.Name+"="+ev.Value)
+	}
+	args = append(args,
+		"-e", "NIMBUS_EVENT_PATH=/var/task/event.json",
+		"-e", "NIMBUS_HANDLER="+cfg.Handler,
+		"-e", "NIMBUS_HANDLER_FUNCTION="+cfg.HandlerExport,
+		"-e", "NIMBUS_HANDLER_PATH=/var/task/"+cfg.HandlerFile+".js",
+		"-e", fmt.Sprintf("NIMBUS_MEMORY_MB=%d", cfg.MemoryMB),
+		"-e", fmt.Sprintf("NIMBUS_TIMEOUT_SEC=%d", cfg.TimeoutSec),
+		image,
+	)
+	return args
+}
+
+// platformEnvKeys are set by the compute plane. Their values are not secrets.
+var platformEnvKeys = map[string]struct{}{
+	"NIMBUS_EVENT_PATH":       {},
+	"NIMBUS_HANDLER":          {},
+	"NIMBUS_HANDLER_FUNCTION": {},
+	"NIMBUS_HANDLER_PATH":     {},
+	"NIMBUS_MEMORY_MB":        {},
+	"NIMBUS_TIMEOUT_SEC":      {},
+	"NIMBUS_FUNCTION_NAME":    {},
+}
+
+// formatArgsForLog redacts every -e value that is not a platform variable.
+func formatArgsForLog(args []string) string {
+	out := make([]string, len(args))
+	for i, arg := range args {
+		if i > 0 && args[i-1] == "-e" {
+			key, _, ok := strings.Cut(arg, "=")
+			if ok {
+				if _, platform := platformEnvKeys[key]; !platform {
+					out[i] = key + "=***"
+					continue
+				}
+			}
+		}
+		out[i] = arg
+	}
+	return strings.Join(out, " ")
+}
+
+func cpusLabel(cfg fnconfig.Resolved) string {
+	if cfg.CPUsFlag == "" {
+		return "sin límite"
+	}
+	return cfg.CPUsFlag
+}
+
+func outcomeError(exitCode int, oom bool, stderr string, timeoutSec, memoryMB int) string {
+	switch {
+	case oom:
+		return fmt.Sprintf("La función superó el límite de memoria (%d MB) y fue terminada", memoryMB)
+	case exitCode == 124:
+		return fmt.Sprintf("Timeout excedido (%ds)", timeoutSec)
+	case exitCode == 0:
+		return "La función terminó sin un JSON de salida"
+	case stderr != "":
+		return stderr
+	default:
+		return "Error en la ejecución"
+	}
+}
+
+func heapOOM(stderr string) bool {
+	s := strings.ToLower(stderr)
+	return strings.Contains(s, "javascript heap out of memory") || strings.Contains(s, "reached heap limit")
+}
+
+func containerOOMKilled(name string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "docker", "inspect", "-f", "{{.State.OOMKilled}}", name)
+	out, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) == "true"
 }
 
 func containerName(executionID string) string {
@@ -277,19 +368,6 @@ func removeContainer(name string) {
 	if err := cmd.Run(); err != nil {
 		log.Printf("[executor] no se pudo borrar el container %s: %v", name, err)
 	}
-}
-
-func applyDefaults(timeoutSec, memoryMB int, handler string) (int, int, string) {
-	if timeoutSec <= 0 {
-		timeoutSec = 5
-	}
-	if memoryMB <= 0 {
-		memoryMB = 128
-	}
-	if handler == "" {
-		handler = "handler"
-	}
-	return timeoutSec, memoryMB, handler
 }
 
 func exitCodeFrom(err error, timedOut bool) int {

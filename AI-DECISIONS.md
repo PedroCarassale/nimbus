@@ -371,3 +371,33 @@ El contrato queda en `docs/concurrencia.md`.
 
 **Validación y Corrección Humana:** Riesgos que quedan en el diseño: el tope global es por proceso (hostname), no por un conteo de `docker ps`; un container huérfano puede seguir vivo después de que el lease venció. Cancelar una ejecución que ya corre no mata el container, solo deja el flag. `maxConcurrency` en el request aplica a esa admisión: dos requests en vuelo con valores distintos pueden llegar al mayor de los dos, siempre bajo `NIMBUS_MAX_CONTAINERS`. El slot vencido se recupera en la próxima admisión, con una ventana de `NIMBUS_SLOT_LEASE_SEC`.
 
+---
+
+## Paso 2 — Configuración por función en el compute plane
+
+**Problema abordado:** `POST /executions` ya recibía `timeoutSec`, `memoryMb` y `handler`, pero el handler era solo el nombre del export sobre `index.js` (`index.handler` no resolvía un archivo), no había variables de entorno ni CPU, y un valor absurdo (timeout 0 o memoria enorme) se aceptaba o se reemplazaba en silencio. La config por función del control plane la sigue guardando Federico; Go tiene que aplicar el contrato cuando el body la trae.
+
+**Prompt / Herramienta utilizada:** Cursor Cloud Agent (Grok 4.7), pedido de Paso 2 del roadmap de Pedro, apilado sobre la rama de Paso 1.
+
+**Código / Arquitectura generada:**
+
+1. **Contrato en el compute plane**
+   - `internal/fnconfig` valida cada request. Campos opcionales: `timeoutSec` (1..300, default `NIMBUS_TIMEOUT_SEC` o 5), `memoryMb` (64..2048, default `NIMBUS_MEMORY_MB` o 128), `cpus` (0.1..4, default `NIMBUS_CPUS`; vacío = sin `--cpus`), `handler` y `envVars`.
+   - `0` o ausente usa el default, igual que antes. Cualquier otro valor fuera de rango responde 400 con `error` y `field`, antes de tomar un slot.
+   - `envVars`: hasta 32 variables, nombre `[A-Za-z_][A-Za-z0-9_]*`, valor hasta 4096 bytes, total 16 KiB, sin saltos de línea. Un nombre `NIMBUS_*` se rechaza. Los valores no se escriben en el log del proceso: el `docker run` queda como `CLAVE=***`.
+   - El handler es `archivo.export`. `handler` sigue siendo el export `handler` de `index.js`. `index.handler` y `src/app.main` eligen archivo y export. El bootstrap deja de fijar el archivo en `index.js` cuando viene `NIMBUS_HANDLER`.
+
+2. **Docker**
+   - `--memory` y `--memory-swap` con el mismo tope, `--cpus` si hay cuota, y las variables de la plataforma después de las del usuario.
+   - El container no usa `--rm`. Al terminar, Go lee `OOMKilled` y lo borra. Si el cgroup lo mató (137) o Node abortó por el heap (134), la respuesta dice que superó `memoryMb`.
+   - El timeout de 124 no cambia: el plazo incluye el arranque del container. El deadline HTTP del server cubre 300s más la espera de cola.
+
+3. **Control plane**
+   - Sin campos Prisma y sin cambios en Nest. `runner.service.ts` sigue mandando timeout, memoria y handler desde el entorno, y no manda `envVars` ni `cpus`. El body que tiene que pasar a mandar está en `docs/configuracion.md`.
+
+4. **Prueba**
+   - Tests de Go de los límites y de los argumentos de `docker run`, con `-race`.
+   - `make config-check` pega directo a `:8080` después de subir el zip por Nest: 400, defaults, `process.env`, log sin el secreto, `src/app.main`, timeout 2s sobre un sleep de 5s, OOM y `docker inspect` de `--cpus`.
+
+**Validación y Corrección Humana:** Riesgos que quedan en el diseño: los valores de `envVars` viajan en el argv de `docker run` y `docker inspect` los muestra mientras el container existe. El log del compute plane los redacta; si el handler los imprime, quedan en su stdout y en el stream de logs. `getRemainingTimeInMillis` sigue en 0. El timeout cuenta el cold start. Nest todavía no persiste ni reenvía la config por función, así que `make hello` sigue con los defaults del entorno.
+
