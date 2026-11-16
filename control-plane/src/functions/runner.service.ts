@@ -13,6 +13,13 @@ export interface RunnerResult {
   httpStatus?: number;
 }
 
+export interface EnqueueResult {
+  executionId: string;
+  httpStatus: number;
+  error?: string;
+  field?: string;
+}
+
 interface ComputePlaneRequest {
   executionId: string;
   functionId: string;
@@ -139,6 +146,66 @@ export class RunnerService {
         error: `Error comunicándose con compute-plane: ${errorMessage}`,
         exitCode: 1,
         durationMs: Date.now() - startTime,
+      };
+    }
+  }
+
+  /**
+   * Encola una invocación async. Go responde en cuanto Redis acepta el job.
+   * El mismo body que POST /executions, más invocationId.
+   */
+  async enqueue(
+    invocationId: string,
+    functionId: string,
+    version: string,
+    event: Record<string, unknown>,
+  ): Promise<EnqueueResult> {
+    const executionId = uuidv4();
+    const request: ComputePlaneRequest & { invocationId: string } = {
+      invocationId,
+      executionId,
+      functionId,
+      version,
+      event,
+      timeoutSec: parseInt(process.env.NIMBUS_TIMEOUT_SEC || '5', 10),
+      memoryMb: parseInt(
+        (process.env.NIMBUS_MEMORY || '128m').replace('m', ''),
+        10,
+      ),
+      handler: process.env.NIMBUS_HANDLER || 'handler',
+    };
+
+    try {
+      const response = await fetch(`${this.computePlaneUrl}/async/jobs`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(request),
+      });
+      const body = (await response.json().catch(() => ({}))) as {
+        executionId?: string;
+        error?: string;
+        field?: string;
+      };
+      if (response.status === 202) {
+        return {
+          executionId: body.executionId || executionId,
+          httpStatus: 202,
+        };
+      }
+      return {
+        executionId,
+        httpStatus: response.status,
+        error: body.error || 'No se pudo encolar la invocación',
+        field: body.field,
+      };
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : 'Error desconocido';
+      this.logger.error(`Error encolando en compute-plane: ${errorMessage}`);
+      return {
+        executionId,
+        httpStatus: 502,
+        error: `Error comunicándose con compute-plane: ${errorMessage}`,
       };
     }
   }

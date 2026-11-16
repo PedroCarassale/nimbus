@@ -10,7 +10,7 @@
 #   make logs    — Muestra logs de todos los servicios
 #   make console — Abre la consola web en el navegador
 
-.PHONY: up down hello smoke load config-check warm-check logs build clean wait-healthy help
+.PHONY: up down hello smoke load config-check warm-check async-check logs build clean wait-healthy help
 
 # Variables
 COMPOSE := docker compose
@@ -82,6 +82,10 @@ config-check: ## Prueba timeout, memoria, env, handler y cpus contra el compute 
 warm-check: ## Mide cold start vs warm start y el descarte por idle, timeout y OOM
 	@echo "$(YELLOW)>>> Prueba de containers warm...$(NC)"
 	@./scripts/warm-check.sh
+
+async-check: ## Invocación async, reintentos, DLQ, redrive y reclaim tras un kill
+	@echo "$(YELLOW)>>> Prueba de invocación async...$(NC)"
+	@./scripts/async-check.sh
 
 logs: ## Muestra logs de todos los servicios (follow)
 	$(COMPOSE) logs -f

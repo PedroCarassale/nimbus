@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/async"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/concurrency"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/executor"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/fnconfig"
@@ -65,6 +66,22 @@ func main() {
 	exec.StartBackground()
 	handler := handlers.NewWithDefaults(exec, concurrencyMgr, fnDefaults)
 
+	asyncCfg := async.LoadConfig()
+	asyncQueue := async.New(rdb, asyncCfg)
+	if err := asyncQueue.EnsureGroup(ctx); err != nil {
+		log.Printf("[compute-plane] Cola async no disponible todavía: %v", err)
+	}
+	handler.SetQueue(asyncQueue)
+	var stopAsync func()
+	if asyncCfg.Enabled {
+		log.Printf("[compute-plane] Async: intentos=%d backoff=%s..%s jitter=%s claim=%s lock=%s workers=%d",
+			asyncCfg.MaxAttempts, asyncCfg.BackoffBase, asyncCfg.BackoffMax, asyncCfg.BackoffJitter,
+			asyncCfg.ClaimIdle, asyncCfg.LockTTL, asyncCfg.Workers)
+		stopAsync = async.StartWorkers(asyncQueue, handler.RunJob, asyncCfg.Workers)
+	} else {
+		log.Printf("[compute-plane] Workers async apagados (NIMBUS_ASYNC_ENABLED)")
+	}
+
 	// The HTTP deadline has to outlive the longest accepted execution plus
 	// the queue wait. Chi's timeout cancels the request context, which is
 	// what kills docker run.
@@ -79,6 +96,9 @@ func main() {
 	r.Head("/health", handler.Health)
 	r.Post("/executions", handler.StartExecution)
 	r.Post("/executions/{id}/cancel", handler.CancelExecution)
+	r.Post("/async/jobs", handler.EnqueueAsync)
+	r.Get("/dlq", handler.ListDLQ)
+	r.Post("/dlq/{id}/redrive", handler.RedriveDLQ)
 
 	srv := &http.Server{
 		Addr:         ":" + port,
@@ -103,6 +123,9 @@ func main() {
 	ctxShutdown, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	if stopAsync != nil {
+		stopAsync()
+	}
 	if err := srv.Shutdown(ctxShutdown); err != nil {
 		log.Printf("[compute-plane] Error en shutdown: %v", err)
 	}

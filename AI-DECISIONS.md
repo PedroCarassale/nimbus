@@ -436,3 +436,35 @@ El contrato queda en `docs/concurrencia.md`.
 
 **Validación y Corrección Humana:** Riesgos que quedan en el diseño: el estado de módulo (y cualquier cosa en `/tmp`) se filtra entre invokes del mismo container. Un `write` directo al fd 1 rompe el framing y obliga a tirar el container. Los valores de `envVars` siguen visibles en `docker inspect` mientras el container vive. `NIMBUS_TIMEOUT_SEC` dentro del container es el del invoke que lo creó; el corte real lo hace Go. Cancelar una ejecución que ya corre sigue sin matar el container. Los ociosos cuentan para `NIMBUS_MAX_CONTAINERS`. El tmpfs de `/tmp` entra en la cuenta de memoria del cgroup. El camino frío sigue arrancando como root de la imagen. Nest no reenvía `coldStart` ni `initMs`.
 
+---
+
+## Paso 4 — Invocación async, reintentos y DLQ
+
+**Problema abordado:** Todas las invocaciones bloqueaban al cliente hasta que el container terminaba. No había reintento si el handler fallaba o el proceso moría a mitad, ni un lugar donde quedara lo que agotó los intentos. La fila de Postgres tiene que terminar con el estado, el output y la cantidad de intentos, y el invoke síncrono tiene que seguir respondiendo igual.
+
+**Prompt / Herramienta utilizada:** Cursor Cloud Agent (Grok 4.7), pedido de Paso 4 del roadmap de Pedro, apilado sobre la rama de Paso 3.
+
+**Código / Arquitectura generada:**
+
+1. **Cola durable en el compute plane**
+   - `POST /async/jobs` valida la config (un 400 no se encola y no va a la DLQ) y hace `XADD` a `nimbus:async:jobs`. El mismo `invocationId` no entra dos veces.
+   - Workers del proceso leen con un consumer group. `XAUTOCLAIM` recupera mensajes cuyo consumer murió. Un lock con renovación impide que la misma invocación corra dos veces a la vez. Si el lock venció, ese intento se cuenta y el siguiente arranca.
+   - El worker llama al mismo `dispatch` que `POST /executions`: semáforo, cola FIFO, config, pool warm y logs.
+   - Un fallo reintentable (handler, timeout, crash, 429) se confirma y se guarda en el sorted set `nimbus:async:retry` con el vencimiento del backoff. El backoff es exponencial con tope y jitter. Default: 3 intentos (el primero más dos reintentos).
+   - Al agotar los intentos, la entrada va a la DLQ (hash + stream) con payload, último error, intentos y timestamps. `GET /dlq` la lista. `POST /dlq/:id/redrive` la vuelve a encolar como intento 1.
+   - Cada resultado se publica en `nimbus:async:results` con un `seq` por invocación.
+
+2. **Control plane, cambio chico**
+   - `POST /functions/:id/invoke?async=true` o `X-Invocation-Type: Event` crea la fila y responde 202 con el id. Sin el flag, la respuesta sigue siendo 200 cuando termina.
+   - El sync marca `RUNNING` antes de llamar a Go. El async lo marca cuando el worker arranca el intento.
+   - Columna opcional `invocations.attempts`. `GET /invocations/:id` la devuelve.
+   - Un consumidor de Nest aplica el stream de resultados. Go no escribe Postgres.
+
+3. **Prueba**
+   - Tests de Go con miniredis: backoff, retry diferido, DLQ, redrive, `XAUTOCLAIM`, el lock y que un 400 no reintenta. `go test -race ./...`.
+   - `make async-check` cubre el 202, el SUCCESS posterior, el sync, la DLQ con timestamps, el redrive y un `SIGKILL` del compute plane a mitad de un sleep.
+
+El contrato queda en `docs/async.md`.
+
+**Validación y Corrección Humana:** Riesgos que quedan en el diseño: el reclaim y el contenedor huérfano pueden solaparse unos segundos después de un kill, hasta que el arranque borra los warm. Los intentos de una misma invocación comparten `executionId` y el stream de logs, así que un `_end` de un intento puede aparecer antes que las líneas del siguiente. El 429 de la cola de concurrencia gasta un intento. `NIMBUS_ASYNC_CLAIM_IDLE_MS` más corto que una ejecución larga hace que otro worker vea el mensaje pendiente; el lock evita correrlo dos veces, pero el idle se reinicia. Nest aplica resultados en orden de `seq`; si ese consumidor está caído, la fila se actualiza cuando vuelve.
+

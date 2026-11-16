@@ -57,6 +57,8 @@ model Invocation {
   output      Json?
   error       String?
   durationMs  Int?             @map("duration_ms")
+  // Intentos ejecutados. NULL en filas anteriores a la invocación async.
+  attempts    Int?             @map("attempts")
   createdAt   DateTime         @default(now()) @map("created_at")
   updatedAt   DateTime         @updatedAt @map("updated_at")
 

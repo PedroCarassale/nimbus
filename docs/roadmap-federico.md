@@ -79,7 +79,7 @@ console/
 - `name` es único a nivel global. Con usuarios va a tener que ser único **por usuario**.
 - No hay auth: cualquiera ve y ejecuta todo.
 - El compute plane ya aplica timeout, memoria, CPU, handler y `envVars` por invocación ([`configuracion.md`](configuracion.md)). Nest todavía no los guarda: `runner.service.ts` manda timeout, memoria y handler desde variables de entorno, y no manda `envVars` ni `cpus`.
-- En `invoke`, el estado `RUNNING` se guarda recién cuando la ejecución ya terminó. Conviene marcarlo antes de llamar a Go.
+- En el invoke sync, `RUNNING` se guarda antes de llamar a Go. En async pasa a `RUNNING` cuando el worker arranca el intento.
 - Hay `GET /invocations/:id`, pero no hay un listado de invocaciones por función.
 
 ## 5. Roadmap del control plane
@@ -159,6 +159,8 @@ No envía `envVars` ni `cpus`. Cuando exista `PATCH /functions/:id`, el invoke t
 `maxConcurrency` es opcional. Si no viene, Go usa `NIMBUS_FN_CONCURRENCY`. La respuesta de una ejecución que entró es `{ executionId, success, output, error, exitCode, durationMs, queuedMs, coldStart, initMs }`. `queuedMs` son los milisegundos esperados en la cola (`0` si entró directo). `coldStart` es `true` cuando Go arrancó un container para ese invoke, e `initMs` es el arranque de ese container (`0` si reutilizó uno). Nest hoy no reenvía esos dos campos. El detalle está en [`warm.md`](warm.md).
 
 Si la cola de la función está llena, o se vence la espera, Go responde **429** con `reason` `queue_full` o `queue_timeout`. El control plane lo traduce a **429 Too Many Requests** en `POST /functions/:id/invoke`. El detalle del semáforo, la cola y el tope global está en [`concurrencia.md`](concurrencia.md).
+
+Invocación async (Paso 4 de Pedro, con un cambio chico en Nest): `POST /functions/:id/invoke?async=true` o el header `X-Invocation-Type: Event` responde **202** con `invocationId` y no espera al handler. Go encola en Redis, reintenta con backoff y deja en una DLQ lo que agota los intentos. Nest solo crea la fila, la marca `RUNNING` cuando el worker arranca y escribe el resultado final (`status`, `output`, `attempts`). La columna `attempts` es opcional. El invoke sin ese flag sigue respondiendo 200 como antes. Contrato, variables y `GET /dlq` / `POST /dlq/:id/redrive` están en [`async.md`](async.md).
 
 Reglas:
 - Todo campo nuevo que el control plane necesite de Go (variables de entorno, invocación async, etc.) se define primero en `docs/` y después se implementa en cada lado.

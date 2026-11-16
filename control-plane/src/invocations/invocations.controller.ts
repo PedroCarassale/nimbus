@@ -35,6 +35,7 @@ export class InvocationsController {
       output: invocation.output,
       error: invocation.error,
       durationMs: invocation.durationMs,
+      attempts: invocation.attempts,
       createdAt: invocation.createdAt,
       updatedAt: invocation.updatedAt,
     };

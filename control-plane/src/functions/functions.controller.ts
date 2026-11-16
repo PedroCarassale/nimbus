@@ -4,14 +4,17 @@ import {
   Post,
   Body,
   Param,
+  Query,
+  Headers,
   UploadedFile,
   UseInterceptors,
   BadRequestException,
-  HttpCode,
   HttpException,
   HttpStatus,
+  Res,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
+import { Response } from 'express';
 import { FunctionsService } from './functions.service';
 import { RunnerService } from './runner.service';
 import { CreateFunctionDto } from './dto/create-function.dto';
@@ -114,17 +117,20 @@ export class FunctionsController {
   }
 
   /**
-   * POST /functions/:id/invoke — Invocar función sincronamente
+   * POST /functions/:id/invoke — Invocar una función.
    *
-   * Para Slice 3: usa el bridge temporal (RunnerService) que ejecuta
-   * los scripts de Slice 1-2. En Slice 4 esto se reemplaza con Nest → Go.
-   *
-   * @param id - ID de la función
-   * @param dto - Evento y versión opcional
+   * Sin flags responde 200 cuando la ejecución termina (sync).
+   * Con `?async=true` o `X-Invocation-Type: Event` responde 202 y el
+   * compute plane ejecuta en segundo plano.
    */
   @Post(':id/invoke')
-  @HttpCode(200)
-  async invoke(@Param('id') id: string, @Body() dto: InvokeFunctionDto) {
+  async invoke(
+    @Param('id') id: string,
+    @Body() dto: InvokeFunctionDto,
+    @Query('async') asyncQuery: string | undefined,
+    @Headers('x-invocation-type') invocationType: string | undefined,
+    @Res() res: Response,
+  ) {
     const fn = await this.functionsService.findOne(id);
 
     let version = dto.version
@@ -147,9 +153,68 @@ export class FunctionsController {
       event,
     );
 
+    if (wantsAsync(asyncQuery, invocationType)) {
+      console.log(
+        `[invoke] Encolando ${fn.name} v${version.version} (requestId: ${invocation.requestId})`,
+      );
+      const enqueued = await this.runnerService.enqueue(
+        invocation.id,
+        fn.id,
+        version.version,
+        event,
+      );
+      if (enqueued.httpStatus === 400) {
+        await this.functionsService.updateInvocation(invocation.id, {
+          status: 'ERROR',
+          executionId: enqueued.executionId,
+          error: enqueued.error,
+          attempts: 0,
+        });
+        throw new BadRequestException({
+          message: enqueued.error || 'Configuración inválida',
+          field: enqueued.field,
+          invocationId: invocation.id,
+        });
+      }
+      if (enqueued.httpStatus !== 202) {
+        await this.functionsService.updateInvocation(invocation.id, {
+          status: 'ERROR',
+          executionId: enqueued.executionId,
+          error: enqueued.error,
+        });
+        throw new HttpException(
+          {
+            statusCode: HttpStatus.BAD_GATEWAY,
+            error: 'Bad Gateway',
+            message: enqueued.error || 'No se pudo encolar la invocación',
+            invocationId: invocation.id,
+            requestId: invocation.requestId,
+          },
+          HttpStatus.BAD_GATEWAY,
+        );
+      }
+      await this.functionsService.updateInvocation(invocation.id, {
+        status: 'PENDING',
+        executionId: enqueued.executionId,
+        attempts: 0,
+      });
+      res.status(HttpStatus.ACCEPTED).json({
+        invocationId: invocation.id,
+        requestId: invocation.requestId,
+        executionId: enqueued.executionId,
+        status: 'PENDING',
+        logsUrl: `/invocations/${invocation.id}/logs`,
+      });
+      return;
+    }
+
     console.log(
       `[invoke] Ejecutando ${fn.name} v${version.version} (requestId: ${invocation.requestId})`,
     );
+
+    await this.functionsService.updateInvocation(invocation.id, {
+      status: 'RUNNING',
+    });
 
     const result = await this.runnerService.invoke(
       fn.id,
@@ -180,11 +245,6 @@ export class FunctionsController {
       );
     }
 
-    await this.functionsService.updateInvocation(invocation.id, {
-      status: 'RUNNING',
-      executionId: result.executionId,
-    });
-
     const status = result.success
       ? 'SUCCESS'
       : result.exitCode === 124
@@ -193,12 +253,14 @@ export class FunctionsController {
 
     await this.functionsService.updateInvocation(invocation.id, {
       status,
+      executionId: result.executionId,
       output: result.output,
       error: result.error,
       durationMs: result.durationMs,
+      attempts: 1,
     });
 
-    return {
+    res.status(HttpStatus.OK).json({
       invocationId: invocation.id,
       requestId: invocation.requestId,
       executionId: result.executionId,
@@ -208,6 +270,17 @@ export class FunctionsController {
       error: result.error,
       queuedMs: result.queuedMs ?? 0,
       logsUrl: `/invocations/${invocation.id}/logs`,
-    };
+    });
   }
+}
+
+function wantsAsync(query?: string, header?: string): boolean {
+  if (header && header.trim().toLowerCase() === 'event') {
+    return true;
+  }
+  if (!query) {
+    return false;
+  }
+  const value = query.trim().toLowerCase();
+  return value === '1' || value === 'true' || value === 'yes';
 }
