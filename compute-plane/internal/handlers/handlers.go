@@ -11,7 +11,12 @@ import (
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/concurrency"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/executor"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/fnconfig"
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/metrics"
+	ntrace "github.com/PedroCarassale/nimbus/compute-plane/internal/trace"
 	"github.com/go-chi/chi/v5"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // runner executes user code. *executor.Executor implements it.
@@ -101,7 +106,19 @@ func (h *Handler) StartExecution(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	status, payload := h.dispatch(r.Context(), req)
+	ctx := ntrace.ExtractHTTP(r.Context(), r.Header)
+	ctx, span := ntrace.Start(ctx, "nimbus.executions", trace.WithSpanKind(trace.SpanKindServer))
+	span.SetAttributes(
+		attribute.String("nimbus.function_id", req.FunctionID),
+		attribute.String("nimbus.mode", "sync"),
+	)
+	defer span.End()
+
+	status, payload := h.dispatch(ctx, req, "sync")
+	span.SetAttributes(attribute.Int("http.response.status_code", status))
+	if status >= 500 {
+		span.SetStatus(codes.Error, http.StatusText(status))
+	}
 	if status == http.StatusTooManyRequests {
 		w.Header().Set("Retry-After", "5")
 	}
@@ -110,25 +127,42 @@ func (h *Handler) StartExecution(w http.ResponseWriter, r *http.Request) {
 
 // dispatch validates, takes a concurrency slot and runs the container.
 // Sync HTTP and the async worker both go through here.
-func (h *Handler) dispatch(ctx context.Context, req StartExecutionRequest) (int, any) {
+// mode is "sync" or "async" and is a metric label, not a trace id.
+func (h *Handler) dispatch(ctx context.Context, req StartExecutionRequest, mode string) (int, any) {
 	resolved, status, payload := h.validate(req)
 	if status != 0 {
 		return status, payload
 	}
 
-	log.Printf("[handler] StartExecution: %s (fn: %s, v: %s, timeout: %ds, memory: %dMB, cpus: %s, handler: %s, env: %d)",
-		req.ExecutionID, req.FunctionID, req.Version, resolved.TimeoutSec, resolved.MemoryMB, cpusLabel(resolved), resolved.Handler, len(resolved.Env))
+	ntrace.Logf(ctx, "[handler] StartExecution: %s (fn: %s, v: %s, timeout: %ds, memory: %dMB, cpus: %s, handler: %s, env: %d, mode: %s)",
+		req.ExecutionID, req.FunctionID, req.Version, resolved.TimeoutSec, resolved.MemoryMB, cpusLabel(resolved), resolved.Handler, len(resolved.Env), mode)
 
 	maxConcurrency := req.MaxConcurrency
 	if maxConcurrency < 0 {
 		maxConcurrency = 0
 	}
-	queuedMs, err := h.concurrency.Acquire(ctx, req.FunctionID, req.ExecutionID, maxConcurrency)
+	qctx, qspan := ntrace.Start(ctx, "queue.wait")
+	qspan.SetAttributes(attribute.String("nimbus.function_id", req.FunctionID))
+	queuedMs, err := h.concurrency.Acquire(qctx, req.FunctionID, req.ExecutionID, maxConcurrency)
+	qspan.SetAttributes(attribute.Int64("nimbus.queued_ms", queuedMs))
 	if err != nil {
+		ntrace.Fail(qspan, err)
+	}
+	qspan.End()
+	metrics.ObserveQueueWait(req.FunctionID, queuedMs)
+	if err != nil {
+		switch {
+		case errors.Is(err, concurrency.ErrQueueFull):
+			metrics.Rejection(req.FunctionID, "queue_full")
+		case errors.Is(err, concurrency.ErrWaitTimeout):
+			metrics.Rejection(req.FunctionID, "queue_timeout")
+		}
 		return admissionResult(req.ExecutionID, queuedMs, err)
 	}
 
+	metrics.ActiveInc(req.FunctionID)
 	defer func() {
+		metrics.ActiveDec(req.FunctionID)
 		if releaseErr := h.concurrency.Release(context.WithoutCancel(ctx), req.FunctionID, req.ExecutionID); releaseErr != nil {
 			log.Printf("[handler] Error liberando slot: %v", releaseErr)
 		}
@@ -154,6 +188,8 @@ func (h *Handler) dispatch(ctx context.Context, req StartExecutionRequest) (int,
 		ColdStart:   result.ColdStart,
 		InitMs:      result.InitMs,
 	}
+	outcome := metrics.Classify(result.Success, result.ExitCode, result.Error)
+	metrics.RecordInvocation(req.FunctionID, mode, outcome, result.DurationMs, result.ColdStart, result.InitMs)
 	if !result.Success && result.ExitCode == 124 {
 		return http.StatusGatewayTimeout, resp
 	}

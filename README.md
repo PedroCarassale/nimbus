@@ -6,6 +6,7 @@ Plataforma serverless (estilo Lambda) de Pedro Carassale y Federico Tessadro.
 
 - **Stack técnico del MVP:** [docs/stack.md](docs/stack.md)
 - **Roadmap hasta el MVP:** [docs/roadmap.md](docs/roadmap.md)
+- **Observabilidad:** [docs/observabilidad.md](docs/observabilidad.md)
 - **Auditoría IA (cátedra):** [AI-DECISIONS.md](AI-DECISIONS.md)
 - **Instrucciones para agentes:** [agents.md](agents.md)
 
@@ -67,6 +68,8 @@ make load         # 6 invokes en paralelo: 2 corren, 3 esperan, 1 recibe 429
 make config-check # timeout, memoria, env, handler y cpus contra el compute plane
 make warm-check   # cold start vs warm start, idle, timeout y OOM
 make async-check  # 202, reintentos, DLQ, redrive y reclaim si el compute plane muere
+make obs          # Prometheus, Grafana y Jaeger (no entra en make up)
+make obs-check    # tráfico real y consulta a las APIs de Prometheus, Grafana y Jaeger
 make logs         # Ver logs de todos los servicios
 make down         # Detener el stack
 make down-clean   # Detener y eliminar volúmenes
@@ -190,6 +193,7 @@ curl -X POST http://localhost:3000/functions/{FN_ID}/invoke \
 | Método | Endpoint | Descripción |
 |--------|----------|-------------|
 | GET | `/health` | Health check |
+| GET | `/metrics` | Métricas HTTP de Prometheus |
 | POST | `/functions` | Crear función |
 | GET | `/functions` | Listar funciones |
 | GET | `/functions/:id` | Obtener detalles |
@@ -203,6 +207,7 @@ curl -X POST http://localhost:3000/functions/{FN_ID}/invoke \
 | Método | Endpoint | Descripción |
 |--------|----------|-------------|
 | GET | `/health` | Health check |
+| GET | `/metrics` | Métricas Prometheus |
 | POST | `/executions` | Ejecutar función (Nest → Go) |
 | POST | `/executions/:id/cancel` | Cancelar ejecución |
 | POST | `/async/jobs` | Encolar una invocación async (Nest → Go). Responde 202 |
@@ -391,6 +396,10 @@ Cliente HTTP
 | `NIMBUS_ASYNC_BACKOFF_BASE_MS` | `500` | Espera después del primer fallo. Después se duplica, con tope y jitter |
 | `NIMBUS_ASYNC_CLAIM_IDLE_MS` | `20000` | Idle para reclamar un mensaje cuyo worker murió |
 | `NIMBUS_ASYNC_LOCK_MS` | `15000` | Lock para no ejecutar la misma invocación dos veces a la vez |
+| `NIMBUS_TRACING` | `1` | `0`, `false`, `off` o `no` apagan la exportación de trazas |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://otel-collector:4318` | Collector OTLP. Si no está, la invocación sigue |
+
+Métricas, dashboard y Jaeger: [docs/observabilidad.md](docs/observabilidad.md). `make obs` los levanta. `make up` no.
 
 **Control Plane — Redis (Slice 5):**
 

@@ -132,6 +132,13 @@ function loadHandlerTarget() {
   };
 }
 
+function logTrace(traceId, traceparent) {
+  if (!traceId && !traceparent) {
+    return;
+  }
+  console.error(`[nimbus] traceId=${traceId || ''} traceparent=${traceparent || ''}`);
+}
+
 function contextFor() {
   return {
     functionName: process.env.NIMBUS_FUNCTION_NAME || 'local',
@@ -224,6 +231,7 @@ async function runOnce() {
   }
 
   const handlerFn = loadUserHandler();
+  logTrace(process.env.NIMBUS_TRACE_ID, process.env.TRACEPARENT);
 
   try {
     const result = await handlerFn(event, contextFor());
@@ -256,6 +264,24 @@ async function handleInvoke(line, handlerFn, flush) {
   const executionId = typeof msg.executionId === 'string' ? msg.executionId : '';
   currentExec = executionId;
   const event = msg.event && typeof msg.event === 'object' ? msg.event : {};
+  // docker -e is fixed when the warm process starts. Each invoke carries its
+  // own trace and we publish it on process.env for the handler of this call.
+  const traceId = typeof msg.traceId === 'string' ? msg.traceId : '';
+  const traceparent = typeof msg.traceparent === 'string' ? msg.traceparent : '';
+  if (traceId) {
+    process.env.NIMBUS_TRACE_ID = traceId;
+  }
+  if (traceparent) {
+    process.env.TRACEPARENT = traceparent;
+  }
+  if (traceId || traceparent) {
+    emit({
+      type: 'log',
+      stream: 'stderr',
+      executionId,
+      line: `[nimbus] traceId=${traceId} traceparent=${traceparent}`,
+    });
+  }
 
   try {
     const result = await handlerFn(event, contextFor());

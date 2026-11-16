@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	ntrace "github.com/PedroCarassale/nimbus/compute-plane/internal/trace"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -79,6 +80,8 @@ func (q *Queue) Enqueue(ctx context.Context, invocationID, executionID string, b
 		MaxAttempts:  maxAttempts,
 		EnqueuedAt:   now,
 		Body:         body,
+		TraceParent:  ntrace.Header(ctx),
+		TraceState:   ntrace.State(ctx),
 	}
 	jobJSON, err := json.Marshal(job)
 	if err != nil {
@@ -282,6 +285,11 @@ func (q *Queue) CommitTerminal(ctx context.Context, invocationID string, st Stat
 		streamDLQ,
 		stateKey(invocationID),
 	}, entry.ID, string(rawEntry), string(rawState)).Err()
+}
+
+// DLQLen is the number of invocations waiting in the dead-letter hash.
+func (q *Queue) DLQLen(ctx context.Context) (int64, error) {
+	return q.rdb.HLen(ctx, dlqItemsKey).Result()
 }
 
 func (q *Queue) ListDLQ(ctx context.Context) ([]DLQEntry, error) {

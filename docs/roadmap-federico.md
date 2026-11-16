@@ -162,6 +162,8 @@ Si la cola de la función está llena, o se vence la espera, Go responde **429**
 
 Invocación async (Paso 4 de Pedro, con un cambio chico en Nest): `POST /functions/:id/invoke?async=true` o el header `X-Invocation-Type: Event` responde **202** con `invocationId` y no espera al handler. Go encola en Redis, reintenta con backoff y deja en una DLQ lo que agota los intentos. Nest solo crea la fila, la marca `RUNNING` cuando el worker arranca y escribe el resultado final (`status`, `output`, `attempts`). La columna `attempts` es opcional. El invoke sin ese flag sigue respondiendo 200 como antes. Contrato, variables y `GET /dlq` / `POST /dlq/:id/redrive` están en [`async.md`](async.md).
 
+Observabilidad (Paso 5 de Pedro, otro cambio chico en Nest): el invoke inyecta el header W3C `traceparent` en `POST /executions` y en `POST /async/jobs`. Go lo guarda en el job de Redis para el camino async. El body no cambia. Nest también expone `GET /metrics` con dos series HTTP. El detalle está en [`observabilidad.md`](observabilidad.md).
+
 Reglas:
 - Todo campo nuevo que el control plane necesite de Go (variables de entorno, invocación async, etc.) se define primero en `docs/` y después se implementa en cada lado.
 - Los cambios al contrato tienen que ser compatibles hacia atrás: agregar campos opcionales, no romper los que ya existen.

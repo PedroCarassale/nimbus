@@ -13,18 +13,25 @@ import (
 
 // Spec is everything the runtime needs to start one container.
 type Spec struct {
-	Key        string
-	FunctionID string
-	Version    string
-	WorkDir    string
-	Image      string
-	Config     fnconfig.Resolved
+	Key         string
+	FunctionID  string
+	Version     string
+	WorkDir     string
+	Image       string
+	Config      fnconfig.Resolved
+	TraceID     string
+	TraceParent string
 }
 
 // Invocation is one call against a container that is already running.
 type Invocation struct {
 	ExecutionID string
 	Event       map[string]interface{}
+	// TraceID and TraceParent travel in the invoke frame. The bootstrap
+	// publishes them as NIMBUS_TRACE_ID and TRACEPARENT for that call.
+	// The process is reused, so docker -e cannot change between invokes.
+	TraceID     string
+	TraceParent string
 	// Log receives one user line. stream is "stdout" or "stderr".
 	Log func(stream, line string)
 	// Begin runs once the pool knows whether this call reused a container,
@@ -342,6 +349,32 @@ func (p *Pool) Shutdown(ctx context.Context) {
 	for _, sess := range victims {
 		_ = sess.Destroy(ctx)
 	}
+}
+
+// FunctionUsage is the warm containers of one function.
+type FunctionUsage struct {
+	Idle int
+	Busy int
+}
+
+// Usage snapshots the pool. A slot that is reserved but not started yet counts as busy.
+func (p *Pool) Usage() map[string]FunctionUsage {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := map[string]FunctionUsage{}
+	for _, s := range p.slots {
+		u := out[s.functionID]
+		if s.busy || s.session == nil {
+			u.Busy++
+		} else {
+			u.Idle++
+		}
+		out[s.functionID] = u
+	}
+	return out
 }
 
 // Idle reports how many sessions are waiting for work.

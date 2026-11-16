@@ -3,11 +3,16 @@ package async
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
+	ntrace "github.com/PedroCarassale/nimbus/compute-plane/internal/trace"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
 type clockQueue struct {
@@ -58,6 +63,35 @@ func jobBody(t *testing.T, executionID string) json.RawMessage {
 		t.Fatal(err)
 	}
 	return raw
+}
+
+func TestEnqueueCarriesTraceParent(t *testing.T) {
+	tp := sdktrace.NewTracerProvider()
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+
+	ctx, span := tp.Tracer("test").Start(context.Background(), "nimbus.async.enqueue")
+	defer span.End()
+
+	cq := newClockQueue(t, Config{})
+	if _, _, err := cq.q.Enqueue(ctx, "inv-trace", "exec-trace", jobBody(t, "exec-trace")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := cq.q.Read(context.Background(), 4, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("deliveries=%d", len(got))
+	}
+	if !strings.Contains(got[0].Job.TraceParent, span.SpanContext().TraceID().String()) {
+		t.Fatalf("traceparent %q", got[0].Job.TraceParent)
+	}
+	continued := ntrace.Continue(context.Background(), got[0].Job.TraceParent, got[0].Job.TraceState)
+	if ntrace.ID(continued) != span.SpanContext().TraceID().String() {
+		t.Fatalf("worker context %s", ntrace.ID(continued))
+	}
 }
 
 func TestEnqueueReadAndIdempotent(t *testing.T) {

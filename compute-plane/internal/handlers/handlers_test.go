@@ -12,6 +12,7 @@ import (
 
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/concurrency"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/executor"
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/metrics"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -166,6 +167,54 @@ func TestStartExecutionPropagatesWarmMeta(t *testing.T) {
 	}
 	if body["coldStart"] != true || body["initMs"].(float64) != 180 {
 		t.Fatalf("body %#v", body)
+	}
+}
+
+func TestStartExecutionRecordsMetrics(t *testing.T) {
+	const fn = "fn-handler-metrics"
+	beforeOK := metrics.Sample("nimbus_invocations_total", map[string]string{
+		"function_id": fn, "status": "success", "mode": "sync",
+	})
+	beforeCold := metrics.Sample("nimbus_cold_starts_total", map[string]string{"function_id": fn})
+	beforeRej := metrics.Sample("nimbus_rejections_total", map[string]string{
+		"function_id": fn, "reason": "queue_full",
+	})
+
+	okHandler := &Handler{
+		executor: &fakeRunner{result: &executor.ExecutionResult{
+			Success: true, ExitCode: 0, ColdStart: true, InitMs: 20, DurationMs: 30,
+		}},
+		concurrency: &fakeLocker{acquire: true, queuedMs: 5},
+	}
+	rr := postJSON(t, newRouter(okHandler), "/executions", `{
+		"executionId":"e-metrics","functionId":"`+fn+`","version":"v1"
+	}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status %d %s", rr.Code, rr.Body.String())
+	}
+	if got := metrics.Sample("nimbus_invocations_total", map[string]string{
+		"function_id": fn, "status": "success", "mode": "sync",
+	}); got-beforeOK != 1 {
+		t.Fatalf("invocations %v", got-beforeOK)
+	}
+	if got := metrics.Sample("nimbus_cold_starts_total", map[string]string{"function_id": fn}); got-beforeCold != 1 {
+		t.Fatalf("cold %v", got-beforeCold)
+	}
+
+	rej := &Handler{executor: &fakeRunner{}, concurrency: &fakeLocker{acquire: false}}
+	rr = postJSON(t, newRouter(rej), "/executions", `{
+		"executionId":"e-rej","functionId":"`+fn+`","version":"v1"
+	}`)
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("status %d %s", rr.Code, rr.Body.String())
+	}
+	if got := metrics.Sample("nimbus_rejections_total", map[string]string{
+		"function_id": fn, "reason": "queue_full",
+	}); got-beforeRej != 1 {
+		t.Fatalf("rejections %v", got-beforeRej)
+	}
+	if got := metrics.Sample("nimbus_active_executions", map[string]string{"function_id": fn}); got != 0 {
+		t.Fatalf("active leaked: %v", got)
 	}
 }
 

@@ -7,6 +7,10 @@ import (
 	"log"
 	"sync"
 	"time"
+
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/metrics"
+	ntrace "github.com/PedroCarassale/nimbus/compute-plane/internal/trace"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // Runner executes one attempt. The compute plane passes the same function
@@ -162,6 +166,10 @@ func (w *Worker) Handle(ctx context.Context, d Delivery) {
 }
 
 func (w *Worker) runAttempt(ctx context.Context, d Delivery, job Job, st State, attempt int) {
+	ctx = ntrace.Continue(ctx, job.TraceParent, job.TraceState)
+	ctx, span := ntrace.Start(ctx, "async.attempt")
+	defer span.End()
+
 	times := append([]int64{}, st.AttemptTimes...)
 	times = append(times, w.q.Now().UnixMilli())
 	running := State{
@@ -177,6 +185,11 @@ func (w *Worker) runAttempt(ctx context.Context, d Delivery, job Job, st State, 
 		return
 	}
 	meta := peekBody(job.Body)
+	span.SetAttributes(
+		attribute.String("nimbus.function_id", meta.FunctionID),
+		attribute.String("nimbus.invocation_id", job.InvocationID),
+		attribute.Int("nimbus.attempt", attempt),
+	)
 	_ = w.q.Publish(ctx, Result{
 		InvocationID: job.InvocationID,
 		ExecutionID:  meta.ExecutionID,
@@ -251,6 +264,7 @@ func (w *Worker) runAttempt(ctx context.Context, d Delivery, job Job, st State, 
 			log.Printf("[async] no se pudo programar el reintento %s: %v", job.InvocationID, err)
 			return
 		}
+		metrics.AsyncRetry(meta.FunctionID)
 		_ = w.q.Publish(ctx, Result{
 			InvocationID: job.InvocationID,
 			ExecutionID:  meta.ExecutionID,

@@ -5,6 +5,7 @@ import { RedisModule } from './redis/redis.module';
 import { FunctionsModule } from './functions/functions.module';
 import { InvocationsModule } from './invocations/invocations.module';
 import { HealthController } from './health.controller';
+import { MetricsController } from './observability/metrics.controller';
 
 @Module({
   imports: [
@@ -14,6 +15,6 @@ import { HealthController } from './health.controller';
     FunctionsModule,
     InvocationsModule,
   ],
-  controllers: [HealthController],
+  controllers: [HealthController, MetricsController],
 })
 export class AppModule {}

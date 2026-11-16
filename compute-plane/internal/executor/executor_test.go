@@ -123,6 +123,28 @@ func TestDockerWarmArgsIsolation(t *testing.T) {
 	}
 }
 
+func TestWithExtraEnvInsertsTraceBeforeImage(t *testing.T) {
+	cfg := testConfig(t)
+	args := withExtraEnv(dockerRunArgs("nimbus-abc", "/tmp/work", "nimbus-node", cfg), []string{
+		"NIMBUS_TRACE_ID=abc",
+		"TRACEPARENT=00-abc-def-01",
+	})
+	if args[len(args)-1] != "nimbus-node" {
+		t.Fatalf("image is not last: %v", args)
+	}
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "-e NIMBUS_TRACE_ID=abc") || !strings.Contains(joined, "-e TRACEPARENT=00-abc-def-01") {
+		t.Fatalf("trace env missing: %s", joined)
+	}
+	if got := withExtraEnv(args[:1], nil); len(got) != 1 {
+		t.Fatalf("empty env should keep args")
+	}
+	logged := formatArgsForLog(args)
+	if !strings.Contains(logged, "NIMBUS_TRACE_ID=abc") || !strings.Contains(logged, "TRACEPARENT=00-abc-def-01") {
+		t.Fatalf("trace env should stay visible: %s", logged)
+	}
+}
+
 func TestFormatArgsForLogRedactsEnvValues(t *testing.T) {
 	cfg := testConfig(t)
 	args := dockerRunArgs("nimbus-abc", "/tmp/work", "nimbus-node", cfg)

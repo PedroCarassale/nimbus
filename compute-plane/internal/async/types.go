@@ -9,6 +9,10 @@ type Job struct {
 	MaxAttempts  int             `json:"maxAttempts"`
 	EnqueuedAt   int64           `json:"enqueuedAt"`
 	Body         json.RawMessage `json:"body"`
+	// TraceParent and TraceState are the W3C headers captured when the job
+	// was accepted. Retries keep them, so every attempt stays on the same trace.
+	TraceParent string `json:"traceparent,omitempty"`
+	TraceState  string `json:"tracestate,omitempty"`
 }
 
 // State is the per-invocation record. Result is set only on a terminal phase

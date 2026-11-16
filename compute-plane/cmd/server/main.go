@@ -14,16 +14,20 @@ import (
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/executor"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/fnconfig"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/handlers"
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/metrics"
 	minioClient "github.com/PedroCarassale/nimbus/compute-plane/internal/minio"
+	ntrace "github.com/PedroCarassale/nimbus/compute-plane/internal/trace"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/warm"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 )
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Println("[compute-plane] Iniciando servicio...")
+	stopTrace := ntrace.Setup(context.Background())
 
 	port := getEnv("PORT", "8080")
 	redisAddr := getEnv("REDIS_URL", "redis:6379")
@@ -72,6 +76,35 @@ func main() {
 		log.Printf("[compute-plane] Cola async no disponible todavía: %v", err)
 	}
 	handler.SetQueue(asyncQueue)
+	metrics.SetSources(metrics.Sources{
+		QueueDepth: func(ctx context.Context) map[string]float64 {
+			depths, err := concurrencyMgr.QueueDepths(ctx)
+			if err != nil {
+				return nil
+			}
+			out := make(map[string]float64, len(depths))
+			for id, n := range depths {
+				out[id] = float64(n)
+			}
+			return out
+		},
+		DLQEntries: func(ctx context.Context) float64 {
+			n, err := asyncQueue.DLQLen(ctx)
+			if err != nil {
+				return 0
+			}
+			return float64(n)
+		},
+		ContainersInUse: func(ctx context.Context) float64 {
+			n, err := concurrencyMgr.GlobalInUse(ctx)
+			if err != nil {
+				return 0
+			}
+			return float64(n)
+		},
+		ContainersLimit: float64(concCfg.GlobalMax),
+		WarmPool:        exec.WarmPool,
+	})
 	var stopAsync func()
 	if asyncCfg.Enabled {
 		log.Printf("[compute-plane] Async: intentos=%d backoff=%s..%s jitter=%s claim=%s lock=%s workers=%d",
@@ -94,6 +127,7 @@ func main() {
 
 	r.Get("/health", handler.Health)
 	r.Head("/health", handler.Health)
+	r.Handle("/metrics", promhttp.Handler())
 	r.Post("/executions", handler.StartExecution)
 	r.Post("/executions/{id}/cancel", handler.CancelExecution)
 	r.Post("/async/jobs", handler.EnqueueAsync)
@@ -129,6 +163,7 @@ func main() {
 	if err := srv.Shutdown(ctxShutdown); err != nil {
 		log.Printf("[compute-plane] Error en shutdown: %v", err)
 	}
+	_ = stopTrace(context.Background())
 	exec.Shutdown(context.Background())
 
 	log.Println("[compute-plane] Servidor detenido")

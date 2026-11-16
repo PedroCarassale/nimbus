@@ -69,6 +69,8 @@ Una config inválida (timeout, memoria, CPU, handler, env) responde **400** en e
 
 Go expone la cola en `POST /async/jobs` con el mismo body que `POST /executions` más `invocationId`. Responde **202** `{ invocationId, executionId, status: "queued" }`. Repetir el mismo `invocationId` no encola dos veces.
 
+Si el request trae `traceparent`, el job lo guarda y el worker sigue en esa traza. Sin el header el intento abre una traza propia. El detalle está en [`observabilidad.md`](observabilidad.md).
+
 ## Qué se reintenta
 
 | Resultado | Reintento |

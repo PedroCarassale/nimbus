@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -105,6 +107,41 @@ func (m *Manager) globalKey() string {
 
 func (m *Manager) execKey(executionID string) string {
 	return "nimbus:exec:" + executionID
+}
+
+// QueueDepths reports how many invocations are waiting, per function.
+// Missing keys are omitted; the caller can fill zeros for functions it has seen.
+func (m *Manager) QueueDepths(ctx context.Context) (map[string]int, error) {
+	out := map[string]int{}
+	var cursor uint64
+	for {
+		keys, next, err := m.rdb.Scan(ctx, cursor, "nimbus:queue:fn:*", 100).Result()
+		if err != nil {
+			return nil, err
+		}
+		for _, key := range keys {
+			n, err := m.rdb.ZCard(ctx, key).Result()
+			if err != nil {
+				return nil, err
+			}
+			id := strings.TrimPrefix(key, "nimbus:queue:fn:")
+			if id == "" {
+				continue
+			}
+			out[id] = int(n)
+		}
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	return out, nil
+}
+
+// GlobalInUse counts execution slots whose lease has not expired.
+func (m *Manager) GlobalInUse(ctx context.Context) (int64, error) {
+	now := m.now().UnixMilli()
+	return m.rdb.ZCount(ctx, m.globalKey(), "("+strconv.FormatInt(now, 10), "+inf").Result()
 }
 
 // Acquire blocks until this execution holds a slot, the queue rejects it,
