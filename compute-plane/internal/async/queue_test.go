@@ -107,6 +107,16 @@ func TestEnqueueReadAndIdempotent(t *testing.T) {
 	if err != nil || !dup || id != "exec-1" {
 		t.Fatalf("second enqueue id=%s dup=%v err=%v", id, dup, err)
 	}
+	pendingStatus, err := cq.q.rdb.HGet(ctx, "nimbus:exec:exec-1", "status").Result()
+	if err != nil || pendingStatus != "pending" {
+		t.Fatalf("exec hash status=%q err=%v", pendingStatus, err)
+	}
+	if fn, err := cq.q.rdb.HGet(ctx, "nimbus:exec:exec-1", "functionId").Result(); err != nil || fn != "fn-1" {
+		t.Fatalf("functionId=%q err=%v", fn, err)
+	}
+	if n, err := cq.q.rdb.Exists(ctx, "nimbus:exec:exec-other").Result(); err != nil || n != 0 {
+		t.Fatalf("duplicate wrote another exec hash n=%d err=%v", n, err)
+	}
 
 	got, err := cq.q.Read(ctx, 10, -1)
 	if err != nil {

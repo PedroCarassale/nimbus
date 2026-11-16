@@ -502,3 +502,33 @@ El contrato queda en `docs/async.md`.
 
 **Validación y Corrección Humana:** Riesgos que quedan en el diseño: el trace id dentro de un container warm se actualiza por invoke en `process.env`, pero `docker inspect` sigue mostrando el valor del `docker run` que creó el proceso. Un collector caído descarta spans; no hay cola durable de trazas. La profundidad de cola y la DLQ se leen en el scrape, así que un pico más corto que el intervalo de 5s puede no aparecer. `nimbus_containers_in_use` cuenta slots de Redis, no `docker ps`. Las etiquetas por `function_id` crecen con la cantidad de funciones del proceso.
 
+---
+
+## QA de los pasos 0 a 5
+
+**Problema abordado:** El stack de los pasos 0 a 5 (concurrencia, config, warm, async y observabilidad) estaba entero en ramas sin mergear. Había que correrlo junto, buscar interacciones que los checks de cada paso no cubren, y corregir lo que se rompiera.
+
+**Prompt / Herramienta utilizada:** Cursor Cloud Agent (Grok 4.7). Pedido de QA profundo del stack #9–#15, con Docker en la VM, la suite de `make` dos veces, un flujo de consola con Chrome headless, stress, restarts, zips maliciosos y compatibilidad (`NIMBUS_WARM=0`, `NIMBUS_TRACING=0`, body mínimo de `POST /executions`).
+
+**Código / Arquitectura generada:**
+
+1. **Unzip del artifact en el host**
+   - Tope de 32 MiB descomprimidos, 4096 entradas, y rechazo de symlinks. El path `..` ya se rechazaba. El fallo sigue siendo `Error extrayendo zip`.
+
+2. **Cancel de un async que todavía no fue admitido**
+   - `XADD`, el retry y el redrive crean `nimbus:exec:{id}` en `pending` (TTL 24 h). El admit, si ve `cancelled`, no ejecuta. Un 409 es fatal: no reintenta y no entra a la DLQ.
+
+3. **DLQ**
+   - `dead()` copia `DurationMs` del intento. Antes el JSON lo perdía (`omitempty`).
+
+4. **Tag de versión**
+   - Dejó de ser `YYYYMMDD-HHMMSS`. Ahora lleva milisegundos y un sufijo aleatorio, y un choque del unique reintenta con otro tag. El tag viejo hacía que un segundo deploy del mismo segundo pisara el zip en MinIO y devolviera 500.
+
+5. **Consola**
+   - El healthcheck de nginx usa `127.0.0.1` (wget resolvía `localhost` a `::1`). El panel SSE no marca error cuando el stream cierra después de `end`.
+
+6. **`make qa`**
+   - `scripts/qa-deep.sh` y `scripts/qa-console.mjs`. El informe está en `docs/qa-pasos-0-5.md`.
+
+**Validación y Corrección Humana:** Riesgos que quedan en el diseño: cancelar una ejecución que ya corre no mata el container. El camino frío (`NIMBUS_WARM=0`) sigue como root de la imagen. `docker inspect` muestra los env mientras el container vive. Las keys `nimbus:slots:machine:{hostname}` de un proceso muerto quedan con miembros ya vencidos. Multer no limita el tamaño del upload; el tope del zip aplica al descomprimir. Nest no reenvía `envVars` ni `cpus`, y no hay auth.
+

@@ -95,6 +95,13 @@ El redrive responde 200 con `{ id, invocationId, executionId, status: "queued" }
 
 Estos endpoints están en el compute plane (`:8080`), no en Nest.
 
+## Cancelar un async
+
+`POST /executions/:id/cancel` usa el `executionId` que devolvió el 202. Desde el enqueue existe el hash `nimbus:exec:{executionId}` con estado `pending`, así que cancelar antes de que un worker lo tome no responde 404.
+
+- Si todavía no arrancó (está en el stream, en el backoff o en la cola FIFO), el intento termina en `ERROR` con el texto de cancelación y no entra a la DLQ.
+- Si ya está corriendo, queda marcado y el container sigue hasta que el handler termina o vence el timeout. El flag no mata el proceso.
+
 ## Si se cae el proceso
 
 - El slot de concurrencia vence solo (`NIMBUS_SLOT_LEASE_SEC`), igual que antes. El reintento usa el mismo `executionId`, así que si el slot sigue tomado lo recupera en lugar de pedir otro.

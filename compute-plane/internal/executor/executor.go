@@ -541,6 +541,15 @@ func (e *Executor) ensureImage(ctx context.Context) error {
 	return nil
 }
 
+// A zip is extracted on the host, under NIMBUS_WORK_DIR, before the container
+// exists. These caps stop a zip bomb from filling that disk. They are larger
+// than the example functions and smaller than a payload that is only useful
+// as a bomb.
+const (
+	maxZipEntries      = 4096
+	maxZipUncompressed = 32 << 20
+)
+
 func unzip(src, dest string) error {
 	r, err := zip.OpenReader(src)
 	if err != nil {
@@ -548,10 +557,22 @@ func unzip(src, dest string) error {
 	}
 	defer r.Close()
 
+	if len(r.File) > maxZipEntries {
+		return fmt.Errorf("el zip tiene demasiados archivos (%d)", len(r.File))
+	}
+
 	destClean := filepath.Clean(dest)
 	prefix := destClean + string(os.PathSeparator)
+	var written int64
 
 	for _, f := range r.File {
+		if f.FileInfo().Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("el zip contiene un symlink: %s", f.Name)
+		}
+		if f.UncompressedSize64 > maxZipUncompressed {
+			return fmt.Errorf("el zip descomprimido supera %d bytes", maxZipUncompressed)
+		}
+
 		fpath := filepath.Join(destClean, f.Name)
 		if fpath != destClean && !strings.HasPrefix(fpath, prefix) {
 			return fmt.Errorf("illegal file path: %s", fpath)
@@ -568,7 +589,10 @@ func unzip(src, dest string) error {
 			return err
 		}
 
-		outFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
+		// Permissions come from the zip. The tree is mounted read-only and
+		// the warm process is not root, so a setuid bit in the archive does
+		// not become a host setuid binary. Still drop anything but 0644.
+		outFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 		if err != nil {
 			return err
 		}
@@ -579,12 +603,15 @@ func unzip(src, dest string) error {
 			return err
 		}
 
-		_, err = io.Copy(outFile, rc)
+		n, err := io.Copy(outFile, io.LimitReader(rc, maxZipUncompressed-written+1))
 		outFile.Close()
 		rc.Close()
-
 		if err != nil {
 			return err
+		}
+		written += n
+		if written > maxZipUncompressed {
+			return fmt.Errorf("el zip descomprimido supera %d bytes", maxZipUncompressed)
 		}
 	}
 

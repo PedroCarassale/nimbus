@@ -2,6 +2,7 @@ package executor
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -350,6 +351,64 @@ func TestUnzipAndZipSlip(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "evil.txt")); !os.IsNotExist(err) {
 		t.Fatalf("evil file leaked: %v", err)
+	}
+
+	linkZip := filepath.Join(dir, "link.zip")
+	lf, err := os.Create(linkZip)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw = zip.NewWriter(lf)
+	lhdr := &zip.FileHeader{Name: "escape", Method: zip.Store}
+	lhdr.SetMode(os.ModeSymlink | 0o777)
+	lw, err := zw.CreateHeader(lhdr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lw.Write([]byte("/tmp")); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	lf.Close()
+	linkDest := filepath.Join(dir, "link")
+	if err := os.MkdirAll(linkDest, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := unzip(linkZip, linkDest); err == nil {
+		t.Fatal("expected symlink zip to be rejected")
+	}
+	if _, err := os.Lstat(filepath.Join(linkDest, "escape")); !os.IsNotExist(err) {
+		t.Fatalf("symlink was extracted: %v", err)
+	}
+
+	bombZip := filepath.Join(dir, "bomb.zip")
+	bf, err := os.Create(bombZip)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw = zip.NewWriter(bf)
+	bw, err := zw.Create("big.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bw.Write(bytes.Repeat([]byte{0}, maxZipUncompressed+1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	bf.Close()
+	bombDest := filepath.Join(dir, "bomb")
+	if err := os.MkdirAll(bombDest, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := unzip(bombZip, bombDest); err == nil {
+		t.Fatal("expected oversized zip to be rejected")
+	}
+	if _, err := os.Stat(filepath.Join(bombDest, "big.bin")); !os.IsNotExist(err) {
+		t.Fatalf("oversized file was extracted: %v", err)
 	}
 }
 
