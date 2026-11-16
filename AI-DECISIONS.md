@@ -401,3 +401,38 @@ El contrato queda en `docs/concurrencia.md`.
 
 **Validación y Corrección Humana:** Riesgos que quedan en el diseño: los valores de `envVars` viajan en el argv de `docker run` y `docker inspect` los muestra mientras el container existe. El log del compute plane los redacta; si el handler los imprime, quedan en su stdout y en el stream de logs. `getRemainingTimeInMillis` sigue en 0. El timeout cuenta el cold start. Nest todavía no persiste ni reenvía la config por función, así que `make hello` sigue con los defaults del entorno.
 
+## Paso 3 — Containers warm en el compute plane
+
+**Problema abordado:** Cada `POST /executions` hacía `docker run` de un container nuevo. El tiempo de la invocación incluía siempre el arranque de Node, aunque la función, la versión y la config efectiva no hubieran cambiado. Había que reutilizar containers ya prendidos sin aflojar el aislamiento del slice 1, sin mezclar logs de dos ejecuciones, y sin volver a usar un container que hizo timeout, se cayó o lo mató el OOM.
+
+**Prompt / Herramienta utilizada:** Cursor Cloud Agent (Grok 4.7), pedido de Paso 3 del roadmap de Pedro, apilado sobre la rama de Paso 2.
+
+**Código / Arquitectura generada:**
+
+1. **Protocolo dentro de `runtime-node`**
+   - Con `NIMBUS_WARM=1` el bootstrap carga el handler una vez y se queda leyendo una línea JSON por stdin. Responde por stdout líneas `{type:ready}`, `{type:log}`, `{type:done}` o `{type:fatal}`.
+   - `console.log` / `console.error` se reemiten como frames de log. El protocolo escribe con `fs.writeSync(1)` para no envolverse a sí mismo.
+   - Se eligió stdin/stdout y no HTTP ni un socket unix: el container sigue con `--network=none` y sin un mount extra de permisos. Un `docker run -i` deja un solo proceso.
+   - Una excepción del handler se reporta en `done` con `ok:false` y el proceso sigue. El estado de módulo entre invokes del mismo container se conserva, como en Lambda.
+   - Escribir directo al fd 1 desde el código del usuario desincroniza el protocolo: ese container se descarta.
+
+2. **Pool en el compute plane**
+   - `internal/warm` guarda slots en memoria del proceso. La clave es función + versión + handler + `memoryMb` + `cpus` + hash de `envVars`. El timeout no entra en la clave: cada invoke corta con su propio deadline de Go.
+   - Tope por función = `NIMBUS_FN_CONCURRENCY` (default 2), acotado por `NIMBUS_MAX_CONTAINERS` (default 8). Los containers ociosos cuentan para ese tope. Si no entra otro slot, se desaloja el ocioso más viejo (LRU). Si todos están ocupados, esa invocación usa un container efímero que se borra al terminar.
+   - Un ocioso vive `NIMBUS_WARM_IDLE_SEC` (default 60). Un reaper lo borra. `NIMBUS_WARM=0|false|off|no` apaga el pool y vuelve al `docker run` de un solo uso.
+   - Timeout (124), crash, OOM o un frame que no cierra dejan el slot marcado y el container se borra con `docker rm -f`. No se reutiliza.
+   - Durante el invoke el container se renombra a `nimbus-{executionId}` para que `docker inspect` de la prueba de CPU lo encuentre, y después vuelve al nombre del pool.
+   - Labels `nimbus.warm=1`, `nimbus.functionId` y `nimbus.version`. Al arrancar se hace `docker rm -f` de los que quedaron con ese label. Al apagar el proceso se destruyen los del pool.
+   - El código descomprimido vive en `NIMBUS_WORK_DIR/warm-code/` y se monta en `/var/task:ro`. El container warm corre `--user node`, con `--read-only`, `--tmpfs /tmp` y `HOME=/tmp`. El camino frío no cambia de usuario.
+   - La respuesta de `POST /executions` suma `coldStart` e `initMs`. `initMs` mide desde `docker start` hasta el frame `ready` (mínimo 1 si el reloj da 0). En un acierto warm, `initMs` es 0. En el camino frío de un solo uso, `coldStart` es true e `initMs` es 0 porque ese camino no separa el arranque. Un 429 de cola no lleva esos campos. Nest no los reenvía.
+
+3. **Aislamiento que se mantiene**
+   - `--memory` y `--memory-swap` iguales, `--pids-limit=256`, `--network=none`, filesystem de solo lectura, límites de CPU si vinieron en la config. Los logs de cada invoke siguen yendo a `nimbus:logs:{executionId}`.
+
+4. **Prueba**
+   - Tests de Go del pool con reloj inyectado y sesiones falsas: reuso, clave, descarte, TTL, LRU, tope por función, efímero, shutdown, carrera. `go test -race ./...`.
+   - `make warm-check` pega a `:8080`: series cold/warm, streams de log separados, `docker ps` vacío después del idle, timeout y OOM que obligan un cold siguiente.
+   - En esta máquina la mediana de `durationMs` fue 166 ms en cold y 41 ms en warm; la mediana de `initMs` del cold fue 118 ms. La primera invocación, con descarga del zip, tardó 163 ms.
+
+**Validación y Corrección Humana:** Riesgos que quedan en el diseño: el estado de módulo (y cualquier cosa en `/tmp`) se filtra entre invokes del mismo container. Un `write` directo al fd 1 rompe el framing y obliga a tirar el container. Los valores de `envVars` siguen visibles en `docker inspect` mientras el container vive. `NIMBUS_TIMEOUT_SEC` dentro del container es el del invoke que lo creó; el corte real lo hace Go. Cancelar una ejecución que ya corre sigue sin matar el container. Los ociosos cuentan para `NIMBUS_MAX_CONTAINERS`. El tmpfs de `/tmp` entra en la cuenta de memoria del cgroup. El camino frío sigue arrancando como root de la imagen. Nest no reenvía `coldStart` ni `initMs`.
+

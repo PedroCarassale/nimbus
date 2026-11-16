@@ -19,6 +19,7 @@ import (
 
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/fnconfig"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/logs"
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/warm"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -32,6 +33,11 @@ type Executor struct {
 	store        artifactDownloader
 	rdb          *redis.Client
 	defaultImage string
+	pool         *warm.Pool
+
+	codeMu    sync.Mutex
+	codeDirs  map[string]string
+	codeLocks map[string]*sync.Mutex
 }
 
 type ExecutionRequest struct {
@@ -49,23 +55,72 @@ type ExecutionResult struct {
 	Error       string      `json:"error,omitempty"`
 	ExitCode    int         `json:"exitCode"`
 	DurationMs  int64       `json:"durationMs"`
-	Stdout      string      `json:"stdout,omitempty"`
-	Stderr      string      `json:"stderr,omitempty"`
+	// ColdStart is true when this invocation started a new container.
+	// A warm hit reports false. Clients that ignore unknown fields are unchanged.
+	ColdStart bool `json:"coldStart"`
+	// InitMs is how long the new container took to become ready.
+	// It is 0 on a warm hit and on the cold one-shot path, which does not
+	// split initialization from the handler.
+	InitMs int64  `json:"initMs"`
+	Stdout string `json:"stdout,omitempty"`
+	Stderr string `json:"stderr,omitempty"`
 }
 
 func New(store artifactDownloader, rdb *redis.Client) *Executor {
-	return &Executor{
+	e := &Executor{
 		store:        store,
 		rdb:          rdb,
 		defaultImage: getEnv("NIMBUS_IMAGE", "nimbus-node"),
+		codeDirs:     map[string]string{},
+		codeLocks:    map[string]*sync.Mutex{},
+	}
+	cfg := warm.LoadConfig()
+	if cfg.Enabled {
+		e.pool = warm.New(cfg, dockerStarter{image: e.defaultImage})
+		log.Printf("[executor] Warm pool activo (idle=%s, por función=%d, global=%d)", cfg.IdleTTL, cfg.MaxPerFunction, cfg.GlobalMax)
+	} else {
+		log.Printf("[executor] Warm pool apagado (NIMBUS_WARM)")
+	}
+	return e
+}
+
+// StartBackground launches the idle reaper and drops warm containers and
+// code directories left by a previous process.
+func (e *Executor) StartBackground() {
+	if e.pool == nil {
+		return
+	}
+	e.cleanWarmDirs()
+	e.pool.StartReaper()
+}
+
+// Shutdown destroys every warm container and the code directories they mounted.
+func (e *Executor) Shutdown(ctx context.Context) {
+	if e.pool != nil {
+		e.pool.Shutdown(ctx)
+	}
+	e.codeMu.Lock()
+	dirs := e.codeDirs
+	e.codeDirs = map[string]string{}
+	e.codeMu.Unlock()
+	for _, dir := range dirs {
+		os.RemoveAll(dir)
 	}
 }
 
 func (e *Executor) Execute(ctx context.Context, req *ExecutionRequest) *ExecutionResult {
+	if e.pool != nil {
+		return e.executeWarm(ctx, req)
+	}
+	return e.executeCold(ctx, req)
+}
+
+func (e *Executor) executeCold(ctx context.Context, req *ExecutionRequest) *ExecutionResult {
 	startTime := time.Now()
 	result := &ExecutionResult{
 		ExecutionID: req.ExecutionID,
 		ExitCode:    1,
+		ColdStart:   true,
 	}
 
 	logWriter := logs.NewStreamWriter(e.rdb, req.ExecutionID)
@@ -285,6 +340,8 @@ var platformEnvKeys = map[string]struct{}{
 	"NIMBUS_MEMORY_MB":        {},
 	"NIMBUS_TIMEOUT_SEC":      {},
 	"NIMBUS_FUNCTION_NAME":    {},
+	"NIMBUS_WARM":             {},
+	"HOME":                    {},
 }
 
 // formatArgsForLog redacts every -e value that is not a platform variable.

@@ -138,6 +138,35 @@ func TestStartExecutionSuccess(t *testing.T) {
 	if runner.calls != 1 || locker.releaseCalls != 1 {
 		t.Fatalf("calls=%d release=%d", runner.calls, locker.releaseCalls)
 	}
+	if body["coldStart"] != false || body["initMs"].(float64) != 0 {
+		t.Fatalf("cold start fields %#v", body)
+	}
+}
+
+func TestStartExecutionPropagatesWarmMeta(t *testing.T) {
+	h := &Handler{
+		executor: &fakeRunner{result: &executor.ExecutionResult{
+			Success:   true,
+			ExitCode:  0,
+			ColdStart: true,
+			InitMs:    180,
+			Output:    map[string]interface{}{"ok": true},
+		}},
+		concurrency: &fakeLocker{acquire: true},
+	}
+	rr := postJSON(t, newRouter(h), "/executions", `{
+		"executionId":"e1","functionId":"f1","version":"v1"
+	}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status %d %s", rr.Code, rr.Body.String())
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["coldStart"] != true || body["initMs"].(float64) != 180 {
+		t.Fatalf("body %#v", body)
+	}
 }
 
 func TestStartExecutionBadRequest(t *testing.T) {

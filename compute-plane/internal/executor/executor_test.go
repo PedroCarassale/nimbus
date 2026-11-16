@@ -76,6 +76,53 @@ func TestDockerRunArgsIsolation(t *testing.T) {
 	}
 }
 
+func TestDockerWarmArgsIsolation(t *testing.T) {
+	cfg := testConfig(t)
+	args := dockerWarmArgs("nimbus-w-abc", "/tmp/nimbus-work/warm/code", "nimbus-node", cfg, "fn/1", "2024.01")
+	joined := strings.Join(args, " ")
+	for _, want := range []string{
+		"run -i",
+		"--name nimbus-w-abc",
+		"--label nimbus.warm=1",
+		"--label nimbus.functionId=fn_1",
+		"--label nimbus.version=2024.01",
+		"--memory=256m",
+		"--memory-swap=256m",
+		"--cpus=0.5",
+		"--pids-limit=256",
+		"--network=none",
+		"--read-only",
+		"--user node",
+		"--tmpfs /tmp:rw,nosuid,size=16m",
+		"-v /tmp/nimbus-work/warm/code:/var/task:ro",
+		"-e GREETING=super-secret-value",
+		"-e NIMBUS_WARM=1",
+		"-e HOME=/tmp",
+		"-e NIMBUS_HANDLER=src/app.main",
+		"-e NIMBUS_MEMORY_MB=256",
+		"nimbus-node",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("args missing %q in %s", want, joined)
+		}
+	}
+	for _, arg := range args {
+		if arg == "--rm" {
+			t.Fatal("warm container must stay until the pool discards it")
+		}
+	}
+	if args[len(args)-1] != "nimbus-node" {
+		t.Fatalf("image is not last: %v", args)
+	}
+	logged := formatArgsForLog(args)
+	if strings.Contains(logged, "super-secret-value") {
+		t.Fatalf("log line leaked env value: %s", logged)
+	}
+	if !strings.Contains(logged, "GREETING=***") || !strings.Contains(logged, "NIMBUS_WARM=1") {
+		t.Fatalf("redaction mismatch: %s", logged)
+	}
+}
+
 func TestFormatArgsForLogRedactsEnvValues(t *testing.T) {
 	cfg := testConfig(t)
 	args := dockerRunArgs("nimbus-abc", "/tmp/work", "nimbus-node", cfg)
@@ -300,6 +347,26 @@ func testRedis(t *testing.T) *redis.Client {
 	t.Helper()
 	mr := miniredis.RunT(t)
 	return redis.NewClient(&redis.Options{Addr: mr.Addr()})
+}
+
+func TestWarmDisabledStaysOnTheColdPath(t *testing.T) {
+	t.Setenv("NIMBUS_WARM", "off")
+	rdb := testRedis(t)
+	exec := New(fakeStore{err: errors.New("minio down")}, rdb)
+	if exec.pool != nil {
+		t.Fatal("NIMBUS_WARM=off should not create a pool")
+	}
+	result := exec.Execute(context.Background(), &ExecutionRequest{
+		ExecutionID: "exec-cold",
+		FunctionID:  "fn-1",
+		Version:     "v1",
+	})
+	if result.Success || !result.ColdStart {
+		t.Fatalf("result %+v", result)
+	}
+	if !strings.Contains(result.Error, "descargando artifact") {
+		t.Fatalf("error = %q", result.Error)
+	}
 }
 
 func TestExecuteDownloadErrorIsLogged(t *testing.T) {

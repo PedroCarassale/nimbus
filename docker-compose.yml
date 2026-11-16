@@ -112,6 +112,8 @@ services:
       NIMBUS_FN_QUEUE_WAIT_SEC: ${NIMBUS_FN_QUEUE_WAIT_SEC:-30}
       NIMBUS_MAX_CONTAINERS: ${NIMBUS_MAX_CONTAINERS:-8}
       NIMBUS_SLOT_LEASE_SEC: ${NIMBUS_SLOT_LEASE_SEC:-30}
+      NIMBUS_WARM: ${NIMBUS_WARM:-1}
+      NIMBUS_WARM_IDLE_SEC: ${NIMBUS_WARM_IDLE_SEC:-60}
     depends_on:
       redis:
         condition: service_healthy

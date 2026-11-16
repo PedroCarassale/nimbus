@@ -10,13 +10,14 @@ compute-plane/
   cmd/server/main.go            # servidor HTTP (chi) en :8080
   internal/handlers/            # POST /executions, POST /executions/:id/cancel, GET /health
   internal/fnconfig/            # timeout, memoria, CPU, handler y envVars por invocación
-  internal/executor/            # baja el zip de MinIO, lo extrae y corre docker run
+  internal/executor/            # baja el zip de MinIO, lo extrae y corre docker
+  internal/warm/                # pool de containers reutilizables
   internal/concurrency/         # semáforo + cola FIFO en Redis (N por función, tope global)
   internal/logs/                # escribe stdout/stderr en nimbus:logs:{executionId}
   internal/minio/               # cliente S3
 ```
 - Cada función admite N ejecuciones a la vez (`NIMBUS_FN_CONCURRENCY`, default 2). El resto espera en una cola FIFO de Redis, con tope (`NIMBUS_FN_QUEUE_MAX`) y 429 si se llena. Hay un tope global de ejecuciones por proceso (`NIMBUS_MAX_CONTAINERS`). Detalle en [`concurrencia.md`](concurrencia.md).
-- Cada invoke crea un container nuevo (cold start siempre).
+- Un container ya iniciado se reutiliza para la misma función, versión y config efectiva. Si está frío, idle o vino sucio (timeout, crash, OOM), se arranca uno nuevo. Detalle en [`warm.md`](warm.md).
 - Todas las invocaciones son sincrónicas.
 
 ### Paso 0 — Base estable
@@ -36,9 +37,11 @@ compute-plane/
 Detalle de campos, defaults y límites: [`configuracion.md`](configuracion.md).
 
 ### Paso 3 — Warm containers
-- [ ] Reusar containers ya iniciados para la misma función y versión.
-- [ ] Pool con tiempo de vida y limpieza de containers inactivos.
-- [ ] Medir cold start vs warm start.
+- [x] Reusar containers ya iniciados para la misma función, versión y config efectiva.
+- [x] Pool con tiempo de vida y limpieza de containers inactivos.
+- [x] Medir cold start vs warm start.
+
+Detalle del protocolo, las variables y los números: [`warm.md`](warm.md).
 
 ### Paso 4 — Invocación async + reintentos + DLQ
 - [ ] Invocación async: responde enseguida con un id y ejecuta en segundo plano.

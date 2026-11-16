@@ -76,6 +76,8 @@ type StartExecutionResponse struct {
 	ExitCode    int         `json:"exitCode"`
 	DurationMs  int64       `json:"durationMs"`
 	QueuedMs    int64       `json:"queuedMs"`
+	ColdStart   bool        `json:"coldStart"`
+	InitMs      int64       `json:"initMs"`
 }
 
 func (h *Handler) StartExecution(w http.ResponseWriter, r *http.Request) {
@@ -157,6 +159,8 @@ func (h *Handler) StartExecution(w http.ResponseWriter, r *http.Request) {
 		ExitCode:    result.ExitCode,
 		DurationMs:  result.DurationMs,
 		QueuedMs:    queuedMs,
+		ColdStart:   result.ColdStart,
+		InitMs:      result.InitMs,
 	}
 
 	w.Header().Set("Content-Type", "application/json")

@@ -14,6 +14,7 @@ import (
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/fnconfig"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/handlers"
 	minioClient "github.com/PedroCarassale/nimbus/compute-plane/internal/minio"
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/warm"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/redis/go-redis/v9"
@@ -57,7 +58,11 @@ func main() {
 	log.Printf("[compute-plane] Config por función: timeout=%ds memory=%dMB handler=%s cpus=%s",
 		fnDefaults.TimeoutSec, fnDefaults.MemoryMB, fnDefaults.Handler, fnDefaults.CPUsLabel())
 	concurrencyMgr := concurrency.NewManager(rdb, concCfg)
+	if err := warm.CleanupOrphans(ctx); err != nil {
+		log.Printf("[compute-plane] No se pudieron limpiar containers warm anteriores: %v", err)
+	}
 	exec := executor.New(mc, rdb)
+	exec.StartBackground()
 	handler := handlers.NewWithDefaults(exec, concurrencyMgr, fnDefaults)
 
 	// The HTTP deadline has to outlive the longest accepted execution plus
@@ -101,6 +106,7 @@ func main() {
 	if err := srv.Shutdown(ctxShutdown); err != nil {
 		log.Printf("[compute-plane] Error en shutdown: %v", err)
 	}
+	exec.Shutdown(context.Background())
 
 	log.Println("[compute-plane] Servidor detenido")
 }
