@@ -8,16 +8,19 @@ import (
 	"strings"
 
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/fnconfig"
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/runtime"
 )
 
 // PoolKey identifies containers that can serve the same invocation.
 // Timeout is not part of the key: the compute plane enforces it from
 // outside, and a warm process can serve a different deadline next time.
-// Memory, CPU, and environment are part of the container, so they are.
+// Memory, CPU, environment, and runtime are part of the container, so they
+// are. An empty runtime shares the nodejs20 pool.
 func PoolKey(functionID, version string, cfg fnconfig.Resolved) string {
 	return strings.Join([]string{
 		functionID,
 		version,
+		runtime.Canonical(cfg.Runtime),
 		cfg.Handler,
 		strconv.Itoa(cfg.MemoryMB),
 		strconv.Itoa(cfg.CPUsMilli),

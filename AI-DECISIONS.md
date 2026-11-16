@@ -563,3 +563,34 @@ El contrato queda en `docs/async.md`.
 
 **Validación y Corrección Humana:** El cupo de Redis del host muerto sigue contando hasta que vence el lease (como máximo `NIMBUS_SLOT_LEASE_SEC`); el barrido no borra leases todavía vigentes de otro proceso. Cancelar y que el handler alcance a responder en el mismo instante deja el resultado en cancelado y tira el container. El invoke sync de Nest sigue respondiendo HTTP 200 con `status: ERROR` y el texto de cancelación.
 
+---
+
+## Runtimes Python y Go
+
+**Problema abordado:** El compute plane solo arrancaba `nimbus-node`. Un invoke no podía elegir lenguaje, y el pool warm no distinguía un runtime de otro. Hacía falta `python3.12` y un Go usable con el mismo contrato (un disparo y loop warm por líneas JSON, logs, timeout, memoria, CPU, env, usuario no root, filesystem de solo lectura, `network=none`, trace id).
+
+**Prompt / Herramienta utilizada:** Cursor Cloud Agent (Grok 4.7). Pedido de Paso 6, runtimes Python y Go, en un PR apilado sobre el de cancel real. Firecracker queda fuera.
+
+**Código / Arquitectura generada:**
+
+1. **Campo `runtime`**
+   - Opcional en `POST /executions`. Vacío o ausente es `nodejs20`. `python3.12` y `go1.x` son los otros dos. Cualquier otro valor es 400 con `field: runtime` y no toma slot.
+   - La clave del pool warm incluye el runtime. Un vacío comparte el pool de Node.
+   - `nimbus_invocations_total` lleva la etiqueta `runtime` con esos tres valores. El resto de las series no, para no multiplicar histogramas.
+
+2. **Imágenes**
+   - `runtime-python`: `python:3.12-alpine`, usuario `node` uid 1000, bootstrap en Python. Handler `archivo.funcion`. La función es normal; una corrutina se rechaza.
+   - `runtime-go`: bootstrap estático de la plataforma. El zip del usuario trae un binario Linux estático (por defecto `/var/task/bootstrap`), no el fuente. El container no tiene red ni toolchain, así que no compila adentro. Cada invoke hace `exec` del binario (stdin evento, stdout JSON, stderr logs). En warm se reutiliza el container, no el proceso del usuario.
+   - Python y Go corren como `node` también en frío, con tmpfs en `/tmp`. Node en frío sigue como root.
+   - El unzip deja `0644`. Para `go1.x` el compute plane pone `0755` en el binario, en el host, antes de montarlo de solo lectura.
+
+3. **Ejemplos y checks**
+   - `examples/hello-python`, `examples/hello-go`, `make hello-python`, `make hello-go`, `make runtime-check`.
+   - `make qa` corre el check después del QA de los pasos 0–5. El job de compose del CI también.
+   - El deploy del zip sigue por Nest. El invoke de estos targets pega a `:8080` con `runtime`, porque Nest no tiene el campo.
+
+4. **Nest**
+   - Sin cambio de código ni migración. Para que la consola lo use, Nest tiene que persistir `runtime` (string, default `nodejs20`) y reenviarlo en `POST /executions`. El detalle está en `docs/runtimes.md`.
+
+**Validación y Corrección Humana:** Go no conserva estado de proceso entre invokes del mismo container. El binario tiene que ser estático (`CGO_ENABLED=0`) y de la arquitectura del daemon; uno enlazado a glibc no arranca en Alpine. Node en frío sigue como root. Nest no guarda ni reenvía `runtime`, así que el invoke de la consola sigue en Node.
+

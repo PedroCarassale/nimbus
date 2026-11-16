@@ -32,7 +32,9 @@ make console
 
 **Consola Web:** http://localhost:8088
 
-`make up` construye la imagen `nimbus-node` y crea `/tmp/nimbus-work`. Ese directorio va montado con el mismo path en el compute plane y en el host: el daemon de Docker resuelve ahí el código de la función.
+`make up` construye las imágenes `nimbus-node`, `nimbus-python` y `nimbus-go`, y crea `/tmp/nimbus-work`. Ese directorio va montado con el mismo path en el compute plane y en el host: el daemon de Docker resuelve ahí el código de la función.
+
+`make hello` sigue en Node. `make hello-python` y `make hello-go` invocan el compute plane con `runtime` (`python3.12` o `go1.x`): Nest todavía no guarda ni reenvía ese campo. El detalle está en [`docs/runtimes.md`](docs/runtimes.md).
 
 El servicio S3 del compose es Silo (`pgsty/silo`), compatible con la API de MinIO. Las imágenes `minio/minio` y `minio/mc` ya no se pueden descargar sin cuenta.
 

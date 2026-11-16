@@ -18,6 +18,7 @@ import (
 
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/cancel"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/fnconfig"
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/runtime"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/warm"
 )
 
@@ -68,7 +69,7 @@ func dockerWarmArgs(name, workDir, image string, cfg fnconfig.Resolved, function
 		"--pids-limit=256",
 		"--network=none",
 		"--read-only",
-		"--tmpfs", "/tmp:rw,nosuid,size=16m",
+		"--tmpfs", "/tmp:rw,nosuid,mode=1777,size=16m",
 		"--user", "node",
 	}
 	if cfg.CPUsFlag != "" {
@@ -83,7 +84,7 @@ func dockerWarmArgs(name, workDir, image string, cfg fnconfig.Resolved, function
 		"-e", "HOME=/tmp",
 		"-e", "NIMBUS_HANDLER="+cfg.Handler,
 		"-e", "NIMBUS_HANDLER_FUNCTION="+cfg.HandlerExport,
-		"-e", "NIMBUS_HANDLER_PATH=/var/task/"+cfg.HandlerFile+".js",
+		"-e", "NIMBUS_HANDLER_PATH="+runtime.TaskPath(cfg.Runtime, cfg.Handler, cfg.HandlerFile),
 		"-e", fmt.Sprintf("NIMBUS_MEMORY_MB=%d", cfg.MemoryMB),
 		"-e", fmt.Sprintf("NIMBUS_TIMEOUT_SEC=%d", cfg.TimeoutSec),
 		image,

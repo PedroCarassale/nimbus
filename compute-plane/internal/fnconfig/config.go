@@ -199,6 +199,10 @@ type Resolved struct {
 	HandlerFile   string
 	HandlerExport string
 	Env           []EnvVar
+	// Runtime is nodejs20, python3.12 or go1.x. Empty means nodejs20.
+	// It is not a docker limit: the handler validates it and the executor
+	// picks the image. Complete leaves it untouched.
+	Runtime string
 }
 
 // Resolve applies defaults and bounds to one request.

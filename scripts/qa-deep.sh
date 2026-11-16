@@ -563,7 +563,9 @@ RST_OK=0
 for i in $(seq 1 8); do
   IID="$(jq -r .invocationId "$OUT/rst-$i.json")"
   ST=""
-  for _ in $(seq 1 40); do
+  # XAUTOCLAIM espera NIMBUS_ASYNC_CLAIM_IDLE_MS (20s) y este handler duerme
+  # 2.5s. 20s de sondeo cerraba antes de que el intento recuperado terminara.
+  for _ in $(seq 1 80); do
     ST="$(curl -sf "$API_URL/invocations/$IID" | jq -r .status)"
     if [[ "$ST" == "SUCCESS" || "$ST" == "ERROR" || "$ST" == "TIMEOUT" ]]; then break; fi
     sleep 0.5

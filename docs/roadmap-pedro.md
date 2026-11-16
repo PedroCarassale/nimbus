@@ -24,6 +24,7 @@ compute-plane/
 - El invoke sync sigue igual. Con `?async=true` o `X-Invocation-Type: Event` Nest responde 202 y un worker del compute plane ejecuta el mismo camino (semáforo, cola, config, warm, logs). Reintentos con backoff y DLQ en Redis. Detalle en [`async.md`](async.md).
 - `GET /metrics` expone invocaciones, duración, cold/warm, cola, 429, reintentos y DLQ. Las trazas salen por OTLP. Grafana y Jaeger están en el perfil `obs`. Detalle en [`observabilidad.md`](observabilidad.md).
 - Cancelar una ejecución que ya corre mata el container (frío y warm). El warm no vuelve al pool. Un async cancelado no se reintenta ni va a la DLQ; la fila queda en `ERROR` con `Ejecución cancelada` porque Prisma no tiene `CANCELLED`. Las keys `nimbus:slots:machine:{host}` de un proceso muerto se borran cuando sus leases vencen.
+- Hay tres runtimes: `nodejs20` (default), `python3.12` y `go1.x` (binario estático en el zip). `POST /executions` acepta `runtime`. La clave del pool warm lo incluye. Nest todavía no lo persiste ni lo reenvía. Detalle en [`runtimes.md`](runtimes.md).
 
 ### Paso 0 — Base estable
 - [x] Correr `make up` + `make hello` con Docker real y arreglar lo que rompa.
@@ -62,9 +63,9 @@ Detalle de la cola, las variables y la operación de la DLQ: [`async.md`](async.
 
 Detalle de métricas, puertos y variables: [`observabilidad.md`](observabilidad.md).
 
-### Paso 6 — Aislamiento fuerte y multi-runtime (más adelante)
+### Paso 6 — Aislamiento fuerte y multi-runtime
 - [ ] Firecracker / microVM en lugar de Docker.
-- [ ] Runtimes nuevos: Python, Go.
+- [x] Runtimes nuevos: Python (`python3.12`) y Go (`go1.x`, binario estático). Detalle en [`runtimes.md`](runtimes.md).
 
 ### Paso 7 — Deploy real (más adelante)
 - [ ] S3 real en lugar de MinIO.

@@ -48,10 +48,10 @@ func TestRecordInvocationAndRejection(t *testing.T) {
 		t.Fatalf("cancel message must win over a kill exit: %s", got)
 	}
 
-	RecordInvocation(fn, "sync", "success", 40, true, 12)
-	RecordInvocation(fn, "async", "error", 15, false, 0)
-	RecordInvocation(fn, "sync", Classify(false, 124, ""), 1000, true, 0)
-	RecordInvocation(fn, "sync", Classify(false, 137, ""), 20, true, 8)
+	RecordInvocation(fn, "sync", "success", "nodejs20", 40, true, 12)
+	RecordInvocation(fn, "async", "error", "", 15, false, 0)
+	RecordInvocation(fn, "sync", Classify(false, 124, ""), "python3.12", 1000, true, 0)
+	RecordInvocation(fn, "sync", Classify(false, 137, ""), "go1.x", 20, true, 8)
 	ObserveQueueWait(fn, 250)
 	Rejection(fn, "queue_full")
 	Rejection(fn, "nope")
@@ -103,6 +103,21 @@ func TestRecordInvocationAndRejection(t *testing.T) {
 	}
 	if got := Sample("nimbus_init_duration_seconds", map[string]string{"function_id": fn}); got != 2 {
 		t.Fatalf("init samples %v, want 2 (zero initMs is skipped)", got)
+	}
+	if got := Sample("nimbus_invocations_total", map[string]string{
+		"function_id": fn, "status": "timeout", "mode": "sync", "runtime": "python3.12",
+	}); got < 1 {
+		t.Fatalf("python runtime label %v", got)
+	}
+	if got := Sample("nimbus_invocations_total", map[string]string{
+		"function_id": fn, "status": "oom", "mode": "sync", "runtime": "go1.x",
+	}); got < 1 {
+		t.Fatalf("go runtime label %v", got)
+	}
+	if got := Sample("nimbus_invocations_total", map[string]string{
+		"function_id": fn, "status": "success", "mode": "sync", "runtime": "nodejs20",
+	}); got-beforeInv != 1 {
+		t.Fatalf("node runtime label %v", got-beforeInv)
 	}
 }
 
