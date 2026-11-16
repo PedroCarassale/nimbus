@@ -21,6 +21,7 @@ import (
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/fnconfig"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/logs"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/metrics"
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/runtime"
 	ntrace "github.com/PedroCarassale/nimbus/compute-plane/internal/trace"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/warm"
 	"github.com/redis/go-redis/v9"
@@ -195,13 +196,6 @@ func (e *Executor) executeCold(ctx context.Context, req *ExecutionRequest) *Exec
 		return result
 	}
 
-	if err := e.ensureImage(ctx); err != nil {
-		result.Error = fmt.Sprintf("Error con imagen Docker: %v", err)
-		result.DurationMs = time.Since(startTime).Milliseconds()
-		logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Error: %s", result.Error))
-		return result
-	}
-
 	cfg, cfgErr := req.Config.Complete()
 	if cfgErr != nil {
 		result.Error = fmt.Sprintf("Configuración inválida: %s", cfgErr.Error())
@@ -209,10 +203,27 @@ func (e *Executor) executeCold(ctx context.Context, req *ExecutionRequest) *Exec
 		logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Error: %s", result.Error))
 		return result
 	}
+	// Complete does not know about runtimes. Keep the value the handler set.
+	cfg.Runtime = req.Config.Runtime
 
-	logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Ejecutando handler '%s' (timeout: %ds, memory: %dMB, cpus: %s, env: %d)",
-		cfg.Handler, cfg.TimeoutSec, cfg.MemoryMB, cpusLabel(cfg), len(cfg.Env)))
-	dockerResult := e.runDockerWithStreaming(ctx, req.ExecutionID, workDir, cfg, logWriter)
+	if err := makeGoBinaryRunnable(workDir, cfg); err != nil {
+		result.Error = err.Error()
+		result.DurationMs = time.Since(startTime).Milliseconds()
+		logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Error: %s", result.Error))
+		return result
+	}
+
+	image := e.imageFor(cfg)
+	if err := e.ensureImage(ctx, image); err != nil {
+		result.Error = fmt.Sprintf("Error con imagen Docker: %v", err)
+		result.DurationMs = time.Since(startTime).Milliseconds()
+		logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Error: %s", result.Error))
+		return result
+	}
+
+	logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Ejecutando handler '%s' (runtime: %s, timeout: %ds, memory: %dMB, cpus: %s, env: %d)",
+		cfg.Handler, runtime.Canonical(cfg.Runtime), cfg.TimeoutSec, cfg.MemoryMB, cpusLabel(cfg), len(cfg.Env)))
+	dockerResult := e.runDockerWithStreaming(ctx, req.ExecutionID, workDir, image, cfg, logWriter)
 
 	result.Success = dockerResult.success
 	result.Output = dockerResult.output
@@ -244,9 +255,9 @@ type dockerResult struct {
 	oom      bool
 }
 
-func (e *Executor) runDockerWithStreaming(ctx context.Context, executionID, workDir string, cfg fnconfig.Resolved, logWriter *logs.StreamWriter) dockerResult {
+func (e *Executor) runDockerWithStreaming(ctx context.Context, executionID, workDir, image string, cfg fnconfig.Resolved, logWriter *logs.StreamWriter) dockerResult {
 	name := containerName(executionID)
-	args := withExtraEnv(dockerRunArgs(name, workDir, e.defaultImage, cfg), traceEnvs(ctx))
+	args := withExtraEnv(dockerRunArgs(name, workDir, image, cfg), traceEnvs(ctx))
 	// User env values are secrets. The log line keeps the keys and redacts the values.
 	log.Printf("[executor] docker %s", formatArgsForLog(args))
 
@@ -383,6 +394,15 @@ func dockerRunArgs(containerName, workDir, image string, cfg fnconfig.Resolved) 
 	if cfg.CPUsFlag != "" {
 		args = append(args, "--cpus="+cfg.CPUsFlag)
 	}
+	// Python and Go drop to the image user on the cold path too. Node stays
+	// root here: that is the previous contract. /tmp is a small tmpfs so the
+	// unprivileged user has a writable home.
+	if runtime.RunsAsNode(cfg.Runtime) {
+		args = append(args,
+			"--user", "node",
+			"--tmpfs", "/tmp:rw,nosuid,mode=1777,size=16m",
+		)
+	}
 	args = append(args,
 		"-v", fmt.Sprintf("%s:/var/task:ro", workDir),
 	)
@@ -395,7 +415,12 @@ func dockerRunArgs(containerName, workDir, image string, cfg fnconfig.Resolved) 
 		"-e", "NIMBUS_EVENT_PATH=/var/task/event.json",
 		"-e", "NIMBUS_HANDLER="+cfg.Handler,
 		"-e", "NIMBUS_HANDLER_FUNCTION="+cfg.HandlerExport,
-		"-e", "NIMBUS_HANDLER_PATH=/var/task/"+cfg.HandlerFile+".js",
+		"-e", "NIMBUS_HANDLER_PATH="+runtime.TaskPath(cfg.Runtime, cfg.Handler, cfg.HandlerFile),
+	)
+	if runtime.RunsAsNode(cfg.Runtime) {
+		args = append(args, "-e", "HOME=/tmp")
+	}
+	args = append(args,
 		"-e", fmt.Sprintf("NIMBUS_MEMORY_MB=%d", cfg.MemoryMB),
 		"-e", fmt.Sprintf("NIMBUS_TIMEOUT_SEC=%d", cfg.TimeoutSec),
 		image,
@@ -589,24 +614,73 @@ func decodeJSONValue(s string) (interface{}, bool) {
 	return v, true
 }
 
-func (e *Executor) ensureImage(ctx context.Context) error {
-	cmd := exec.CommandContext(ctx, "docker", "image", "inspect", e.defaultImage)
+func (e *Executor) imageFor(cfg fnconfig.Resolved) string {
+	if runtime.Canonical(cfg.Runtime) == runtime.NodeJS20 && e.defaultImage != "" {
+		return e.defaultImage
+	}
+	return runtime.Image(cfg.Runtime)
+}
+
+// makeGoBinaryRunnable sets the execute bit on the provided binary.
+// Unzip forces 0644 so a setuid bit in the archive cannot land on the host.
+// The Go runtime still has to exec that file, and /var/task is mounted
+// read-only, so the bit is set on the host path before docker run.
+func makeGoBinaryRunnable(workDir string, cfg fnconfig.Resolved) error {
+	if runtime.Canonical(cfg.Runtime) != runtime.Go1x {
+		return nil
+	}
+	rel := cfg.Handler
+	if rel == "" {
+		rel = "bootstrap"
+	}
+	if strings.Contains(rel, "..") || filepath.IsAbs(rel) {
+		return fmt.Errorf("handler go inválido")
+	}
+	path := filepath.Join(workDir, filepath.FromSlash(rel))
+	cleanWork := filepath.Clean(workDir)
+	cleanPath := filepath.Clean(path)
+	if cleanPath != cleanWork && !strings.HasPrefix(cleanPath, cleanWork+string(os.PathSeparator)) {
+		return fmt.Errorf("handler go inválido")
+	}
+	info, err := os.Stat(cleanPath)
+	if err != nil || info.IsDir() {
+		return fmt.Errorf("No se encontró el binario go: %s", rel)
+	}
+	if err := os.Chmod(cleanPath, 0o755); err != nil {
+		return fmt.Errorf("No se pudo marcar el binario go como ejecutable: %v", err)
+	}
+	return nil
+}
+
+func (e *Executor) ensureImage(ctx context.Context, image string) error {
+	if image == "" {
+		image = e.defaultImage
+	}
+	cmd := exec.CommandContext(ctx, "docker", "image", "inspect", image)
 	if err := cmd.Run(); err == nil {
 		return nil
 	}
 
-	log.Printf("[executor] Construyendo imagen %s...", e.defaultImage)
+	log.Printf("[executor] Construyendo imagen %s...", image)
 
-	runtimePath := "/app/runtime-node"
+	dir, ok := runtime.SourceDir(image)
+	if !ok {
+		if image == e.defaultImage {
+			dir = "runtime-node"
+		} else {
+			return fmt.Errorf("imagen %s no existe y no hay un Dockerfile de plataforma", image)
+		}
+	}
+	runtimePath := "/app/" + dir
 	if _, err := os.Stat(runtimePath); os.IsNotExist(err) {
-		runtimePath = "./runtime-node"
+		runtimePath = "./" + dir
 		if _, err := os.Stat(runtimePath); os.IsNotExist(err) {
 			cwd, _ := os.Getwd()
-			return fmt.Errorf("directorio runtime-node no encontrado (cwd: %s)", cwd)
+			return fmt.Errorf("directorio %s no encontrado (cwd: %s)", dir, cwd)
 		}
 	}
 
-	cmd = exec.CommandContext(ctx, "docker", "build", "-t", e.defaultImage, runtimePath)
+	cmd = exec.CommandContext(ctx, "docker", "build", "-t", image, runtimePath)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {

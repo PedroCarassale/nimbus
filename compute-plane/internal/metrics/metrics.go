@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/cancel"
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/runtime"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	dto "github.com/prometheus/client_model/go"
@@ -18,8 +19,8 @@ import (
 var (
 	invocations = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "nimbus_invocations_total",
-		Help: "Invocations that ran, by function, status (success, error, timeout, oom, cancelled) and mode (sync, async).",
-	}, []string{"function_id", "status", "mode"})
+		Help: "Invocations that ran, by function, status (success, error, timeout, oom, cancelled), mode (sync, async) and runtime (nodejs20, python3.12, go1.x).",
+	}, []string{"function_id", "status", "mode", "runtime"})
 
 	errorsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "nimbus_errors_total",
@@ -122,12 +123,13 @@ func Classify(success bool, exitCode int, errText string) string {
 
 // RecordInvocation updates counters and histograms for one execution that
 // got past admission. mode is "sync" or "async".
-func RecordInvocation(functionID, mode, status string, durationMs int64, coldStart bool, initMs int64) {
+func RecordInvocation(functionID, mode, status, runtimeName string, durationMs int64, coldStart bool, initMs int64) {
 	id := label(functionID)
 	mode = modeLabel(mode)
 	status = statusLabel(status)
+	runtimeName = runtime.Label(runtimeName)
 	Remember(id)
-	invocations.WithLabelValues(id, status, mode).Inc()
+	invocations.WithLabelValues(id, status, mode, runtimeName).Inc()
 	switch status {
 	case "error":
 		errorsTotal.WithLabelValues(id, mode).Inc()

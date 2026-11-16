@@ -10,7 +10,7 @@
 #   make logs    — Muestra logs de todos los servicios
 #   make console — Abre la consola web en el navegador
 
-.PHONY: up down hello smoke load config-check warm-check async-check obs obs-check qa logs build clean wait-healthy help
+.PHONY: up down hello hello-python hello-go smoke load config-check warm-check async-check runtime-check obs obs-check qa logs build clean wait-healthy help
 
 # Variables
 COMPOSE := docker compose
@@ -37,8 +37,10 @@ up: ## Levanta todo el stack (Postgres, Redis, MinIO, Nest, Go)
 	@echo "$(YELLOW)>>> Levantando stack Nimbus...$(NC)"
 	@mkdir -p $(WORK_DIR)
 	@chmod 1777 $(WORK_DIR)
-	@echo "$(YELLOW)>>> Construyendo imagen de runtime nimbus-node...$(NC)"
+	@echo "$(YELLOW)>>> Construyendo imágenes de runtime (node, python, go)...$(NC)"
 	docker build -t nimbus-node ./runtime-node
+	docker build -t nimbus-python ./runtime-python
+	docker build -t nimbus-go ./runtime-go
 	$(COMPOSE) up -d --build
 	@echo "$(YELLOW)>>> Esperando que los servicios estén healthy...$(NC)"
 	@$(MAKE) wait-healthy
@@ -67,6 +69,14 @@ hello: ## Demo completa: create → deploy → invoke función hello
 	@echo ""
 	@./scripts/hello-demo.sh
 
+hello-python: ## Demo python3.12 (invoke directo al compute plane)
+	@echo "$(YELLOW)>>> Demo hello-python...$(NC)"
+	@./scripts/hello-python.sh
+
+hello-go: ## Demo go1.x: binario estático, invoke directo al compute plane
+	@echo "$(YELLOW)>>> Demo hello-go...$(NC)"
+	@./scripts/hello-go.sh
+
 smoke: ## Ejecuta smoke test (create, deploy, invoke, logs, error, timeout)
 	@echo "$(YELLOW)>>> Ejecutando smoke test...$(NC)"
 	@./scripts/smoke-test.sh
@@ -86,6 +96,10 @@ warm-check: ## Mide cold start vs warm start y el descarte por idle, timeout y O
 async-check: ## Invocación async, reintentos, DLQ, redrive y reclaim tras un kill
 	@echo "$(YELLOW)>>> Prueba de invocación async...$(NC)"
 	@./scripts/async-check.sh
+
+runtime-check: ## python3.12 y go1.x: cold, warm, timeout, OOM y error
+	@echo "$(YELLOW)>>> Prueba de runtimes...$(NC)"
+	@./scripts/runtime-check.sh
 
 obs: ## Prometheus, Grafana, Jaeger y el collector (perfil obs, aparte de make up)
 	@echo "$(YELLOW)>>> Levantando observabilidad...$(NC)"
@@ -107,9 +121,10 @@ obs-check: ## Tráfico real y consulta a Prometheus, Grafana y Jaeger
 	@echo "$(YELLOW)>>> Prueba de observabilidad...$(NC)"
 	@./scripts/obs-check.sh
 
-qa: ## QA profundo de los pasos 0–5 (consola, stress, restarts, seguridad)
+qa: ## QA profundo de los pasos 0–5 más los runtimes de python y go
 	@echo "$(YELLOW)>>> QA profundo...$(NC)"
 	@./scripts/qa-deep.sh
+	@./scripts/runtime-check.sh
 
 logs: ## Muestra logs de todos los servicios (follow)
 	$(COMPOSE) logs -f

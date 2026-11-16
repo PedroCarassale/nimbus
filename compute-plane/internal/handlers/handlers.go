@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"strings"
 
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/async"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/cancel"
@@ -13,6 +14,7 @@ import (
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/executor"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/fnconfig"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/metrics"
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/runtime"
 	ntrace "github.com/PedroCarassale/nimbus/compute-plane/internal/trace"
 	"github.com/go-chi/chi/v5"
 	"go.opentelemetry.io/otel/attribute"
@@ -81,6 +83,7 @@ type StartExecutionRequest struct {
 	CPUs           json.RawMessage        `json:"cpus"`
 	Handler        json.RawMessage        `json:"handler"`
 	EnvVars        json.RawMessage        `json:"envVars"`
+	Runtime        string                 `json:"runtime,omitempty"`
 	MaxConcurrency int                    `json:"maxConcurrency,omitempty"`
 }
 
@@ -137,8 +140,9 @@ func (h *Handler) dispatch(ctx context.Context, req StartExecutionRequest, mode 
 		return status, payload
 	}
 
-	ntrace.Logf(ctx, "[handler] StartExecution: %s (fn: %s, v: %s, timeout: %ds, memory: %dMB, cpus: %s, handler: %s, env: %d, mode: %s)",
-		req.ExecutionID, req.FunctionID, req.Version, resolved.TimeoutSec, resolved.MemoryMB, cpusLabel(resolved), resolved.Handler, len(resolved.Env), mode)
+	ntrace.Logf(ctx, "[handler] StartExecution: %s (fn: %s, v: %s, runtime: %s, timeout: %ds, memory: %dMB, cpus: %s, handler: %s, env: %d, mode: %s)",
+		req.ExecutionID, req.FunctionID, req.Version, resolved.Runtime, resolved.TimeoutSec, resolved.MemoryMB, cpusLabel(resolved), resolved.Handler, len(resolved.Env), mode)
+	trace.SpanFromContext(ctx).SetAttributes(attribute.String("nimbus.runtime", resolved.Runtime))
 
 	maxConcurrency := req.MaxConcurrency
 	if maxConcurrency < 0 {
@@ -217,7 +221,7 @@ func (h *Handler) dispatch(ctx context.Context, req StartExecutionRequest, mode 
 		InitMs:      result.InitMs,
 	}
 	outcome := metrics.Classify(result.Success, result.ExitCode, result.Error)
-	metrics.RecordInvocation(req.FunctionID, mode, outcome, result.DurationMs, result.ColdStart, result.InitMs)
+	metrics.RecordInvocation(req.FunctionID, mode, outcome, resolved.Runtime, result.DurationMs, result.ColdStart, result.InitMs)
 	if wasCancelled {
 		log.Printf("[handler] Ejecución %s cancelada (duration: %dms)", req.ExecutionID, result.DurationMs)
 		return http.StatusConflict, resp
@@ -256,18 +260,40 @@ func (h *Handler) validate(req StartExecutionRequest) (fnconfig.Resolved, int, a
 		EnvVars:    req.EnvVars,
 	}, h.effectiveDefaults())
 	if err != nil {
-		var ferr *fnconfig.FieldError
-		if errors.As(err, &ferr) {
-			log.Printf("[handler] Configuración rechazada para %s: %s", req.ExecutionID, ferr.Message)
-			return fnconfig.Resolved{}, http.StatusBadRequest, map[string]string{
-				"error": ferr.Message,
-				"field": ferr.Field,
-			}
-		}
-		log.Printf("[handler] Configuración rechazada para %s", req.ExecutionID)
-		return fnconfig.Resolved{}, http.StatusBadRequest, map[string]string{"error": "Configuración inválida"}
+		return fieldRejection(req.ExecutionID, err)
+	}
+	rt, err := runtime.Normalize(req.Runtime)
+	if err != nil {
+		return fieldRejection(req.ExecutionID, err)
+	}
+	resolved.Runtime = rt
+	// Go ships a binary, not a file.function export. An omitted handler is
+	// the binary "bootstrap" at the root of the zip. An explicit handler is
+	// that relative path ("bootstrap", "bin/hello").
+	if rt == runtime.Go1x && handlerOmitted(req.Handler) {
+		resolved.Handler = "bootstrap"
+		resolved.HandlerFile = "bootstrap"
+		resolved.HandlerExport = "bootstrap"
 	}
 	return resolved, 0, nil
+}
+
+func handlerOmitted(raw json.RawMessage) bool {
+	text := strings.TrimSpace(string(raw))
+	return text == "" || text == "null"
+}
+
+func fieldRejection(executionID string, err error) (fnconfig.Resolved, int, any) {
+	var ferr *fnconfig.FieldError
+	if errors.As(err, &ferr) {
+		log.Printf("[handler] Configuración rechazada para %s: %s", executionID, ferr.Message)
+		return fnconfig.Resolved{}, http.StatusBadRequest, map[string]string{
+			"error": ferr.Message,
+			"field": ferr.Field,
+		}
+	}
+	log.Printf("[handler] Configuración rechazada para %s", executionID)
+	return fnconfig.Resolved{}, http.StatusBadRequest, map[string]string{"error": "Configuración inválida"}
 }
 
 type CancelExecutionResponse struct {

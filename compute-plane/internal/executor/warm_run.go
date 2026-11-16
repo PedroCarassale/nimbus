@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/logs"
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/runtime"
 	ntrace "github.com/PedroCarassale/nimbus/compute-plane/internal/trace"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/warm"
 	"go.opentelemetry.io/otel/attribute"
@@ -42,6 +43,7 @@ func (e *Executor) executeWarm(ctx context.Context, req *ExecutionRequest) *Exec
 		logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Error: %s", result.Error))
 		return result
 	}
+	cfg.Runtime = req.Config.Runtime
 
 	dlCtx, dlSpan := ntrace.Start(ctx, "artifact.download")
 	dlSpan.SetAttributes(attribute.String("nimbus.function_id", req.FunctionID))
@@ -55,14 +57,21 @@ func (e *Executor) executeWarm(ctx context.Context, req *ExecutionRequest) *Exec
 	}
 	dlSpan.End()
 
-	if err := e.ensureImage(ctx); err != nil {
+	if err := makeGoBinaryRunnable(workDir, cfg); err != nil {
+		result.Error = err.Error()
+		logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Error: %s", result.Error))
+		return result
+	}
+
+	image := e.imageFor(cfg)
+	if err := e.ensureImage(ctx, image); err != nil {
 		result.Error = fmt.Sprintf("Error con imagen Docker: %v", err)
 		logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Error: %s", result.Error))
 		return result
 	}
 
-	logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Ejecutando handler '%s' (timeout: %ds, memory: %dMB, cpus: %s, env: %d)",
-		cfg.Handler, cfg.TimeoutSec, cfg.MemoryMB, cpusLabel(cfg), len(cfg.Env)))
+	logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Ejecutando handler '%s' (runtime: %s, timeout: %ds, memory: %dMB, cpus: %s, env: %d)",
+		cfg.Handler, runtime.Canonical(cfg.Runtime), cfg.TimeoutSec, cfg.MemoryMB, cpusLabel(cfg), len(cfg.Env)))
 
 	timeoutCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.TimeoutSec)*time.Second)
 	defer cancel()
@@ -81,7 +90,7 @@ func (e *Executor) executeWarm(ctx context.Context, req *ExecutionRequest) *Exec
 		FunctionID:  req.FunctionID,
 		Version:     req.Version,
 		WorkDir:     workDir,
-		Image:       e.defaultImage,
+		Image:       image,
 		Config:      cfg,
 		TraceID:     ntrace.ID(ctx),
 		TraceParent: ntrace.Header(ctx),

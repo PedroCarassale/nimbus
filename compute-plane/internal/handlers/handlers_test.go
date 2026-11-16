@@ -431,6 +431,7 @@ func TestStartExecutionRejectsInvalidConfig(t *testing.T) {
 		{`{"executionId":"e1","functionId":"f1","version":"v1","handler":"../x.main"}`, "handler"},
 		{`{"executionId":"e1","functionId":"f1","version":"v1","envVars":{"NIMBUS_SECRET":"super-secret-value"}}`, "envVars"},
 		{`{"executionId":"e1","functionId":"f1","version":"v1","envVars":{"BAD-NAME":"x"}}`, "envVars"},
+		{`{"executionId":"e1","functionId":"f1","version":"v1","runtime":"ruby"}`, "runtime"},
 	}
 	for _, tc := range cases {
 		rr := postJSON(t, router, "/executions", tc.body)
@@ -476,8 +477,49 @@ func TestStartExecutionForwardsRuntimeConfig(t *testing.T) {
 	if cfg.Handler != "src/app.main" || cfg.HandlerFile != "src/app" || cfg.HandlerExport != "main" {
 		t.Fatalf("handler %+v", cfg)
 	}
+	if cfg.Runtime != "nodejs20" {
+		t.Fatalf("default runtime %+v", cfg.Runtime)
+	}
 	if len(cfg.Env) != 1 || cfg.Env[0].Name != "GREETING" || cfg.Env[0].Value != "super-secret-value" {
 		t.Fatalf("env %+v", cfg.Env)
+	}
+}
+
+func TestRuntimeFieldSelectsPythonAndGo(t *testing.T) {
+	runner := &fakeRunner{}
+	locker := &fakeLocker{acquire: true}
+	h := &Handler{executor: runner, concurrency: locker}
+	router := newRouter(h)
+
+	rr := postJSON(t, router, "/executions", `{
+		"executionId":"e1","functionId":"f1","version":"v1","runtime":"python3.12","handler":"index.handler"
+	}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("python status %d %s", rr.Code, rr.Body.String())
+	}
+	if runner.last.Config.Runtime != "python3.12" || runner.last.Config.Handler != "index.handler" || runner.last.Config.HandlerFile != "index" {
+		t.Fatalf("python cfg %+v", runner.last.Config)
+	}
+
+	rr = postJSON(t, router, "/executions", `{
+		"executionId":"e2","functionId":"f1","version":"v1","runtime":"go1.x"
+	}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("go status %d %s", rr.Code, rr.Body.String())
+	}
+	cfg := runner.last.Config
+	if cfg.Runtime != "go1.x" || cfg.Handler != "bootstrap" {
+		t.Fatalf("omitted go handler %+v", cfg)
+	}
+
+	rr = postJSON(t, router, "/executions", `{
+		"executionId":"e3","functionId":"f1","version":"v1","runtime":"go1.x","handler":"bin/hello"
+	}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("go path status %d %s", rr.Code, rr.Body.String())
+	}
+	if runner.last.Config.Handler != "bin/hello" {
+		t.Fatalf("explicit go handler %+v", runner.last.Config)
 	}
 }
 
