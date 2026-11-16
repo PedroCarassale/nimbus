@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/cancel"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/fnconfig"
 )
 
@@ -157,6 +158,7 @@ func (p *Pool) Run(ctx context.Context, spec Spec, inv Invocation) (Outcome, Met
 	}
 
 	out := slot.session.Invoke(ctx, inv)
+	out = applyCancel(ctx, out)
 	p.finish(slot, out)
 	return out, meta
 }
@@ -171,11 +173,31 @@ func (p *Pool) runEphemeral(ctx context.Context, spec Spec, inv Invocation) (Out
 		inv.Begin(meta)
 	}
 	out := sess.Invoke(ctx, inv)
+	out = applyCancel(ctx, out)
 	_ = sess.Destroy(context.Background())
 	return out, meta
 }
 
+// applyCancel drops the handler result when the user cancelled the run.
+// The container is tainted so finish destroys it instead of returning it
+// to the pool. A timeout is a different cause and is left as exit 124.
+func applyCancel(ctx context.Context, out Outcome) Outcome {
+	if !cancel.Is(ctx) {
+		return out
+	}
+	out.Success = false
+	out.Output = nil
+	out.OOM = false
+	out.Tainted = true
+	out.Error = cancel.Message
+	out.ExitCode = cancel.ExitCode
+	return out
+}
+
 func startFailure(ctx context.Context, err error) Outcome {
+	if cancel.Is(ctx) {
+		return Outcome{ExitCode: cancel.ExitCode, Error: cancel.Message, Tainted: true}
+	}
 	if ctx.Err() == context.DeadlineExceeded {
 		return Outcome{ExitCode: 124, Tainted: true}
 	}

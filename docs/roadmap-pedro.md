@@ -23,6 +23,7 @@ compute-plane/
 - Un container ya iniciado se reutiliza para la misma función, versión y config efectiva. Si está frío, idle o vino sucio (timeout, crash, OOM), se arranca uno nuevo. Detalle en [`warm.md`](warm.md).
 - El invoke sync sigue igual. Con `?async=true` o `X-Invocation-Type: Event` Nest responde 202 y un worker del compute plane ejecuta el mismo camino (semáforo, cola, config, warm, logs). Reintentos con backoff y DLQ en Redis. Detalle en [`async.md`](async.md).
 - `GET /metrics` expone invocaciones, duración, cold/warm, cola, 429, reintentos y DLQ. Las trazas salen por OTLP. Grafana y Jaeger están en el perfil `obs`. Detalle en [`observabilidad.md`](observabilidad.md).
+- Cancelar una ejecución que ya corre mata el container (frío y warm). El warm no vuelve al pool. Un async cancelado no se reintenta ni va a la DLQ; la fila queda en `ERROR` con `Ejecución cancelada` porque Prisma no tiene `CANCELLED`. Las keys `nimbus:slots:machine:{host}` de un proceso muerto se borran cuando sus leases vencen.
 
 ### Paso 0 — Base estable
 - [x] Correr `make up` + `make hello` con Docker real y arreglar lo que rompa.

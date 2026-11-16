@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/cancel"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	dto "github.com/prometheus/client_model/go"
@@ -101,6 +102,12 @@ func rememberedIDs() []string {
 
 // Classify maps an execution result to a status label.
 func Classify(success bool, exitCode int, errText string) string {
+	// 130 is the platform code for a user cancel. docker rm -f also exits
+	// 137, so the exit code alone is not enough: the message is the same one
+	// returned on HTTP 409.
+	if exitCode == cancel.ExitCode || errText == cancel.Message {
+		return "cancelled"
+	}
 	if exitCode == 124 {
 		return "timeout"
 	}

@@ -78,10 +78,10 @@ Log `/tmp/nimbus-qa/qa-20261116-190847.log`. **26 PASS, 0 FAIL.** Una corrida an
 
 ## Lo que queda abierto
 
-- Cancelar una ejecución que ya está corriendo solo pone el flag. El container sigue hasta que el handler termina o vence el timeout. En esta pasada, un sleep de 2500 ms cancelado a los ~400 ms igual devolvió SUCCESS a los 2547 ms. Severidad media. Está escrito en `docs/concurrencia.md` y `docs/async.md`.
+- ~~Cancelar una ejecución que ya está corriendo solo pone el flag.~~ Cerrado después de esta pasada: el cancel mata el container en frío y en warm, el warm no se reutiliza, y un async cancelado queda en `ERROR` con `Ejecución cancelada` sin reintento ni DLQ. El sleep de 2500 ms de esta pasada (SUCCESS a los 2547 ms) es el caso que se reescribió en `make qa`. Prisma sigue sin estado `CANCELLED`.
+- ~~Un `SIGKILL` del compute deja miembros en `nimbus:slots:machine:{hostname-muerto}`.~~ Cerrado después de esta pasada: al arrancar, y cada medio lease, se borran las keys de slots cuyos miembros ya vencieron. Un peer con leases vigentes se conserva.
 - Con `NIMBUS_WARM=0` el proceso es el usuario de la imagen (root). El camino warm corre como uid 1000 (`node`). Esta pasada midió el uid del camino warm. Severidad baja. Es el corte del paso 3.
 - Mientras el container vive, `docker inspect` muestra los env. El log del compute los redacta: en `make qa` el valor de `GREETING` no estaba en `docker logs nimbus-compute-plane`. Si el handler los imprime, salen en el log del usuario.
-- Un `SIGKILL` del compute deja miembros en `nimbus:slots:machine:{hostname-muerto}` y en el sorted set de la función. El score queda en el pasado (no otorgan cupo) y el host actual quedó en `ZCARD 0`. Nadie barre las keys de hostnames que ya no existen. Severidad baja.
 - Multer no limita el tamaño del upload. El tope de 32 MiB corta la bomba al descomprimir, no en el body de Nest. Un zip enorme en memoria del control plane sigue siendo posible. Severidad baja.
 - Nest no reenvía `envVars`, `cpus` ni `coldStart` al compute. `getRemainingTimeInMillis` sigue en 0. Los intentos async comparten `executionId` y el stream de logs. Un 429 gasta un intento async. No hay auth. Nada de eso se cambió en esta pasada.
 

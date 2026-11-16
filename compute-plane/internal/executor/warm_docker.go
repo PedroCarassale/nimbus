@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/cancel"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/fnconfig"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/warm"
 )
@@ -259,7 +260,13 @@ func (s *dockerWarmSession) Invoke(ctx context.Context, inv warm.Invocation) war
 				Tainted:  true,
 				ExitCode: 1,
 			}
-			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			if cancel.Is(ctx) {
+				// Kill before returning so the sleep cannot finish and the
+				// pool does not put this container back.
+				_ = s.Destroy(context.Background())
+				out.ExitCode = cancel.ExitCode
+				out.Error = cancel.Message
+			} else if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				out.ExitCode = 124
 			} else {
 				out.Error = "La ejecución fue cancelada"
@@ -267,6 +274,16 @@ func (s *dockerWarmSession) Invoke(ctx context.Context, inv warm.Invocation) war
 			return out
 		case frame, ok := <-s.frames:
 			if !ok {
+				if cancel.Is(ctx) {
+					_ = s.Destroy(context.Background())
+					return warm.Outcome{
+						ExitCode: cancel.ExitCode,
+						Error:    cancel.Message,
+						Tainted:  true,
+						Stdout:   stdoutBuf.String(),
+						Stderr:   stderrBuf.String(),
+					}
+				}
 				out := s.closedOutcome()
 				if stdoutBuf.Len() > 0 {
 					out.Stdout = stdoutBuf.String() + out.Stdout

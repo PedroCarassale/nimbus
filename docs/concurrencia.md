@@ -107,8 +107,10 @@ Si la ejecución se cancela mientras espera, el compute plane responde **409** c
 
 `POST /executions/:id/cancel` sirve para una ejecución en cola y para una que ya corre:
 
-- **En cola:** sale de la cola en el momento y no arranca. El `POST /executions` que estaba bloqueado responde 409.
-- **En curso:** se marca `cancelled` en Redis. El slot sigue ocupado hasta que el proceso suelta la ejecución, para no entregar ese cupo dos veces. Hoy el container no se mata por ese flag.
+- **En cola:** sale de la cola en el momento y no arranca. El `POST /executions` que estaba bloqueado responde 409 con `"error": "Ejecución cancelada mientras esperaba en la cola"`.
+- **En curso:** se marca `cancelled` en Redis y el proceso que la está ejecutando corta el contexto. Eso mata el container con `docker rm -f` (el camino frío y el warm). El warm no vuelve al pool: el siguiente invoke de esa clave es cold. El `POST /executions` que estaba bloqueado responde **409** con `success: false`, `exitCode` **130** y `"error": "Ejecución cancelada"`. `durationMs` es el tiempo hasta el corte, no hasta que el handler hubiera terminado. El slot sigue ocupado hasta el release, para no entregar ese cupo dos veces. Un 137 del `SIGKILL` no se reporta como OOM.
+
+Prisma no tiene estado `CANCELLED`. La fila queda en `ERROR` con ese texto. No hace falta migración ni cambio en Nest: el invoke sync ya guarda `ERROR` cuando `success` es false y el exit no es 124, y el worker async publica `status: ERROR`. El 409 es fatal para el async (no reintenta, no entra a la DLQ). Si más adelante se quiere un estado propio en la API, lo agrega Federico al enum.
 
 Cancelar un id que no está en cola ni en curso responde 404.
 
@@ -120,7 +122,7 @@ Por función:
 - `nimbus:queue:fn:{functionId}` — sorted set FIFO. El score es un ticket (`INCR`), así el orden no depende del reloj.
 - `nimbus:queue:seq:fn:{functionId}` — secuencia de tickets.
 
-Por proceso de compute (el hostname del container; en el compose es estable por `container_name`):
+Por proceso de compute (el hostname es el id del container; al recrearlo cambia):
 
 - `nimbus:slots:machine:{hostname}` — mismas leases, cuenta contra `NIMBUS_MAX_CONTAINERS`.
 
@@ -132,7 +134,9 @@ La admisión es un script Lua: limpia leases vencidos, respeta el FIFO (solo la 
 
 ## Si el proceso se cae
 
-Un slot lo renueva el proceso cada un tercio del lease. Si el proceso muere, deja de renovar. La próxima admisión (o la renovación de otra ejecución viva) borra los scores ya vencidos y ese cupo, también el del tope global, vuelve a estar libre. La ventana es `NIMBUS_SLOT_LEASE_SEC` (default 30s).
+Un slot lo renueva el proceso cada un tercio del lease. Si el proceso muere, deja de renovar. La próxima admisión (o la renovación de otra ejecución viva) borra los scores ya vencidos de **su** key y ese cupo vuelve a estar libre. La ventana es `NIMBUS_SLOT_LEASE_SEC` (default 30s).
+
+Un `SIGKILL` cambia el hostname (es el id del container) y deja `nimbus:slots:machine:{hostname-muerto}` con miembros que nadie vuelve a mirar: la admisión solo barre la key del proceso vivo. Al arrancar, y después cada medio lease, el proceso recorre `nimbus:slots:machine:*` y `nimbus:slots:fn:*`, saca los scores ya vencidos y borra la key si quedó vacía. Un peer que sigue renovando no se toca. La cola FIFO tampoco: ahí el score es un ticket, no un vencimiento. La key del host muerto puede seguir existiendo hasta que vence el último lease; después el barrido la borra sin esperar una admisión nueva.
 
 Quien espera en la cola refresca `heartbeat` en cada intento. Si deja de hacerlo durante `NIMBUS_FN_QUEUE_WAIT_SEC`, la próxima admisión lo saca de la cola. Una cabeza muerta no bloquea a los demás para siempre.
 

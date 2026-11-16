@@ -41,6 +41,12 @@ func TestRecordInvocationAndRejection(t *testing.T) {
 	if got := Classify(false, 1, "boom"); got != "error" {
 		t.Fatalf("error: %s", got)
 	}
+	if got := Classify(false, 130, "Ejecución cancelada"); got != "cancelled" {
+		t.Fatalf("cancelled: %s", got)
+	}
+	if got := Classify(true, 137, "Ejecución cancelada"); got != "cancelled" {
+		t.Fatalf("cancel message must win over a kill exit: %s", got)
+	}
 
 	RecordInvocation(fn, "sync", "success", 40, true, 12)
 	RecordInvocation(fn, "async", "error", 15, false, 0)

@@ -240,10 +240,90 @@ sleep 0.4
 CANCELR="$(curl -sS -w ' HTTP:%{http_code}' -X POST "$COMPUTE_URL/executions/$RUNID/cancel")"
 wait "$LIVE_PID" || true
 echo "  cancel running: $CANCELR result=$(cat "$OUT/running.json")"
-if echo "$CANCELR" | grep -q '"cancelled":true' && jq -e '.success == true' "$OUT/running.json" >/dev/null; then
-  ok "cancel de una ejecución que ya corre marca el flag y el handler igual termina (documentado)"
+RUN_DUR="$(jq -r '.durationMs // 99999' "$OUT/running.json")"
+RUN_LEFT="$(docker ps -aq --filter "name=nimbus-${RUNID}" | wc -l | tr -d ' ')"
+if echo "$CANCELR" | grep -q '"cancelled":true' \
+  && jq -e '.success == false and .exitCode == 130 and (.error | test("Ejecución cancelada"))' "$OUT/running.json" >/dev/null \
+  && [[ "$RUN_DUR" -lt 1800 && "$RUN_LEFT" == "0" ]]; then
+  ok "cancel de una ejecución warm que ya corre mata el container (durationMs=$RUN_DUR, sin container)"
 else
-  bad "cancel running: $CANCELR $(cat "$OUT/running.json")"
+  bad "cancel running: $CANCELR dur=$RUN_DUR containers=$RUN_LEFT $(cat "$OUT/running.json")"
+fi
+AFTER="$(curl -sS --max-time 20 -X POST "$COMPUTE_URL/executions" -H 'Content-Type: application/json' \
+  -d "{\"executionId\":\"after-$RANDOM\",\"functionId\":\"$HOLD_FN\",\"version\":\"$HOLD_VER\",\"timeoutSec\":10,\"event\":{\"sleepMs\":10}}")"
+echo "  siguiente tras cancel warm: $(echo "$AFTER" | jq -c '{success,coldStart,durationMs}')"
+if echo "$AFTER" | jq -e '.success == true and .coldStart == true' >/dev/null; then
+  ok "el container warm cancelado no se reutiliza (el siguiente es cold)"
+else
+  bad "warm cancelado se reutilizó: $AFTER"
+fi
+
+ASYNC_RUN="$(curl -sf -X POST "$API_URL/functions/$HOLD_FN/invoke?async=true" -H 'Content-Type: application/json' -d '{"event":{"sleepMs":2500}}')"
+AR_ID="$(echo "$ASYNC_RUN" | jq -r .invocationId)"
+AR_EID="$(echo "$ASYNC_RUN" | jq -r .executionId)"
+AR_ST=""
+for _ in $(seq 1 40); do
+  AR_ST="$(curl -sf "$API_URL/invocations/$AR_ID" | jq -r .status)"
+  [[ "$AR_ST" == "RUNNING" ]] && break
+  sleep 0.1
+done
+if [[ "$AR_ST" != "RUNNING" ]]; then
+  bad "el async no llegó a RUNNING antes del cancel (status=$AR_ST)"
+fi
+sleep 0.3
+CANCELA="$(curl -sS -X POST "$COMPUTE_URL/executions/$AR_EID/cancel")"
+AR_FINAL=""
+for _ in $(seq 1 40); do
+  AR_FINAL="$(curl -sf "$API_URL/invocations/$AR_ID")"
+  AR_ST="$(echo "$AR_FINAL" | jq -r .status)"
+  if [[ "$AR_ST" == "ERROR" || "$AR_ST" == "SUCCESS" || "$AR_ST" == "TIMEOUT" ]]; then break; fi
+  sleep 0.2
+done
+AR_DLQ="$(curl -sf "$COMPUTE_URL/dlq" | jq -r --arg id "$AR_ID" '[.entries[] | select(.invocationId==$id)] | length')"
+echo "  cancel async en curso: $CANCELA fila=$(echo "$AR_FINAL" | jq -c '{status,attempts,error,durationMs}') dlq=$AR_DLQ"
+AR_DUR="$(echo "$AR_FINAL" | jq -r '.durationMs // 99999')"
+if echo "$CANCELA" | grep -q '"cancelled":true' \
+  && [[ "$(echo "$AR_FINAL" | jq -r .status)" == "ERROR" && "$(echo "$AR_FINAL" | jq -r .attempts)" == "1" && "$AR_DLQ" == "0" ]] \
+  && [[ "$(echo "$AR_FINAL" | jq -r .error)" == "Ejecución cancelada" ]] \
+  && [[ "$AR_DUR" -lt 1800 ]]; then
+  ok "cancel de un async que ya corre termina en ERROR, sin reintento ni DLQ (durationMs=$AR_DUR)"
+else
+  bad "cancel async en curso: $CANCELA $AR_FINAL dlq=$AR_DLQ"
+fi
+
+export NIMBUS_WARM=0
+recreate_compute
+COLDID="coldlive-$RANDOM"
+curl -sS --max-time 25 -X POST "$COMPUTE_URL/executions" -H 'Content-Type: application/json' \
+  -d "{\"executionId\":\"$COLDID\",\"functionId\":\"$HOLD_FN\",\"version\":\"$HOLD_VER\",\"timeoutSec\":15,\"event\":{\"sleepMs\":2500}}" \
+  >"$OUT/cold-running.json" &
+COLD_PID=$!
+sleep 0.5
+CANCELC="$(curl -sS -w ' HTTP:%{http_code}' -X POST "$COMPUTE_URL/executions/$COLDID/cancel")"
+wait "$COLD_PID" || true
+COLD_DUR="$(jq -r '.durationMs // 99999' "$OUT/cold-running.json")"
+COLD_LEFT="$(docker ps -aq --filter "name=nimbus-${COLDID}" | wc -l | tr -d ' ')"
+echo "  cancel cold: $CANCELC dur=$COLD_DUR containers=$COLD_LEFT $(cat "$OUT/cold-running.json")"
+if echo "$CANCELC" | grep -q '"cancelled":true' \
+  && jq -e '.success == false and .exitCode == 130 and (.error | test("Ejecución cancelada"))' "$OUT/cold-running.json" >/dev/null \
+  && [[ "$COLD_DUR" -lt 1800 && "$COLD_LEFT" == "0" ]]; then
+  ok "cancel de una ejecución fría (NIMBUS_WARM=0) mata el container (durationMs=$COLD_DUR)"
+else
+  bad "cancel cold: $CANCELC dur=$COLD_DUR containers=$COLD_LEFT $(cat "$OUT/cold-running.json")"
+fi
+unset NIMBUS_WARM
+
+docker exec nimbus-redis redis-cli ZADD nimbus:slots:machine:dead-host-qa 1 ghost-exec >/dev/null
+NOWMS="$(python3 -c 'import time; print(int(time.time()*1000)+60000)')"
+docker exec nimbus-redis redis-cli ZADD nimbus:slots:machine:live-peer-qa "$NOWMS" live-exec >/dev/null
+recreate_compute
+DEAD_LEFT="$(docker exec nimbus-redis redis-cli EXISTS nimbus:slots:machine:dead-host-qa | tr -d '[:space:]')"
+LIVE_LEFT="$(docker exec nimbus-redis redis-cli ZSCORE nimbus:slots:machine:live-peer-qa live-exec | tr -d '[:space:]')"
+echo "  slots muertos exists=$DEAD_LEFT peer=$LIVE_LEFT"
+if [[ "$DEAD_LEFT" == "0" && -n "$LIVE_LEFT" && "$LIVE_LEFT" != "(nil)" ]]; then
+  ok "el arranque borra nimbus:slots:machine de un host muerto y deja el de un peer vivo"
+else
+  bad "barrido de slots exists=$DEAD_LEFT peer=$LIVE_LEFT"
 fi
 
 # Ocupar los 4 workers para que el siguiente async quede en el stream.

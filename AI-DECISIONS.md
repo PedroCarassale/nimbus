@@ -530,5 +530,36 @@ El contrato queda en `docs/async.md`.
 6. **`make qa`**
    - `scripts/qa-deep.sh` y `scripts/qa-console.mjs`. El informe está en `docs/qa-pasos-0-5.md`.
 
-**Validación y Corrección Humana:** Riesgos que quedan en el diseño: cancelar una ejecución que ya corre no mata el container. El camino frío (`NIMBUS_WARM=0`) sigue como root de la imagen. `docker inspect` muestra los env mientras el container vive. Las keys `nimbus:slots:machine:{hostname}` de un proceso muerto quedan con miembros ya vencidos. Multer no limita el tamaño del upload; el tope del zip aplica al descomprimir. Nest no reenvía `envVars` ni `cpus`, y no hay auth.
+**Validación y Corrección Humana:** Riesgos que quedan en el diseño: el camino frío (`NIMBUS_WARM=0`) sigue como root de la imagen. `docker inspect` muestra los env mientras el container vive. Multer no limita el tamaño del upload; el tope del zip aplica al descomprimir. Nest no reenvía `envVars` ni `cpus`, y no hay auth.
+
+---
+
+## Cancelar una ejecución que ya corre
+
+**Problema abordado:** `POST /executions/:id/cancel` marcaba `cancelled` en Redis y, si la ejecución ya tenía container, no lo mataba. Un sleep de 2500 ms cancelado cerca de los 400 ms terminaba `SUCCESS` cerca de los 2500 ms, en frío y en warm. Un async cancelado en curso podía seguir, reintentar o caer en la DLQ. Un `SIGKILL` del compute plane dejaba `nimbus:slots:machine:{hostname}` (y los slots de la función) con miembros vencidos: la admisión solo barre la key del proceso vivo, y el hostname cambia al recrear el container.
+
+**Prompt / Herramienta utilizada:** Cursor Cloud Agent (Grok 4.7), pedido de cerrar el hallazgo de QA de severidad media (cancel real) y el de severidad baja (keys de slots de un host muerto), en un PR aparte sobre `main`.
+
+**Código / Arquitectura generada:**
+
+1. **Corte del proceso**
+   - El handler abre un contexto con causa propia para la ejecución que ya tiene slot. `POST /executions/:id/cancel` sigue poniendo el flag de Redis (cola y async todavía no admitido) y, si este proceso la está corriendo, cancela esa causa.
+   - El camino frío hace `docker rm -f` del container `nimbus-{executionId}` en cuanto llega la causa. El exit 137 de ese `SIGKILL` no se clasifica como OOM.
+   - El camino warm hace `docker rm -f` del container renombrado y lo marca tainted. El pool lo destruye y no lo devuelve. El invoke siguiente de esa clave es cold.
+   - `POST /executions` responde 409 con `success: false`, `exitCode` 130 y `error: "Ejecución cancelada"`. La métrica `nimbus_invocations_total` usa el status `cancelled`.
+
+2. **Async**
+   - El 409 ya era fatal: no reintenta y no entra a la DLQ. El worker publica `status: ERROR` con el mismo texto. `attempts` no sube por el corte.
+
+3. **Postgres**
+   - El enum `InvocationStatus` no tiene `CANCELLED`. No hay migración. La fila queda en `ERROR` con el mensaje explícito. Nest no cambia: el sync ya guarda `ERROR` cuando `success` es false y el exit no es 124, y el consumidor async ya aplica un `ERROR`.
+
+4. **Slots de un host muerto**
+   - Al arrancar, y cada medio `NIMBUS_SLOT_LEASE_SEC`, se recorren `nimbus:slots:machine:*` y `nimbus:slots:fn:*`. Se borran los scores ya vencidos y la key si quedó vacía. Un peer con lease vigente no se toca. La cola FIFO no entra en el barrido.
+
+5. **Prueba**
+   - Tests de Go del override de un resultado success, del descarte del pool, del 409 sync, del async que no va a la DLQ, de la métrica `cancelled` y del barrido que borra al host muerto y deja al peer.
+   - `make qa` exige duration menor que el sleep, que el container no siga, que el warm siguiente sea cold, el mismo corte con `NIMBUS_WARM=0`, el async en `ERROR` sin DLQ, y el `EXISTS` de la key muerta en 0.
+
+**Validación y Corrección Humana:** El cupo de Redis del host muerto sigue contando hasta que vence el lease (como máximo `NIMBUS_SLOT_LEASE_SEC`); el barrido no borra leases todavía vigentes de otro proceso. Cancelar y que el handler alcance a responder en el mismo instante deja el resultado en cancelado y tira el container. El invoke sync de Nest sigue respondiendo HTTP 200 con `status: ERROR` y el texto de cancelación.
 

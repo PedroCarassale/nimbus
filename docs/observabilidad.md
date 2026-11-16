@@ -31,7 +31,7 @@ El endpoint es `GET /metrics`. Las etiquetas usan `function_id`. No hay `executi
 
 | Métrica | Tipo | Etiquetas | Qué mide |
 |---------|------|-----------|----------|
-| `nimbus_invocations_total` | counter | `function_id`, `status`, `mode` | Invocaciones que pasaron la admisión. `status` es `success`, `error`, `timeout`, `oom` o `cancelled`. `mode` es `sync` o `async`. |
+| `nimbus_invocations_total` | counter | `function_id`, `status`, `mode` | Invocaciones que pasaron la admisión. `status` es `success`, `error`, `timeout`, `oom` o `cancelled`. `cancelled` es un `POST /executions/:id/cancel` que alcanzó a cortar el container (exit 130). `mode` es `sync` o `async`. |
 | `nimbus_errors_total` | counter | `function_id`, `mode` | El handler falló y no fue timeout ni OOM. |
 | `nimbus_timeouts_total` | counter | `function_id`, `mode` | Exit 124. |
 | `nimbus_ooms_total` | counter | `function_id`, `mode` | Exit 137, 134, o el texto de límite de memoria. |
