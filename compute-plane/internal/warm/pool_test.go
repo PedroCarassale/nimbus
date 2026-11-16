@@ -171,6 +171,18 @@ func TestPoolKeySeparatesConfig(t *testing.T) {
 	if base.Key == swapped.Key {
 		t.Fatal("different env must not share a key")
 	}
+	asNode := specOf("fn", "v1", "handler", 128, 0, fnconfig.EnvVar{Name: "A", Value: "1"})
+	asNode.Config.Runtime = "nodejs20"
+	asNode.Key = PoolKey(asNode.FunctionID, asNode.Version, asNode.Config)
+	if asNode.Key != base.Key {
+		t.Fatal("empty runtime must share the nodejs20 pool")
+	}
+	asPy := specOf("fn", "v1", "handler", 128, 0, fnconfig.EnvVar{Name: "A", Value: "1"})
+	asPy.Config.Runtime = "python3.12"
+	asPy.Key = PoolKey(asPy.FunctionID, asPy.Version, asPy.Config)
+	if asPy.Key == base.Key {
+		t.Fatal("python must not share the node pool")
+	}
 
 	cases := []Spec{
 		specOf("other", "v1", "handler", 128, 0),

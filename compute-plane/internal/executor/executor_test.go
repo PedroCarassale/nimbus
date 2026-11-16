@@ -122,7 +122,7 @@ func TestDockerWarmArgsIsolation(t *testing.T) {
 		"--network=none",
 		"--read-only",
 		"--user node",
-		"--tmpfs /tmp:rw,nosuid,size=16m",
+		"--tmpfs /tmp:rw,nosuid,mode=1777,size=16m",
 		"-v /tmp/nimbus-work/warm/code:/var/task:ro",
 		"-e GREETING=super-secret-value",
 		"-e NIMBUS_WARM=1",
@@ -149,6 +149,61 @@ func TestDockerWarmArgsIsolation(t *testing.T) {
 	}
 	if !strings.Contains(logged, "GREETING=***") || !strings.Contains(logged, "NIMBUS_WARM=1") {
 		t.Fatalf("redaction mismatch: %s", logged)
+	}
+}
+
+func TestDockerRunArgsPythonAndGo(t *testing.T) {
+	py := testConfig(t)
+	py.Runtime = "python3.12"
+	py.Handler = "index.handler"
+	py.HandlerFile = "index"
+	py.HandlerExport = "handler"
+	joined := strings.Join(dockerRunArgs("nimbus-py", "/tmp/work", "nimbus-python", py), " ")
+	for _, want := range []string{
+		"--user node",
+		"--tmpfs /tmp:rw,nosuid,mode=1777,size=16m",
+		"-e HOME=/tmp",
+		"-e NIMBUS_HANDLER_PATH=/var/task/index.py",
+		"nimbus-python",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("python args missing %q in %s", want, joined)
+		}
+	}
+
+	g := testConfig(t)
+	g.Runtime = "go1.x"
+	g.Handler = "bootstrap"
+	g.HandlerFile = "bootstrap"
+	joined = strings.Join(dockerWarmArgs("nimbus-w", "/tmp/work", "nimbus-go", g, "fn", "v1"), " ")
+	if !strings.Contains(joined, "-e NIMBUS_HANDLER_PATH=/var/task/bootstrap") || !strings.Contains(joined, "nimbus-go") {
+		t.Fatalf("go warm args %s", joined)
+	}
+}
+
+func TestMakeGoBinaryRunnable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bootstrap")
+	if err := os.WriteFile(path, []byte("#!/bin/true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := fnconfig.Resolved{Runtime: "go1.x", Handler: "bootstrap"}
+	if err := makeGoBinaryRunnable(dir, cfg); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Fatalf("mode %o", info.Mode().Perm())
+	}
+	node := fnconfig.Resolved{Runtime: "nodejs20", Handler: "handler"}
+	if err := makeGoBinaryRunnable(dir, node); err != nil {
+		t.Fatal(err)
+	}
+	if err := makeGoBinaryRunnable(dir, fnconfig.Resolved{Runtime: "go1.x", Handler: "missing"}); err == nil {
+		t.Fatal("missing binary should fail")
 	}
 }
 

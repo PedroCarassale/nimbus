@@ -23,7 +23,7 @@ make obs-check    # genera tráfico y consulta las tres APIs
 
 Grafana no pide login en local: el acceso anónimo entra como Viewer. El usuario `admin` / `admin` sigue existiendo. El datasource Prometheus y el dashboard `nimbus` se cargan solos al arrancar.
 
-`make obs-check` no corre en CI. El job de compose sigue con `hello`, `smoke`, `config-check`, `warm-check` y `async-check`. El perfil obs baja cuatro imágenes más y no hace falta para esos checks.
+`make obs-check` no corre en CI. El job de compose sigue con `hello`, `smoke`, `config-check`, `warm-check`, `async-check`, `runtime-check`, `hello-python` y `hello-go`. El perfil obs baja cuatro imágenes más y no hace falta para esos checks.
 
 ## Métricas del compute plane
 
@@ -31,7 +31,7 @@ El endpoint es `GET /metrics`. Las etiquetas usan `function_id`. No hay `executi
 
 | Métrica | Tipo | Etiquetas | Qué mide |
 |---------|------|-----------|----------|
-| `nimbus_invocations_total` | counter | `function_id`, `status`, `mode` | Invocaciones que pasaron la admisión. `status` es `success`, `error`, `timeout`, `oom` o `cancelled`. `cancelled` es un `POST /executions/:id/cancel` que alcanzó a cortar el container (exit 130). `mode` es `sync` o `async`. |
+| `nimbus_invocations_total` | counter | `function_id`, `status`, `mode`, `runtime` | Invocaciones que pasaron la admisión. `status` es `success`, `error`, `timeout`, `oom` o `cancelled`. `cancelled` es un `POST /executions/:id/cancel` que alcanzó a cortar el container (exit 130). `mode` es `sync` o `async`. `runtime` es `nodejs20`, `python3.12` o `go1.x` (un valor vacío cuenta como `nodejs20`). El resto de las series no lleva `runtime`: tres valores en un solo counter alcanzan para partir el tráfico por lenguaje. |
 | `nimbus_errors_total` | counter | `function_id`, `mode` | El handler falló y no fue timeout ni OOM. |
 | `nimbus_timeouts_total` | counter | `function_id`, `mode` | Exit 124. |
 | `nimbus_ooms_total` | counter | `function_id`, `mode` | Exit 137, 134, o el texto de límite de memoria. |

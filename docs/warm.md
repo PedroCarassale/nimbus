@@ -4,7 +4,7 @@ Un invoke ya no tiene que pagar `docker run` cada vez. El compute plane deja viv
 
 ## Diseño
 
-El runtime (`runtime-node/bootstrap.js`) tiene dos modos.
+El runtime de Node (`runtime-node/bootstrap.js`) tiene dos modos. Python y Go hablan el mismo protocolo; el detalle de cada imagen está en [`runtimes.md`](runtimes.md).
 
 Sin `NIMBUS_WARM`, hace lo de antes: lee el evento de un archivo, llama al handler una vez, imprime el JSON y sale. Así siguen `scripts/run-zip.sh` y el camino frío.
 
@@ -26,7 +26,7 @@ El límite de ese canal: si el handler escribe directo al fd 1 con `fs.writeSync
 
 ## Aislamiento
 
-El container warm usa los mismos límites que el frío, y corre como el usuario `node` de la imagen (el camino frío sigue con el usuario de la imagen, root):
+El container warm usa los mismos límites que el frío, y corre como el usuario `node` de la imagen (uid 1000). En Node el camino frío sigue como root de la imagen. Python y Go bajan a `node` también en frío.
 
 - `--network=none`
 - `--read-only`
@@ -34,13 +34,13 @@ El container warm usa los mismos límites que el frío, y corre como el usuario 
 - `--cpus` si hay cuota
 - `--pids-limit=256`
 - `--user node`
-- `--tmpfs /tmp` chico, para que el usuario sin privilegios tenga un directorio escribible (`HOME=/tmp`)
+- `--tmpfs /tmp` chico, modo `1777`, para que el usuario sin privilegios tenga un directorio escribible (`HOME=/tmp`). El modo va explícito: en la imagen de Python `/tmp` nace en `755` y el uid 1000 no podría escribir.
 
 El código queda montado en `/var/task` de solo lectura. El evento no se escribe en el disco: viaja en el frame. El zip de una versión se extrae una vez por proceso, bajo `NIMBUS_WORK_DIR/warm-code`, y se reutiliza el directorio. Al apagar el proceso se borra. Si el proceso murió antes, el arranque limpia ese directorio y los containers con la etiqueta `nimbus.warm=1`.
 
 ## Qué container se reutiliza
 
-La clave es función + versión + handler + `memoryMb` + `cpus` + un hash de `envVars`. El timeout no entra: lo aplica Go desde afuera, y el mismo proceso puede atender plazos distintos.
+La clave es función + versión + `runtime` + handler + `memoryMb` + `cpus` + un hash de `envVars`. Un `runtime` vacío comparte el pool de `nodejs20`. El timeout no entra: lo aplica Go desde afuera, y el mismo proceso puede atender plazos distintos.
 
 Dos invokes con el mismo código pero distinto `GREETING`, otra memoria o otro handler no comparten container. Las variables quedan en el entorno del proceso desde el `docker run`; no se pueden cambiar sin arrancar otro.
 

@@ -21,7 +21,7 @@ El control plane (Nest, Postgres, consola) no guarda esta config todavía. Lo ar
 }
 ```
 
-`executionId`, `functionId` y `version` siguen siendo obligatorios. El resto es opcional y compatible con los clientes que ya existen (Nest hoy manda `timeoutSec`, `memoryMb` y `handler`; no manda `cpus` ni `envVars`).
+`executionId`, `functionId` y `version` siguen siendo obligatorios. El resto es opcional y compatible con los clientes que ya existen (Nest hoy manda `timeoutSec`, `memoryMb` y `handler`; no manda `cpus`, `envVars` ni `runtime`).
 
 | Campo | Tipo | Si falta o es 0 | Si viene un valor | Cómo se aplica |
 |-------|------|-----------------|-------------------|----------------|
@@ -29,6 +29,7 @@ El control plane (Nest, Postgres, consola) no guarda esta config todavía. Lo ar
 | `memoryMb` | entero | default del entorno | 64..2048 | `docker run --memory` y `--memory-swap` con el mismo valor (sin swap extra) |
 | `cpus` | número | default del entorno | 0.1..4 | `docker run --cpus`. Si el default también es vacío, no se pasa el flag |
 | `handler` | string | `handler` | ver abajo | `NIMBUS_HANDLER` dentro del container |
+| `runtime` | string | `nodejs20` | `nodejs20`, `python3.12`, `go1.x` | Imagen y bootstrap. Ver [runtimes.md](runtimes.md) |
 | `envVars` | objeto string→string | ninguna | límites de abajo | `docker run -e`. Los valores no se escriben en logs |
 | `maxConcurrency` | entero | `NIMBUS_FN_CONCURRENCY` | ver [concurrencia.md](concurrencia.md) | Solo la admisión de esa invocación |
 
@@ -43,7 +44,7 @@ Respuesta de error:
 }
 ```
 
-`field` es `timeoutSec`, `memoryMb`, `cpus`, `handler` o `envVars`. El texto de `error` no incluye valores de variables de entorno.
+`field` es `timeoutSec`, `memoryMb`, `cpus`, `handler`, `runtime` o `envVars`. El texto de `error` no incluye valores de variables de entorno.
 
 Un timeout que se cumple sigue respondiendo **504** con `exitCode` 124, como antes. Un fallo del handler o un OOM responden **200** con `success: false` y el `exitCode` real (137 si lo mató el cgroup, 134 si Node abortó por el heap).
 
