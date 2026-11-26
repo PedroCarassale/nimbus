@@ -18,6 +18,7 @@ import (
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/isolate"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/metrics"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/objects"
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/registry"
 	ntrace "github.com/PedroCarassale/nimbus/compute-plane/internal/trace"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/warm"
 	"github.com/go-chi/chi/v5"
@@ -64,7 +65,10 @@ func main() {
 	fnDefaults := fnconfig.LoadDefaults()
 	log.Printf("[compute-plane] Config por función: timeout=%ds memory=%dMB handler=%s cpus=%s",
 		fnDefaults.TimeoutSec, fnDefaults.MemoryMB, fnDefaults.Handler, fnDefaults.CPUsLabel())
+	workerID := registry.WorkerID()
+	workerURL := registry.WorkerURL(port)
 	concurrencyMgr := concurrency.NewManager(rdb, concCfg)
+	concurrencyMgr.SetWorkerID(workerID)
 	concurrencyMgr.StartSweeper()
 	iso, isoErr := isolate.Parse(os.Getenv("NIMBUS_ISOLATION"))
 	if isoErr != nil {
@@ -73,7 +77,7 @@ func main() {
 	log.Printf("[compute-plane] Aislamiento: %s", iso)
 	if iso == isolate.Firecracker {
 		firecracker.CleanupLeaked()
-	} else if err := warm.CleanupOrphans(ctx); err != nil {
+	} else if err := warm.CleanupOrphans(ctx, registry.WorkerID()); err != nil {
 		log.Printf("[compute-plane] No se pudieron limpiar containers warm anteriores: %v", err)
 	}
 	exec := executor.New(mc, rdb)
@@ -161,6 +165,12 @@ func main() {
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(requestBudget))
+	r.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Nimbus-Worker", workerID)
+			next.ServeHTTP(w, r)
+		})
+	})
 
 	r.Get("/health", handler.Health)
 	r.Head("/health", handler.Health)
@@ -179,6 +189,31 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
+	beatEvery := registry.DefaultInterval
+	if raw := os.Getenv("NIMBUS_HEARTBEAT_INTERVAL_MS"); raw != "" {
+		if n, err := time.ParseDuration(raw + "ms"); err == nil && n > 0 {
+			beatEvery = n
+		}
+	}
+	beatTTL := registry.DefaultTTL
+	if raw := os.Getenv("NIMBUS_HEARTBEAT_TTL_MS"); raw != "" {
+		if n, err := time.ParseDuration(raw + "ms"); err == nil && n > 0 {
+			beatTTL = n
+		}
+	}
+	beater := registry.Start(registry.New(rdb, beatTTL), func() registry.Snapshot {
+		active, err := concurrencyMgr.GlobalInUse(context.Background())
+		if err != nil {
+			active = 0
+		}
+		return registry.Snapshot{
+			ActiveExecutions: int(active),
+			MaxContainers:    concCfg.GlobalMax,
+			IdleWarmKeys:     exec.IdleWarmKeys(),
+		}
+	}, beatEvery, workerID, workerURL)
+	log.Printf("[compute-plane] Worker id=%s url=%s heartbeat=%s ttl=%s", workerID, workerURL, beatEvery, beatTTL)
+
 	go func() {
 		log.Printf("[compute-plane] Servidor HTTP escuchando en :%s", port)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -190,6 +225,7 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 	log.Println("[compute-plane] Apagando servidor...")
+	beater.Drain()
 
 	ctxShutdown, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -200,6 +236,7 @@ func main() {
 	if err := srv.Shutdown(ctxShutdown); err != nil {
 		log.Printf("[compute-plane] Error en shutdown: %v", err)
 	}
+	beater.Stop()
 	_ = stopTrace(context.Background())
 	exec.Shutdown(context.Background())
 

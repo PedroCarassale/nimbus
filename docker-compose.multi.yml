@@ -1,0 +1,137 @@
+# Segundo archivo de compose: scheduler + dos workers de compute.
+# `make up` no lo carga. `make up-multi` sí.
+#
+# El compute-plane único queda fuera de este perfil para no publicar
+# el mismo :8080. Nest apunta a http://scheduler:8080 y el contrato
+# HTTP no cambia. Los dos workers comparten Redis, Postgres y LocalStack,
+# y compiten por la misma cola SQS.
+
+services:
+  compute-plane:
+    profiles: ["single"]
+
+  control-plane:
+    environment:
+      COMPUTE_PLANE_URL: http://scheduler:8080
+    depends_on: !override
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      localstack-init:
+        condition: service_completed_successfully
+      scheduler:
+        condition: service_healthy
+
+  scheduler:
+    image: nimbus-compute:local
+    build:
+      context: ./compute-plane
+      dockerfile: Dockerfile
+    container_name: nimbus-scheduler
+    entrypoint: ["/app/scheduler"]
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      REDIS_URL: redis:6379
+      REDIS_PASSWORD: ""
+      NIMBUS_TIMEOUT_SEC: ${NIMBUS_TIMEOUT_SEC:-5}
+      NIMBUS_MEMORY_MB: ${NIMBUS_MEMORY_MB:-128}
+      NIMBUS_HANDLER: ${NIMBUS_HANDLER:-handler}
+      NIMBUS_CPUS: ${NIMBUS_CPUS:-}
+      NIMBUS_FN_QUEUE_WAIT_SEC: ${NIMBUS_FN_QUEUE_WAIT_SEC:-30}
+      NIMBUS_HEARTBEAT_TTL_MS: ${NIMBUS_HEARTBEAT_TTL_MS:-6000}
+      NIMBUS_TRACING: ${NIMBUS_TRACING:-1}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318}
+      OTEL_SERVICE_NAME: nimbus-scheduler
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # La imagen se construye una sola vez (servicio scheduler).
+  # Tres builds en paralelo contra el mismo tag fallan con "already exists".
+  compute-worker-1: &compute-worker
+    image: nimbus-compute:local
+    container_name: nimbus-compute-worker-1
+    environment: &worker-env
+      PORT: "8080"
+      REDIS_URL: redis:6379
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+      S3_BUCKET: ${S3_BUCKET:-nimbus-artifacts}
+      S3_ENDPOINT: http://localstack:4566
+      S3_FORCE_PATH_STYLE: "true"
+      SQS_ENDPOINT: http://localstack:4566
+      SQS_QUEUE_URL: http://localstack:4566/queue/us-east-1/000000000000/nimbus-async-jobs
+      SQS_DLQ_URL: http://localstack:4566/queue/us-east-1/000000000000/nimbus-async-dlq
+      NIMBUS_ASYNC_BACKEND: sqs
+      NIMBUS_IMAGE: nimbus-node
+      NIMBUS_WORK_DIR: /tmp/nimbus-work
+      NIMBUS_TIMEOUT_SEC: ${NIMBUS_TIMEOUT_SEC:-5}
+      NIMBUS_MEMORY_MB: ${NIMBUS_MEMORY_MB:-128}
+      NIMBUS_HANDLER: ${NIMBUS_HANDLER:-handler}
+      NIMBUS_CPUS: ${NIMBUS_CPUS:-}
+      NIMBUS_FN_CONCURRENCY: ${NIMBUS_FN_CONCURRENCY:-2}
+      NIMBUS_FN_QUEUE_MAX: ${NIMBUS_FN_QUEUE_MAX:-32}
+      NIMBUS_FN_QUEUE_WAIT_SEC: ${NIMBUS_FN_QUEUE_WAIT_SEC:-30}
+      NIMBUS_MAX_CONTAINERS: ${NIMBUS_MAX_CONTAINERS:-8}
+      NIMBUS_SLOT_LEASE_SEC: ${NIMBUS_SLOT_LEASE_SEC:-30}
+      NIMBUS_WARM: ${NIMBUS_WARM:-1}
+      NIMBUS_WARM_IDLE_SEC: ${NIMBUS_WARM_IDLE_SEC:-60}
+      NIMBUS_ASYNC_ENABLED: ${NIMBUS_ASYNC_ENABLED:-1}
+      NIMBUS_ASYNC_MAX_ATTEMPTS: ${NIMBUS_ASYNC_MAX_ATTEMPTS:-3}
+      NIMBUS_ASYNC_BACKOFF_BASE_MS: ${NIMBUS_ASYNC_BACKOFF_BASE_MS:-500}
+      NIMBUS_ASYNC_BACKOFF_MAX_MS: ${NIMBUS_ASYNC_BACKOFF_MAX_MS:-30000}
+      NIMBUS_ASYNC_BACKOFF_JITTER_MS: ${NIMBUS_ASYNC_BACKOFF_JITTER_MS:-250}
+      NIMBUS_ASYNC_CLAIM_IDLE_MS: ${NIMBUS_ASYNC_CLAIM_IDLE_MS:-20000}
+      NIMBUS_ASYNC_LOCK_MS: ${NIMBUS_ASYNC_LOCK_MS:-15000}
+      # Un receptor por proceso: mientras corre un job, el otro worker
+      # puede tomar el siguiente mensaje de la misma cola SQS.
+      NIMBUS_ASYNC_WORKERS: ${NIMBUS_ASYNC_WORKERS:-1}
+      NIMBUS_TRACING: ${NIMBUS_TRACING:-1}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318}
+      OTEL_SERVICE_NAME: nimbus-compute-worker-1
+      NIMBUS_WORKER_ID: compute-worker-1
+      NIMBUS_WORKER_URL: http://compute-worker-1:8080
+      NIMBUS_HEARTBEAT_INTERVAL_MS: ${NIMBUS_HEARTBEAT_INTERVAL_MS:-2000}
+      NIMBUS_HEARTBEAT_TTL_MS: ${NIMBUS_HEARTBEAT_TTL_MS:-6000}
+    depends_on:
+      scheduler:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      localstack-init:
+        condition: service_completed_successfully
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/nimbus-work:/tmp/nimbus-work
+      - ./runtime-node:/app/runtime-node:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  compute-worker-2:
+    <<: *compute-worker
+    container_name: nimbus-compute-worker-2
+    environment:
+      <<: *worker-env
+      OTEL_SERVICE_NAME: nimbus-compute-worker-2
+      NIMBUS_WORKER_ID: compute-worker-2
+      NIMBUS_WORKER_URL: http://compute-worker-2:8080

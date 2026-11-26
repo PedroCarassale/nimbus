@@ -822,6 +822,19 @@ func writeTraceLog(ctx context.Context, logWriter *logs.StreamWriter) {
 	logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] traceId=%s traceparent=%s", id, ntrace.Header(ctx)))
 }
 
+// IdleWarmKeys are the affinity tokens of idle warm sandboxes.
+// The heartbeat publishes them so the scheduler can prefer this process.
+func (e *Executor) IdleWarmKeys() []string {
+	if e == nil || e.pool == nil {
+		return []string{}
+	}
+	keys := e.pool.IdleKeys()
+	if keys == nil {
+		return []string{}
+	}
+	return keys
+}
+
 // WarmPool reports idle and busy warm containers for the metrics scrape.
 func (e *Executor) WarmPool() []metrics.WarmSample {
 	if e == nil || e.pool == nil {

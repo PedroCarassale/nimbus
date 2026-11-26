@@ -656,3 +656,40 @@ El contrato queda en `docs/async.md`.
 
 **Validación y Corrección Humana:** Riesgos que quedan en el diseño: SQS mide la visibilidad en segundos enteros, así que un backoff de 400 ms espera 1 s. `maxReceiveCount` se graba al crear la cola; cambiar `NIMBUS_ASYNC_MAX_ATTEMPTS` después no lo mueve solo. LocalStack puede sumar `ApproximateReceiveCount` en un poll que el cliente no ve, y la `RedrivePolicy` mueve el mensaje con ese contador, no con los intentos que el worker llegó a ejecutar. `GET /dlq` recibe los mensajes unos segundos y les devuelve la visibilidad a 0: en esa ventana otro lector no los ve. Las credenciales del compose son `test`/`test`, las de LocalStack. Nest solo cambia la configuración del cliente S3; el enqueue async sigue en Go. El backend `redis` queda para los tests y como alternativa si se setea la variable.
 
+---
+
+## Paso 7b — Varios workers de compute y scheduler
+
+**Problema abordado:** El compute plane era un solo proceso. Hacía falta correr varios workers y un scheduler que reparte el mismo contrato HTTP (`POST /executions`, cancel, async, DLQ, health, metrics) para que Nest no cambie de código: en ese modo solo apunta `COMPUTE_PLANE_URL` al scheduler. `make up` de un solo worker tenía que seguir igual.
+
+**Prompt / Herramienta utilizada:** Cursor Cloud Agent (Grok 4.7). Pedido de Paso 7b, varios workers de compute y scheduler, en un PR apilado sobre LocalStack (PR #21, rama `cursor/paso-7a-localstack-9b60`).
+
+**Código / Arquitectura generada:**
+
+1. **Registro en Redis**
+   - Cada worker publica `nimbus:worker:{id}` cada 2 s con TTL 6 s: id, URL, ejecuciones activas, tope de containers, claves warm ociosas (`functionId:version:runtime:configHash`) y `state` `healthy` o `draining`.
+   - `NIMBUS_WORKER_ID` default es el hostname. `NIMBUS_WORKER_URL` es la base a la que el scheduler hace dial.
+   - `SIGTERM` publica `draining`, termina lo que está en curso y borra la key. Un `SIGKILL` deja que venza el TTL.
+   - Al admitir o encolar, el script de concurrencia guarda `workerId` en `nimbus:exec:{executionId}`. Las respuestas llevan `X-Nimbus-Worker`.
+   - Si el proceso se está apagando, el worker async no confirma el mensaje de SQS: lo deja pendiente para que el siguiente receive lo corra. Confirmarlo en el mismo momento en que Redis también se reinicia perdía el resultado.
+
+2. **Scheduler (`compute-plane/cmd/scheduler`)**
+   - Mismos paths que el compute plane, más `GET /workers`.
+   - `POST /executions`: workers sanos con lugar; si alguno anuncia la clave warm de ese request, ese; si no, el de menor `active / maxContainers` (empate: menos active). Las rutas ya entregadas y todavía abiertas se suman al active del heartbeat, porque el heartbeat va 2 s atrás.
+   - Si el dial falla antes de una respuesta HTTP, un solo reintento contra otro worker sano. Si no hay, 503. Un status del worker no se reintenta.
+   - Cancel: reenvío al `workerId` de la ejecución. Si no está, pregunta a los workers que siguen vivos.
+   - Async, DLQ y redrive van a cualquier worker sano. Los dos procesos leen la misma cola SQS.
+   - Span `scheduler.route`, `traceparent` propagado, métricas `nimbus_scheduler_routes_total{worker,reason}` y `nimbus_scheduler_workers_healthy`.
+
+3. **Compose**
+   - `docker-compose.multi.yml` y `make up-multi` / `make down-multi`: scheduler en `:8080`, `compute-worker-1` y `compute-worker-2`, Redis, Postgres y LocalStack compartidos. El compute plane único no arranca en ese archivo. Nest queda en `http://scheduler:8080`.
+   - Cada worker etiqueta sus containers warm y extrae el zip en su propio directorio, para no pisar el pool del otro sobre el mismo daemon.
+   - `make cluster-check` cubre el listado, el reparto, la afinidad warm, el burst async, el cancel en el worker que corre la ejecución, y el `SIGKILL` con el TTL.
+
+4. **Nest**
+   - Sin cambio de código. El cliente sigue siendo `COMPUTE_PLANE_URL`.
+
+El contrato queda en `docs/cluster-scheduler.md`.
+
+**Validación y Corrección Humana:** Riesgos que quedan en el diseño: el heartbeat puede ir hasta 2 s atrás; el contador en vuelo del scheduler evita que un burst caiga en un solo worker, y puede contar de más cuando el heartbeat ya incluye esa ejecución. El reintento es solo ante un error de dial y solo una vez: si el worker leyó el body y se cortó la conexión antes del status, ese intento puede duplicarse. El semáforo por función sigue siendo una sola key de Redis para todo el cluster; `NIMBUS_MAX_CONTAINERS` es de cada proceso. Un `SIGKILL` no marca `draining`: el scheduler lo saca cuando vence el TTL. Dos workers comparten el socket de Docker del host.
+

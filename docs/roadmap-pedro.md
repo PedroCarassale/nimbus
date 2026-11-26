@@ -8,6 +8,9 @@ En orden sugerido. Cada paso es un PR chico contra `main`.
 ```
 compute-plane/
   cmd/server/main.go            # servidor HTTP (chi) en :8080
+  cmd/scheduler/main.go         # mismo contrato, reparte entre workers
+  internal/registry/            # heartbeats en Redis
+  internal/scheduler/           # afinidad warm, menor carga, failover, cancel
   internal/handlers/            # POST /executions, POST /executions/:id/cancel, GET /health
   internal/fnconfig/            # timeout, memoria, CPU, handler y envVars por invocación
   internal/executor/            # baja el zip de S3, lo extrae y corre docker
@@ -26,6 +29,7 @@ compute-plane/
 - Cancelar una ejecución que ya corre mata el container (frío y warm). El warm no vuelve al pool. Un async cancelado no se reintenta ni va a la DLQ; la fila queda en `ERROR` con `Ejecución cancelada` porque Prisma no tiene `CANCELLED`. Las keys `nimbus:slots:machine:{host}` de un proceso muerto se borran cuando sus leases vencen.
 - Hay tres runtimes: `nodejs20` (default), `python3.12` y `go1.x` (binario estático en el zip). `POST /executions` acepta `runtime`. La clave del pool warm lo incluye. Nest todavía no lo persiste ni lo reenvía. Detalle en [`runtimes.md`](runtimes.md).
 - El aislamiento por defecto sigue siendo Docker. `NIMBUS_ISOLATION=firecracker` usa microVMs con el mismo contrato (one-shot, warm, timeout, memoria, logs, cancel). Detalle en [`firecracker.md`](firecracker.md).
+- Varios workers anuncian heartbeats en Redis y un scheduler en Go reparte `POST /executions` (afinidad warm, menor carga, un reintento si el dial falla). Nest no cambia: `COMPUTE_PLANE_URL` apunta al scheduler. `make up` sigue con un solo proceso. Detalle en [`cluster-scheduler.md`](cluster-scheduler.md).
 
 ### Paso 0 — Base estable
 - [x] Correr `make up` + `make hello` con Docker real y arreglar lo que rompa.
@@ -70,7 +74,7 @@ Detalle de métricas, puertos y variables: [`observabilidad.md`](observabilidad.
 
 ### Paso 7 — Deploy real (más adelante)
 - [x] S3 real / LocalStack. El compose usa `localstack/localstack` (S3 + SQS). Con `S3_ENDPOINT` vacío el mismo cliente habla con Amazon S3. La cola async puede ir a SQS con DLQ nativa. Detalle en [`localstack-aws.md`](localstack-aws.md).
-- [ ] Varios workers de compute en distintas máquinas, con scheduler.
+- [x] Varios workers de compute en distintas máquinas, con scheduler. Detalle en [`cluster-scheduler.md`](cluster-scheduler.md).
 
 ## Contrato Nest ↔ Go
 

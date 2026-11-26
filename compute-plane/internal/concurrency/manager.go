@@ -44,6 +44,7 @@ type Manager struct {
 	rdb       *redis.Client
 	cfg       Config
 	machineID string
+	workerID  string
 	now       func() time.Time
 
 	mu    sync.Mutex
@@ -84,6 +85,15 @@ func NewManager(rdb *redis.Client, cfg Config) *Manager {
 		stops:     make(map[string]context.CancelFunc),
 		sweepStop: make(chan struct{}),
 	}
+}
+
+// SetWorkerID records this process on nimbus:exec:{id} when a request is
+// admitted or queued. Empty leaves the hash unchanged.
+func (m *Manager) SetWorkerID(id string) {
+	if m == nil {
+		return
+	}
+	m.workerID = id
 }
 
 func machineID() string {
@@ -300,6 +310,7 @@ func (m *Manager) admit(ctx context.Context, functionID, executionID string, lim
 		m.cfg.QueueLease.Milliseconds(),
 		m.metaTTL().Milliseconds(),
 		"nimbus:exec:",
+		m.workerID,
 	).Result()
 	if err != nil {
 		return "", fmt.Errorf("admit: %w", err)

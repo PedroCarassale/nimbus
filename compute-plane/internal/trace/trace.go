@@ -117,6 +117,11 @@ func ExtractHTTP(ctx context.Context, header http.Header) context.Context {
 	return otel.GetTextMapPropagator().Extract(ctx, propagation.HeaderCarrier(header))
 }
 
+// InjectHTTP writes the W3C traceparent of ctx onto an outgoing request.
+func InjectHTTP(ctx context.Context, header http.Header) {
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(header))
+}
+
 // Continue attaches a remote parent stored in Redis (or anywhere else) to ctx.
 // Cancellation and values of ctx are preserved.
 func Continue(ctx context.Context, traceparent, tracestate string) context.Context {

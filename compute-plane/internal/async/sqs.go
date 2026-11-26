@@ -285,6 +285,15 @@ func (s *SQSQueue) Extend(ctx context.Context, d Delivery) error {
 	return s.changeVisibility(ctx, s.jobsURL, d.ReceiptHandle, visibilitySeconds(s.Config().ClaimIdle))
 }
 
+// Abandon returns the message to the queue immediately. A zero timeout is
+// visible at once. The caller passes a context that outlives shutdown.
+func (s *SQSQueue) Abandon(ctx context.Context, d Delivery) error {
+	if d.ReceiptHandle == "" {
+		return nil
+	}
+	return s.changeVisibility(ctx, s.jobsURL, d.ReceiptHandle, 0)
+}
+
 func (s *SQSQueue) Postpone(ctx context.Context, d Delivery, job Job, delay time.Duration, st State) error {
 	if err := s.SaveState(ctx, job.InvocationID, st); err != nil {
 		return err

@@ -15,8 +15,10 @@ RUN go mod download
 # Copiar código fuente
 COPY . .
 
-# Compilar binario estático
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /compute-plane ./cmd/server
+# Compilar binarios estáticos. El scheduler comparte la imagen y
+# compose lo arranca con /app/scheduler.
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /compute-plane ./cmd/server \
+ && CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /scheduler ./cmd/scheduler
 
 # --- Runtime ---
 # alpine 3.21 ships docker-cli 27.x, which can talk to Docker Engine 27–29.
@@ -34,6 +36,7 @@ WORKDIR /app
 
 # Copiar binario compilado
 COPY --from=builder /compute-plane /app/compute-plane
+COPY --from=builder /scheduler /app/scheduler
 
 # Puerto por defecto.
 # NIMBUS_WORK_DIR se monta en el host con el mismo path (ver docker-compose).

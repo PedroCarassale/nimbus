@@ -233,6 +233,53 @@ func TestWorkerCrashCountsAttemptAndClaimDoesNotDoubleRun(t *testing.T) {
 	}
 }
 
+func TestWorkerShutdownLeavesTheMessagePending(t *testing.T) {
+	cq := newClockQueue(t, Config{MaxAttempts: 3, ClaimIdle: time.Millisecond})
+	ctx := context.Background()
+	if _, _, err := cq.q.Enqueue(ctx, "inv-1", "exec-1", jobBody(t, "exec-1")); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := cq.q.Read(ctx, 5, -1)
+	if err != nil || len(msgs) != 1 {
+		t.Fatal(err)
+	}
+	shut, cancel := context.WithCancel(ctx)
+	started := make(chan struct{})
+	var calls atomic.Int32
+	worker := NewWorker(cq.q, func(ctx context.Context, _ json.RawMessage) RunResult {
+		calls.Add(1)
+		close(started)
+		<-ctx.Done()
+		return RunResult{Kind: KindOK, Output: map[string]any{"ok": true}, DurationMs: 10}
+	})
+	done := make(chan struct{})
+	go func() {
+		worker.Handle(shut, msgs[0])
+		close(done)
+	}()
+	<-started
+	cancel()
+	<-done
+	if calls.Load() != 1 {
+		t.Fatalf("calls=%d", calls.Load())
+	}
+	st, err := cq.q.LoadState(ctx, "inv-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Phase == PhaseSucceeded || st.Result != nil {
+		t.Fatalf("shutdown acked the job: %+v", st)
+	}
+	time.Sleep(2 * time.Millisecond)
+	claimed, err := cq.q.Claim(ctx, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 || claimed[0].Job.InvocationID != "inv-1" {
+		t.Fatalf("pending after shutdown: %+v", claimed)
+	}
+}
+
 func TestWorkerTimeoutReachesDLQ(t *testing.T) {
 	cq := newClockQueue(t, Config{MaxAttempts: 1})
 	worker := NewWorker(cq.q, func(context.Context, json.RawMessage) RunResult {
