@@ -169,6 +169,9 @@ func (q *Queue) Fork(name string) Backend { return q.WithConsumer(name) }
 // Extend is a no-op on Redis. SQS refreshes the visibility timeout here.
 func (q *Queue) Extend(context.Context, Delivery) error { return nil }
 
+// Abandon leaves the Redis stream entry pending. The next claim takes it.
+func (q *Queue) Abandon(context.Context, Delivery) error { return nil }
+
 // Postpone records the retry and acks the stream entry. SQS changes
 // visibility instead of acking, so the same message is received again.
 func (q *Queue) Postpone(ctx context.Context, d Delivery, job Job, delay time.Duration, st State) error {

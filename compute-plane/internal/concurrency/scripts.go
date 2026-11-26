@@ -7,7 +7,10 @@ import "github.com/redis/go-redis/v9"
 // KEYS: slots, queue, global, exec hash, fifo sequence
 // ARGV: executionId, functionId, maxConcurrency, queueMax, globalMax,
 //
-//	nowMs, leaseMs, queueLeaseMs, metaTTLMs, execKeyPrefix
+//	nowMs, leaseMs, queueLeaseMs, metaTTLMs, execKeyPrefix, workerId
+//
+// workerId may be empty. When it is set, acquired and queued hashes record
+// it so a scheduler can cancel on the worker that holds the request.
 //
 // Reply: {status, position} where status is acquired, queued, rejected, or cancelled.
 const admitLua = `
@@ -22,6 +25,10 @@ local lease = tonumber(ARGV[7])
 local queueLease = tonumber(ARGV[8])
 local metaTTL = tonumber(ARGV[9])
 local execPrefix = ARGV[10]
+local workerId = ARGV[11]
+if not workerId or workerId == false then
+  workerId = ''
+end
 local expiry = now + lease
 
 local function as_array(v)
@@ -60,6 +67,12 @@ local function present(v)
   return v and v ~= false
 end
 
+local function tag_worker()
+  if workerId ~= '' then
+    redis.call('HSET', execKey, 'workerId', workerId)
+  end
+end
+
 sweep_slots()
 
 -- created is true only when this call inserted the hash. A reservation that
@@ -85,6 +98,7 @@ if present(redis.call('ZSCORE', slots, executionId)) then
   redis.call('ZADD', global, tostring(expiry), executionId)
   redis.call('ZREM', queue, executionId)
   redis.call('HSET', execKey, 'status', 'running')
+  tag_worker()
   return {'acquired', '0'}
 end
 
@@ -110,6 +124,7 @@ if room and fair then
   redis.call('ZADD', global, tostring(expiry), executionId)
   redis.call('HSET', execKey, 'status', 'running')
   redis.call('HSET', execKey, 'startedAt', tostring(now))
+  tag_worker()
   return {'acquired', '0'}
 end
 
@@ -126,6 +141,8 @@ if not inQueue then
   redis.call('HSET', execKey, 'status', 'queued')
   redis.call('HSET', execKey, 'enqueuedAt', tostring(now))
 end
+
+tag_worker()
 
 local pos = redis.call('ZRANK', queue, executionId)
 if not pos or pos == false then

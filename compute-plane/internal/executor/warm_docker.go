@@ -19,6 +19,7 @@ import (
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/cancel"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/fnconfig"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/isolate"
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/registry"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/runtime"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/warm"
 )
@@ -65,6 +66,7 @@ func dockerWarmArgs(name, workDir, image string, cfg fnconfig.Resolved, function
 		"run", "-i",
 		"--name", name,
 		"--label", "nimbus.warm=1",
+		"--label", "nimbus.worker=" + labelValue(registry.WorkerID()),
 		"--label", "nimbus.functionId=" + labelValue(functionID),
 		"--label", "nimbus.version=" + labelValue(version),
 		fmt.Sprintf("--memory=%dm", cfg.MemoryMB),

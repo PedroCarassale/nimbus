@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/logs"
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/registry"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/runtime"
 	ntrace "github.com/PedroCarassale/nimbus/compute-plane/internal/trace"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/warm"
@@ -234,12 +235,34 @@ func (e *Executor) codeLock(key string) *sync.Mutex {
 	return m
 }
 
+func workerSegment(id string) string {
+	if id == "" {
+		return "local"
+	}
+	var b strings.Builder
+	for _, r := range id {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	s := strings.Trim(b.String(), ".-")
+	if s == "" {
+		return "local"
+	}
+	return s
+}
+
 func warmCodeRoot() (string, error) {
 	parent := os.Getenv("NIMBUS_WORK_DIR")
 	if parent == "" {
 		parent = os.TempDir()
 	}
-	dir := filepath.Join(parent, "warm-code")
+	// Each worker keeps its own tree. Two processes sharing NIMBUS_WORK_DIR
+	// must not wipe or reuse each other's extracted zips.
+	dir := filepath.Join(parent, "warm-code", workerSegment(registry.WorkerID()))
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("creando directorio de trabajo: %w", err)
 	}

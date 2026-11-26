@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -77,6 +78,7 @@ type slot struct {
 	id         string
 	key        string
 	functionID string
+	affinity   string
 	session    Session
 	busy       bool
 	lastUsed   time.Time
@@ -224,6 +226,7 @@ func (p *Pool) reserve(spec Spec) (*slot, bool, error) {
 				id:         newID(),
 				key:        spec.Key,
 				functionID: spec.FunctionID,
+				affinity:   AffinityKey(spec.FunctionID, spec.Version, spec.Config),
 				busy:       true,
 			}
 			p.slots[created.id] = created
@@ -396,6 +399,31 @@ func (p *Pool) Usage() map[string]FunctionUsage {
 		}
 		out[s.functionID] = u
 	}
+	return out
+}
+
+// IdleKeys lists affinity tokens of sessions waiting for work.
+// Busy slots and reservations that have not finished starting are omitted.
+// The scheduler matches these against AffinityKey of the next request.
+func (p *Pool) IdleKeys() []string {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	seen := map[string]struct{}{}
+	out := make([]string, 0)
+	for _, s := range p.slots {
+		if s.busy || s.session == nil || s.affinity == "" {
+			continue
+		}
+		if _, ok := seen[s.affinity]; ok {
+			continue
+		}
+		seen[s.affinity] = struct{}{}
+		out = append(out, s.affinity)
+	}
+	sort.Strings(out)
 	return out
 }
 

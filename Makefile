@@ -10,9 +10,10 @@
 #   make logs    — Muestra logs de todos los servicios
 #   make console — Abre la consola web en el navegador
 
-.PHONY: up down hello hello-python hello-go smoke load config-check warm-check async-check runtime-check localstack-check obs obs-check qa logs build clean wait-healthy help up-fc fc-prepare fc-check
+.PHONY: up down hello hello-python hello-go smoke load config-check warm-check async-check runtime-check localstack-check obs obs-check qa logs build clean wait-healthy help up-fc fc-prepare fc-check up-multi down-multi wait-healthy-multi cluster-check
 
 COMPOSE_FC := docker compose -f docker-compose.yml -f docker-compose.firecracker.yml
+COMPOSE_MULTI := docker compose -f docker-compose.yml -f docker-compose.multi.yml
 
 # Variables
 COMPOSE := docker compose
@@ -53,6 +54,86 @@ down: ## Detiene y limpia el stack
 	@echo "$(YELLOW)>>> Deteniendo stack...$(NC)"
 	$(COMPOSE) down
 	@echo "$(GREEN)>>> Stack detenido$(NC)"
+
+up-multi: ## Scheduler + 2 workers (Redis, Postgres y LocalStack compartidos)
+	@echo "$(YELLOW)>>> Levantando stack multi-worker...$(NC)"
+	@mkdir -p $(WORK_DIR)
+	@chmod 1777 $(WORK_DIR)
+	@echo "$(YELLOW)>>> Construyendo imágenes de runtime (node, python, go)...$(NC)"
+	docker build -t nimbus-node ./runtime-node
+	docker build -t nimbus-python ./runtime-python
+	docker build -t nimbus-go ./runtime-go
+	$(COMPOSE_MULTI) up -d --build
+	@echo "$(YELLOW)>>> Esperando scheduler, workers, control plane y consola...$(NC)"
+	@$(MAKE) wait-healthy-multi
+	@echo "$(GREEN)>>> Cluster listo. Scheduler en $(COMPUTE_URL)  Control plane en $(API_URL)$(NC)"
+
+down-multi: ## Detiene el stack multi-worker
+	@echo "$(YELLOW)>>> Deteniendo stack multi-worker...$(NC)"
+	$(COMPOSE_MULTI) down
+	@ids=$$(docker ps -aq --filter name=nimbus-); \
+	if [ -n "$$ids" ]; then docker rm -f $$ids >/dev/null; fi
+	@echo "$(GREEN)>>> Stack multi-worker detenido$(NC)"
+
+wait-healthy-multi: ## Espera scheduler, dos workers healthy, control plane y consola
+	@echo "Esperando scheduler..."
+	@for i in $$(seq 1 120); do \
+		if curl -sf $(COMPUTE_URL)/health >/dev/null 2>&1; then \
+			echo "$(GREEN)  ✓ Scheduler listo$(NC)"; \
+			break; \
+		fi; \
+		if [ $$i -eq 120 ]; then \
+			echo "$(RED)  ✗ Timeout esperando scheduler$(NC)"; \
+			$(COMPOSE_MULTI) logs --no-color scheduler || true; \
+			exit 1; \
+		fi; \
+		sleep 1; \
+	done
+	@echo "Esperando 2 workers healthy..."
+	@for i in $$(seq 1 90); do \
+		n=$$(curl -sf $(COMPUTE_URL)/workers | jq '[.workers[] | select(.state=="healthy")] | length' 2>/dev/null || echo 0); \
+		if [ "$$n" = "2" ]; then \
+			echo "$(GREEN)  ✓ 2 workers healthy$(NC)"; \
+			break; \
+		fi; \
+		if [ $$i -eq 90 ]; then \
+			echo "$(RED)  ✗ Timeout esperando workers (había $$n)$(NC)"; \
+			curl -sS $(COMPUTE_URL)/workers || true; \
+			$(COMPOSE_MULTI) logs --no-color compute-worker-1 compute-worker-2 || true; \
+			exit 1; \
+		fi; \
+		sleep 1; \
+	done
+	@echo "Esperando control-plane..."
+	@for i in $$(seq 1 180); do \
+		if curl -sf $(API_URL)/health >/dev/null 2>&1; then \
+			echo "$(GREEN)  ✓ Control plane listo$(NC)"; \
+			break; \
+		fi; \
+		if [ $$i -eq 180 ]; then \
+			echo "$(RED)  ✗ Timeout esperando control-plane$(NC)"; \
+			$(COMPOSE_MULTI) logs --no-color control-plane scheduler || true; \
+			exit 1; \
+		fi; \
+		sleep 1; \
+	done
+	@echo "Esperando consola..."
+	@for i in $$(seq 1 90); do \
+		if curl -sf $(CONSOLE_URL)/ >/dev/null 2>&1; then \
+			echo "$(GREEN)  ✓ Consola lista$(NC)"; \
+			break; \
+		fi; \
+		if [ $$i -eq 90 ]; then \
+			echo "$(RED)  ✗ Timeout esperando consola$(NC)"; \
+			$(COMPOSE_MULTI) logs --no-color console || true; \
+			exit 1; \
+		fi; \
+		sleep 1; \
+	done
+
+cluster-check: ## Distribución, afinidad warm, async, cancel y failover del scheduler
+	@echo "$(YELLOW)>>> Prueba del cluster (scheduler + workers)...$(NC)"
+	@./scripts/cluster-check.sh
 
 down-clean: ## Detiene el stack y elimina volúmenes
 	@echo "$(YELLOW)>>> Deteniendo stack y limpiando volúmenes...$(NC)"
