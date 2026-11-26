@@ -153,11 +153,101 @@ func (q *Queue) Claim(ctx context.Context, count int) ([]Delivery, error) {
 	return parseMessages(msgs), nil
 }
 
-func (q *Queue) Ack(ctx context.Context, id string) error {
-	if id == "" {
+func (q *Queue) Ack(ctx context.Context, d Delivery) error {
+	if d.ID == "" {
 		return nil
 	}
-	return q.rdb.XAck(ctx, streamJobs, groupWorkers, id).Err()
+	return q.rdb.XAck(ctx, streamJobs, groupWorkers, d.ID).Err()
+}
+
+func (q *Queue) Consumer() string { return q.consumer }
+
+// Fork returns a Redis consumer with its own name. SQS overrides this so a
+// forked worker keeps the SQS client.
+func (q *Queue) Fork(name string) Backend { return q.WithConsumer(name) }
+
+// Extend is a no-op on Redis. SQS refreshes the visibility timeout here.
+func (q *Queue) Extend(context.Context, Delivery) error { return nil }
+
+// Postpone records the retry and acks the stream entry. SQS changes
+// visibility instead of acking, so the same message is received again.
+func (q *Queue) Postpone(ctx context.Context, d Delivery, job Job, delay time.Duration, st State) error {
+	if err := q.ScheduleRetry(ctx, job, delay, st); err != nil {
+		return err
+	}
+	return q.Ack(ctx, d)
+}
+
+// SealFailed stores a terminal state that must not enter the DLQ (validation
+// or an explicit cancel) and acks the delivery.
+func (q *Queue) SealFailed(ctx context.Context, d Delivery, st State) error {
+	if err := q.CommitTerminal(ctx, d.Job.InvocationID, st, nil); err != nil {
+		return err
+	}
+	return q.Ack(ctx, d)
+}
+
+// SealDead stores the DLQ entry and acks the stream message. SQS leaves the
+// message in place so the queue redrive policy can move it.
+func (q *Queue) SealDead(ctx context.Context, d Delivery, st State, entry DLQEntry) error {
+	if err := q.CommitTerminal(ctx, d.Job.InvocationID, st, &entry); err != nil {
+		return err
+	}
+	return q.Ack(ctx, d)
+}
+
+// Reserve records the invocation as accepted without publishing it. The SQS
+// backend sends the message itself. A duplicate invocation returns the
+// original execution id.
+func (q *Queue) Reserve(ctx context.Context, invocationID, executionID string, job Job) (string, bool, error) {
+	jobJSON, err := json.Marshal(job)
+	if err != nil {
+		return "", false, err
+	}
+	stJSON, err := json.Marshal(State{Phase: PhaseQueued, EnqueuedAt: job.EnqueuedAt})
+	if err != nil {
+		return "", false, err
+	}
+	meta := peekBody(job.Body)
+	res, err := reserveScript.Run(ctx, q.rdb, []string{
+		acceptKey(invocationID),
+		stateKey(invocationID),
+		execKey(executionID),
+	}, executionID, string(jobJSON), string(stJSON), meta.FunctionID, job.EnqueuedAt, pendingExecTTL.Milliseconds()).Result()
+	if err != nil {
+		return "", false, err
+	}
+	status, stored, err := twoStrings(res)
+	if err != nil {
+		return "", false, err
+	}
+	return stored, status == "duplicate", nil
+}
+
+// ReleaseAccept forgets an accept that never made it onto the transport.
+func (q *Queue) ReleaseAccept(ctx context.Context, invocationID string) error {
+	return q.rdb.Del(ctx, acceptKey(invocationID)).Err()
+}
+
+// TouchPending recreates the cancel hash when a redrive finds it expired.
+func (q *Queue) TouchPending(ctx context.Context, executionID, functionID string) error {
+	if executionID == "" {
+		return nil
+	}
+	key := execKey(executionID)
+	n, err := q.rdb.Exists(ctx, key).Result()
+	if err != nil || n > 0 {
+		return err
+	}
+	if err := q.rdb.HSet(ctx, key,
+		"functionId", functionID,
+		"status", "pending",
+		"cancelled", "false",
+		"heartbeat", q.Now().UnixMilli(),
+	).Err(); err != nil {
+		return err
+	}
+	return q.rdb.PExpire(ctx, key, pendingExecTTL).Err()
 }
 
 // PromoteDue moves due retries back onto the job stream.
@@ -464,6 +554,24 @@ const pendingExecTTL = 24 * time.Hour
 // see a job that is still waiting for a worker.
 func execKey(executionID string) string { return "nimbus:exec:" + executionID }
 
+const reserveLua = `
+local existing = redis.call('GET', KEYS[1])
+if existing and existing ~= false then
+  return {'duplicate', existing}
+end
+if redis.call('EXISTS', KEYS[3]) == 0 then
+  redis.call('HSET', KEYS[3],
+    'functionId', ARGV[4],
+    'status', 'pending',
+    'cancelled', 'false',
+    'heartbeat', tostring(ARGV[5]))
+  redis.call('PEXPIRE', KEYS[3], ARGV[6])
+end
+redis.call('SET', KEYS[1], ARGV[1])
+redis.call('SET', KEYS[2], ARGV[3])
+return {'ok', ARGV[1]}
+`
+
 const enqueueLua = `
 local existing = redis.call('GET', KEYS[1])
 if existing and existing ~= false then
@@ -556,6 +664,7 @@ return raw
 `
 
 var (
+	reserveScript     = redis.NewScript(reserveLua)
 	enqueueScript     = redis.NewScript(enqueueLua)
 	promoteScript     = redis.NewScript(promoteLua)
 	scheduleScript    = redis.NewScript(scheduleLua)

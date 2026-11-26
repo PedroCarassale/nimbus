@@ -177,6 +177,44 @@ func TestQueueFullRejectsWithoutWaiting(t *testing.T) {
 	}
 }
 
+func TestQueueFullKeepsAsyncReservation(t *testing.T) {
+	m := newTestManager(t)
+	m.cfg.MaxConcurrency = 1
+	m.cfg.QueueMax = 1
+	ctx := context.Background()
+
+	if _, err := m.Acquire(ctx, "fn", "holder", 1); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		_, _ = m.Acquire(ctx, "fn", "waiter", 1)
+	}()
+	waitStatus(t, m, "waiter", "queued")
+
+	// Reserve already wrote the cancel handle, the way an async enqueue does.
+	if err := m.rdb.HSet(ctx, m.execKey("overflow"),
+		"functionId", "fn",
+		"status", "pending",
+		"cancelled", "false",
+	).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Acquire(ctx, "fn", "overflow", 1); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("err = %v, want ErrQueueFull", err)
+	}
+	status, err := m.rdb.HGet(ctx, m.execKey("overflow"), "status").Result()
+	if err != nil || status != "pending" {
+		t.Fatalf("reservation status=%q err=%v", status, err)
+	}
+	if err := m.MarkForCancellation(ctx, "overflow"); err != nil {
+		t.Fatal(err)
+	}
+	cancelled, err := m.rdb.HGet(ctx, m.execKey("overflow"), "cancelled").Result()
+	if err != nil || (cancelled != "true" && cancelled != "1") {
+		t.Fatalf("cancelled=%q err=%v", cancelled, err)
+	}
+}
+
 func TestQueueWaitTimeout(t *testing.T) {
 	m := newTestManager(t)
 	m.cfg.MaxConcurrency = 1
@@ -612,6 +650,36 @@ func TestSweepStaleSlotsDropsDeadHostsOnly(t *testing.T) {
 	}
 	if n, err := m.rdb.ZCard(ctx, "nimbus:queue:fn:old-fn").Result(); err != nil || n != 1 {
 		t.Fatalf("queue was swept: n=%d err=%v", n, err)
+	}
+}
+
+func TestReleaseOwnSlotsOnStartup(t *testing.T) {
+	m := newTestManager(t)
+	ctx := context.Background()
+	now := float64(m.now().UnixMilli() + 60_000)
+	if err := m.rdb.ZAdd(ctx, m.globalKey(), redis.Z{Score: now, Member: "mine"}).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.rdb.ZAdd(ctx, "nimbus:slots:fn:fn", redis.Z{Score: now, Member: "mine"}, redis.Z{Score: now, Member: "peer-exec"}).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.rdb.ZAdd(ctx, "nimbus:slots:machine:live-peer", redis.Z{Score: now, Member: "peer-exec"}).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ReleaseOwnSlots(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if exists, _ := m.rdb.Exists(ctx, m.globalKey()).Result(); exists != 0 {
+		t.Fatal("this host still holds slots from the previous process")
+	}
+	if _, err := m.rdb.ZScore(ctx, "nimbus:slots:fn:fn", "mine").Result(); !errors.Is(err, redis.Nil) {
+		t.Fatalf("function slot for this host was kept: %v", err)
+	}
+	if _, err := m.rdb.ZScore(ctx, "nimbus:slots:fn:fn", "peer-exec").Result(); err != nil {
+		t.Fatalf("peer function slot was dropped: %v", err)
+	}
+	if _, err := m.rdb.ZScore(ctx, "nimbus:slots:machine:live-peer", "peer-exec").Result(); err != nil {
+		t.Fatalf("peer machine slot was dropped: %v", err)
 	}
 }
 

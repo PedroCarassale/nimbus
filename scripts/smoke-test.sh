@@ -9,7 +9,7 @@
 # 3. Invoca la función (Nest → Go compute plane)
 #
 # Requiere:
-# - docker compose up (postgres + redis + minio + compute-plane + control-plane)
+# - docker compose up (postgres + redis + localstack + compute-plane + control-plane)
 # - curl y jq instalados
 
 set -euo pipefail

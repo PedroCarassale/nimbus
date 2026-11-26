@@ -249,7 +249,7 @@ func TestAutoClaimReclaimsIdlePending(t *testing.T) {
 	if len(claimed) != 1 || claimed[0].Job.InvocationID != "inv-1" {
 		t.Fatalf("claimed %+v", claimed)
 	}
-	if err := other.Ack(ctx, claimed[0].ID); err != nil {
+	if err := other.Ack(ctx, claimed[0]); err != nil {
 		t.Fatal(err)
 	}
 	pending, err := cq.q.rdb.XPending(ctx, streamJobs, groupWorkers).Result()

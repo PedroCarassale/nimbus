@@ -409,13 +409,63 @@ func (m *Manager) stopSweeper() {
 // admission only sweeps the key of the process that is running.
 func (m *Manager) StartSweeper() {
 	m.sweepStart.Do(func() {
-		// The first pass is synchronous so a restart drops expired keys
-		// before accepting work. The ticker covers leases that expire later.
+		// This process just started, so every slot scored to its hostname
+		// belongs to a previous life. Drop those before accepting work.
+		// A peer's machine key is left alone. The ticker only expires
+		// leases that run out while this process is up.
+		if err := m.ReleaseOwnSlots(context.Background()); err != nil {
+			log.Printf("[concurrency] no se pudieron soltar los slots de este host: %v", err)
+		}
 		if _, err := m.SweepStaleSlots(context.Background()); err != nil {
 			log.Printf("[concurrency] barrido de slots: %v", err)
 		}
 		go m.sweepLoop()
 	})
+}
+
+// ReleaseOwnSlots removes slot membership this hostname still has from a
+// process that exited. The periodic sweeper must not call it: a live
+// process holds real slots under the same key.
+func (m *Manager) ReleaseOwnSlots(ctx context.Context) error {
+	members, err := m.rdb.ZRange(ctx, m.globalKey(), 0, -1).Result()
+	if err != nil || len(members) == 0 {
+		return err
+	}
+	asArgs := make([]interface{}, len(members))
+	for i, member := range members {
+		asArgs[i] = member
+	}
+	var cursor uint64
+	for {
+		keys, next, err := m.rdb.Scan(ctx, cursor, "nimbus:slots:fn:*", 100).Result()
+		if err != nil {
+			return err
+		}
+		seen := map[string]struct{}{}
+		for _, key := range keys {
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			if err := m.rdb.ZRem(ctx, key, asArgs...).Err(); err != nil {
+				return err
+			}
+			n, err := m.rdb.ZCard(ctx, key).Result()
+			if err != nil {
+				return err
+			}
+			if n == 0 {
+				if err := m.rdb.Del(ctx, key).Err(); err != nil {
+					return err
+				}
+			}
+		}
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	return m.rdb.Del(ctx, m.globalKey()).Err()
 }
 
 func (m *Manager) sweepLoop() {

@@ -3,14 +3,14 @@
 # Slice 7: Consola web React
 #
 # Targets principales:
-#   make up      — Levanta todo el stack (Postgres, Redis, MinIO, control/compute planes, console)
+#   make up      — Levanta todo el stack (Postgres, Redis, LocalStack, control/compute planes, console)
 #   make down    — Detiene y limpia el stack
 #   make hello   — Demo completa: crea función hello, despliega, invoca y muestra resultado
 #   make smoke   — Ejecuta smoke test completo
 #   make logs    — Muestra logs de todos los servicios
 #   make console — Abre la consola web en el navegador
 
-.PHONY: up down hello hello-python hello-go smoke load config-check warm-check async-check runtime-check obs obs-check qa logs build clean wait-healthy help up-fc fc-prepare fc-check
+.PHONY: up down hello hello-python hello-go smoke load config-check warm-check async-check runtime-check localstack-check obs obs-check qa logs build clean wait-healthy help up-fc fc-prepare fc-check
 
 COMPOSE_FC := docker compose -f docker-compose.yml -f docker-compose.firecracker.yml
 
@@ -35,7 +35,7 @@ help: ## Muestra esta ayuda
 	@echo "Quickstart MVP:"
 	@echo "  make up && make hello"
 
-up: ## Levanta todo el stack (Postgres, Redis, MinIO, Nest, Go)
+up: ## Levanta todo el stack (Postgres, Redis, LocalStack, Nest, Go)
 	@echo "$(YELLOW)>>> Levantando stack Nimbus...$(NC)"
 	@mkdir -p $(WORK_DIR)
 	@chmod 1777 $(WORK_DIR)
@@ -98,6 +98,10 @@ warm-check: ## Mide cold start vs warm start y el descarte por idle, timeout y O
 async-check: ## Invocación async, reintentos, DLQ, redrive y reclaim tras un kill
 	@echo "$(YELLOW)>>> Prueba de invocación async...$(NC)"
 	@./scripts/async-check.sh
+
+localstack-check: ## S3, SQS y DLQ nativa contra LocalStack
+	@echo "$(YELLOW)>>> Prueba de LocalStack (S3 + SQS/DLQ)...$(NC)"
+	@./scripts/localstack-check.sh
 
 runtime-check: ## python3.12 y go1.x: cold, warm, timeout, OOM y error
 	@echo "$(YELLOW)>>> Prueba de runtimes...$(NC)"
@@ -166,7 +170,7 @@ wait-healthy: ## Espera a que todos los servicios estén healthy
 		fi; \
 		if [ $$i -eq 180 ]; then \
 			echo "$(RED)  ✗ Timeout esperando control-plane$(NC)"; \
-			$(COMPOSE) logs --no-color control-plane compute-plane minio || true; \
+			$(COMPOSE) logs --no-color control-plane compute-plane localstack localstack-init || true; \
 			exit 1; \
 		fi; \
 		sleep 1; \

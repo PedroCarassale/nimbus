@@ -7,28 +7,75 @@ import {
 } from '@aws-sdk/client-s3';
 import { Readable } from 'stream';
 
+function firstEnv(...names: string[]): string {
+  for (const name of names) {
+    const value = process.env[name];
+    if (value && value.trim()) {
+      return value.trim();
+    }
+  }
+  return '';
+}
+
+function normalizeEndpoint(raw: string): string {
+  const value = raw.trim().replace(/\/+$/, '');
+  if (!value) {
+    return '';
+  }
+  if (!value.includes('://')) {
+    return `http://${value}`;
+  }
+  return value;
+}
+
 @Injectable()
 export class MinioService implements OnModuleInit {
   private client: S3Client;
   private bucket: string;
 
   async onModuleInit() {
-    const endpoint = process.env.MINIO_ENDPOINT || 'http://localhost:9000';
-    const accessKey = process.env.MINIO_ACCESS_KEY || 'minioadmin';
-    const secretKey = process.env.MINIO_SECRET_KEY || 'minioadmin';
-    this.bucket = process.env.MINIO_BUCKET || 'nimbus-artifacts';
+    const region = firstEnv('AWS_REGION', 'AWS_DEFAULT_REGION') || 'us-east-1';
+    const endpoint = normalizeEndpoint(
+      firstEnv('S3_ENDPOINT', 'AWS_ENDPOINT_URL', 'MINIO_ENDPOINT'),
+    );
+    let accessKey = firstEnv(
+      'AWS_ACCESS_KEY_ID',
+      'MINIO_ACCESS_KEY',
+      'MINIO_ROOT_USER',
+    );
+    let secretKey = firstEnv(
+      'AWS_SECRET_ACCESS_KEY',
+      'MINIO_SECRET_KEY',
+      'MINIO_ROOT_PASSWORD',
+    );
+    this.bucket = firstEnv('S3_BUCKET', 'MINIO_BUCKET') || 'nimbus-artifacts';
+    if (endpoint && !accessKey && !secretKey) {
+      accessKey = 'test';
+      secretKey = 'test';
+    }
+    const pathRaw = (process.env.S3_FORCE_PATH_STYLE || '').trim().toLowerCase();
+    const forcePathStyle = pathRaw
+      ? !['0', 'false', 'off', 'no'].includes(pathRaw)
+      : endpoint !== '';
 
-    this.client = new S3Client({
-      endpoint,
-      region: 'us-east-1',
-      credentials: {
+    const config: ConstructorParameters<typeof S3Client>[0] = {
+      region,
+      forcePathStyle,
+    };
+    if (endpoint) {
+      config.endpoint = endpoint;
+    }
+    if (accessKey || secretKey) {
+      config.credentials = {
         accessKeyId: accessKey,
         secretAccessKey: secretKey,
-      },
-      forcePathStyle: true,
-    });
+      };
+    }
+    this.client = new S3Client(config);
 
-    console.log(`[minio] Configurado para ${endpoint}, bucket: ${this.bucket}`);
+    console.log(
+      `[s3] Configurado para ${endpoint || `aws:${region}`}, bucket: ${this.bucket}`,
+    );
   }
 
   async uploadArtifact(
@@ -47,7 +94,7 @@ export class MinioService implements OnModuleInit {
       }),
     );
 
-    console.log(`[minio] Artifact subido: ${key}`);
+    console.log(`[s3] Artifact subido: ${key}`);
     return key;
   }
 

@@ -17,7 +17,7 @@ import (
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/handlers"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/isolate"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/metrics"
-	minioClient "github.com/PedroCarassale/nimbus/compute-plane/internal/minio"
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/objects"
 	ntrace "github.com/PedroCarassale/nimbus/compute-plane/internal/trace"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/warm"
 	"github.com/go-chi/chi/v5"
@@ -33,11 +33,6 @@ func main() {
 
 	port := getEnv("PORT", "8080")
 	redisAddr := getEnv("REDIS_URL", "redis:6379")
-	minioEndpoint := getEnv("MINIO_ENDPOINT", "minio:9000")
-	minioAccessKey := getEnv("MINIO_ACCESS_KEY", "minioadmin")
-	minioSecretKey := getEnv("MINIO_SECRET_KEY", "minioadmin")
-	minioBucket := getEnv("MINIO_BUCKET", "nimbus-artifacts")
-	minioUseSSL := getEnv("MINIO_USE_SSL", "false") == "true"
 
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     redisAddr,
@@ -52,11 +47,16 @@ func main() {
 		log.Println("[compute-plane] Conectado a Redis")
 	}
 
-	mc, err := minioClient.New(minioEndpoint, minioAccessKey, minioSecretKey, minioBucket, minioUseSSL)
+	objCfg := objects.LoadConfig()
+	mc, err := objects.New(ctx, objCfg)
 	if err != nil {
-		log.Fatalf("[compute-plane] Error conectando a MinIO: %v", err)
+		log.Fatalf("[compute-plane] Error conectando a S3: %v", err)
 	}
-	log.Println("[compute-plane] Conectado a MinIO")
+	endpoint := objCfg.Endpoint
+	if endpoint == "" {
+		endpoint = "aws:" + objCfg.Region
+	}
+	log.Printf("[compute-plane] S3 bucket=%s endpoint=%s pathStyle=%v", objCfg.Bucket, endpoint, objCfg.ForcePathStyle)
 
 	concCfg := concurrency.LoadConfig()
 	log.Printf("[compute-plane] Concurrencia por función=%d cola=%d espera=%s containers=%d lease=%s",
@@ -81,11 +81,38 @@ func main() {
 	handler := handlers.NewWithDefaults(exec, concurrencyMgr, fnDefaults)
 
 	asyncCfg := async.LoadConfig()
-	asyncQueue := async.New(rdb, asyncCfg)
-	if err := asyncQueue.EnsureGroup(ctx); err != nil {
+	backendName, err := async.ParseBackend(os.Getenv("NIMBUS_ASYNC_BACKEND"))
+	if err != nil {
+		log.Fatalf("[compute-plane] %v", err)
+	}
+	var (
+		queuer  async.Queuer
+		workers async.Backend
+	)
+	switch backendName {
+	case "sqs":
+		settings := async.LoadSQSSettings()
+		sqsQueue, sqsErr := async.NewSQS(ctx, rdb, asyncCfg, settings)
+		if sqsErr != nil {
+			log.Fatalf("[compute-plane] Error conectando a SQS: %v", sqsErr)
+		}
+		queuer = sqsQueue
+		workers = sqsQueue
+		where := settings.Endpoint
+		if where == "" {
+			where = "aws:" + settings.Region
+		}
+		log.Printf("[compute-plane] Async backend=sqs endpoint=%s queue=%s dlq=%s", where, sqsQueue.JobsURL(), sqsQueue.DLQURL())
+	default:
+		redisQueue := async.New(rdb, asyncCfg)
+		queuer = redisQueue
+		workers = redisQueue
+		log.Printf("[compute-plane] Async backend=redis")
+	}
+	if err := workers.EnsureGroup(ctx); err != nil {
 		log.Printf("[compute-plane] Cola async no disponible todavía: %v", err)
 	}
-	handler.SetQueue(asyncQueue)
+	handler.SetQueue(queuer)
 	metrics.SetSources(metrics.Sources{
 		QueueDepth: func(ctx context.Context) map[string]float64 {
 			depths, err := concurrencyMgr.QueueDepths(ctx)
@@ -99,7 +126,7 @@ func main() {
 			return out
 		},
 		DLQEntries: func(ctx context.Context) float64 {
-			n, err := asyncQueue.DLQLen(ctx)
+			n, err := queuer.DLQLen(ctx)
 			if err != nil {
 				return 0
 			}
@@ -120,7 +147,7 @@ func main() {
 		log.Printf("[compute-plane] Async: intentos=%d backoff=%s..%s jitter=%s claim=%s lock=%s workers=%d",
 			asyncCfg.MaxAttempts, asyncCfg.BackoffBase, asyncCfg.BackoffMax, asyncCfg.BackoffJitter,
 			asyncCfg.ClaimIdle, asyncCfg.LockTTL, asyncCfg.Workers)
-		stopAsync = async.StartWorkers(asyncQueue, handler.RunJob, asyncCfg.Workers)
+		stopAsync = async.StartWorkers(workers, handler.RunJob, asyncCfg.Workers)
 	} else {
 		log.Printf("[compute-plane] Workers async apagados (NIMBUS_ASYNC_ENABLED)")
 	}

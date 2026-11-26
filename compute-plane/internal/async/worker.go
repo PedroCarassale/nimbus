@@ -17,21 +17,21 @@ import (
 // used by POST /executions.
 type Runner func(ctx context.Context, body json.RawMessage) RunResult
 
-// Worker consumes the job stream.
+// Worker consumes the job transport (Redis stream or SQS).
 type Worker struct {
-	q   *Queue
+	q   Backend
 	run Runner
 	cfg Config
 }
 
-func NewWorker(q *Queue, run Runner) *Worker {
-	return &Worker{q: q, run: run, cfg: q.cfg}
+func NewWorker(q Backend, run Runner) *Worker {
+	return &Worker{q: q, run: run, cfg: q.Config()}
 }
 
 // StartWorkers runs n consumers until stop is called. In-flight attempts are
 // given a few seconds to ack; a hard kill leaves the message pending so the
 // next process can claim it.
-func StartWorkers(q *Queue, run Runner, n int) (stop func()) {
+func StartWorkers(q Backend, run Runner, n int) (stop func()) {
 	if n < 1 {
 		n = 1
 	}
@@ -39,8 +39,8 @@ func StartWorkers(q *Queue, run Runner, n int) (stop func()) {
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
 		wg.Add(1)
-		name := fmt.Sprintf("%s-%d", q.consumer, i)
-		consumer := q.WithConsumer(name)
+		name := fmt.Sprintf("%s-%d", q.Consumer(), i)
+		consumer := q.Fork(name)
 		worker := NewWorker(consumer, run)
 		go func() {
 			defer wg.Done()
@@ -114,9 +114,9 @@ func (w *Worker) Handle(ctx context.Context, d Delivery) {
 		}
 	}()
 	job := d.Job
-	if job.InvocationID == "" || d.ID == "" {
+	if job.InvocationID == "" || (d.ID == "" && d.ReceiptHandle == "") {
 		log.Printf("[async] mensaje sin invocación, se descarta %s", d.ID)
-		_ = w.q.Ack(ctx, d.ID)
+		_ = w.q.Ack(ctx, d)
 		return
 	}
 	if job.MaxAttempts < 1 {
@@ -128,12 +128,18 @@ func (w *Worker) Handle(ctx context.Context, d Delivery) {
 		log.Printf("[async] estado %s: %v", job.InvocationID, err)
 		return
 	}
+	// A queued job has not run yet. Some SQS stand-ins bump
+	// ApproximateReceiveCount on the long poll that first sees the message,
+	// so the body attempt (1) wins until the phase leaves "queued".
+	if d.ReceiveCount > 0 && st.Phase != "" && st.Phase != PhaseQueued {
+		job.Attempt = d.ReceiveCount
+	}
 	if isTerminal(st.Phase) {
 		w.finishTerminal(ctx, d, st)
 		return
 	}
 
-	token := w.q.consumer + ":" + d.ID
+	token := w.q.Consumer() + ":" + d.ID
 	ok, err := w.q.TryLock(ctx, job.InvocationID, token)
 	if err != nil {
 		log.Printf("[async] lock %s: %v", job.InvocationID, err)
@@ -157,7 +163,7 @@ func (w *Worker) Handle(ctx context.Context, d Delivery) {
 	action, attempt := NextAction(st, job.Attempt, job.MaxAttempts)
 	switch action {
 	case ActionAck:
-		_ = w.q.Ack(ctx, d.ID)
+		_ = w.q.Ack(ctx, d)
 	case ActionDead:
 		w.dead(ctx, d, job, st, st.Attempt, firstNonEmpty(st.LastError, "el worker se cayó durante el intento"), st.ExitCode, 0)
 	default:
@@ -200,7 +206,7 @@ func (w *Worker) runAttempt(ctx context.Context, d Delivery, job Job, st State, 
 	})
 
 	refreshCtx, stopRefresh := context.WithCancel(context.Background())
-	go w.refresh(refreshCtx, job.InvocationID, w.q.consumer+":"+d.ID)
+	go w.refresh(refreshCtx, job.InvocationID, w.q.Consumer()+":"+d.ID, d)
 
 	result := w.run(ctx, job.Body)
 	stopRefresh()
@@ -220,8 +226,16 @@ func (w *Worker) runAttempt(ctx context.Context, d Delivery, job Job, st State, 
 			log.Printf("[async] no se pudo cerrar %s: %v", job.InvocationID, err)
 			return
 		}
-		_ = w.q.Publish(ctx, res)
-		_ = w.q.Ack(ctx, d.ID)
+		// Ack only after Redis has the result. A restart of Redis between
+		// the two calls must leave the SQS message so the next receive
+		// publishes again.
+		if err := w.q.Publish(ctx, res); err != nil {
+			log.Printf("[async] no se pudo publicar %s: %v", job.InvocationID, err)
+			return
+		}
+		if err := w.q.Ack(ctx, d); err != nil {
+			log.Printf("[async] no se pudo confirmar %s: %v", job.InvocationID, err)
+		}
 	case KindValidation, KindFatal:
 		if result.Error == "" {
 			result.Error = "la invocación no se puede ejecutar"
@@ -235,12 +249,17 @@ func (w *Worker) runAttempt(ctx context.Context, d Delivery, job Job, st State, 
 		done.LastError = result.Error
 		done.ExitCode = result.ExitCode
 		done.Result = &res
-		if err := w.q.CommitTerminal(ctx, job.InvocationID, done, nil); err != nil {
-			log.Printf("[async] no se pudo marcar el fallo %s: %v", job.InvocationID, err)
+		if err := w.q.SaveState(ctx, job.InvocationID, done); err != nil {
+			log.Printf("[async] no se pudo cerrar %s: %v", job.InvocationID, err)
 			return
 		}
-		_ = w.q.Publish(ctx, res)
-		_ = w.q.Ack(ctx, d.ID)
+		if err := w.q.Publish(ctx, res); err != nil {
+			log.Printf("[async] no se pudo publicar %s: %v", job.InvocationID, err)
+			return
+		}
+		if err := w.q.SealFailed(ctx, d, done); err != nil {
+			log.Printf("[async] no se pudo marcar el fallo %s: %v", job.InvocationID, err)
+		}
 	default:
 		if result.Error == "" {
 			result.Error = "la ejecución falló"
@@ -260,7 +279,7 @@ func (w *Worker) runAttempt(ctx context.Context, d Delivery, job Job, st State, 
 			EnqueuedAt:   running.EnqueuedAt,
 			AttemptTimes: times,
 		}
-		if err := w.q.ScheduleRetry(ctx, next, delay, retryState); err != nil {
+		if err := w.q.Postpone(ctx, d, next, delay, retryState); err != nil {
 			log.Printf("[async] no se pudo programar el reintento %s: %v", job.InvocationID, err)
 			return
 		}
@@ -274,7 +293,6 @@ func (w *Worker) runAttempt(ctx context.Context, d Delivery, job Job, st State, 
 			Attempts:     attempt,
 			At:           w.q.Now().UnixMilli(),
 		})
-		_ = w.q.Ack(ctx, d.ID)
 		log.Printf("[async] reintento %s intento=%d espera=%s", job.InvocationID, attempt+1, delay)
 	}
 }
@@ -327,6 +345,7 @@ func (w *Worker) dead(ctx context.Context, d Delivery, job Job, st State, attemp
 		AttemptTimes: st.AttemptTimes,
 		FailedAt:     failedAt,
 		DeadAt:       now,
+		DurationMs:   durationMs,
 	}
 	done := st
 	done.Phase = PhaseDead
@@ -334,12 +353,11 @@ func (w *Worker) dead(ctx context.Context, d Delivery, job Job, st State, attemp
 	done.LastError = lastError
 	done.ExitCode = exitCode
 	done.Result = &result
-	if err := w.q.CommitTerminal(ctx, job.InvocationID, done, &entry); err != nil {
+	if err := w.q.SealDead(ctx, d, done, entry); err != nil {
 		log.Printf("[async] DLQ %s: %v", job.InvocationID, err)
 		return
 	}
 	_ = w.q.Publish(ctx, result)
-	_ = w.q.Ack(ctx, d.ID)
 	log.Printf("[async] DLQ %s intentos=%d", job.InvocationID, attempts)
 }
 
@@ -358,9 +376,14 @@ func (w *Worker) seal(ctx context.Context, invocationID string, result *Result) 
 
 func (w *Worker) finishTerminal(ctx context.Context, d Delivery, st State) {
 	if st.Result != nil {
-		_ = w.q.Publish(ctx, *st.Result)
+		if err := w.q.Publish(ctx, *st.Result); err != nil {
+			log.Printf("[async] no se pudo republicar %s: %v", d.Job.InvocationID, err)
+			return
+		}
 	}
-	_ = w.q.Ack(ctx, d.ID)
+	if err := w.q.Ack(ctx, d); err != nil {
+		log.Printf("[async] no se pudo confirmar %s: %v", d.Job.InvocationID, err)
+	}
 }
 
 func (w *Worker) terminal(job Job, meta bodyMeta, status string, attempts int, result RunResult) Result {
@@ -380,7 +403,7 @@ func (w *Worker) terminal(job Job, meta bodyMeta, status string, attempts int, r
 	}
 }
 
-func (w *Worker) refresh(ctx context.Context, invocationID, token string) {
+func (w *Worker) refresh(ctx context.Context, invocationID, token string, d Delivery) {
 	interval := w.cfg.LockTTL / 3
 	if interval < 20*time.Millisecond {
 		interval = 20 * time.Millisecond
@@ -394,6 +417,9 @@ func (w *Worker) refresh(ctx context.Context, invocationID, token string) {
 		case <-ticker.C:
 			if err := w.q.RefreshLock(context.Background(), invocationID, token); err != nil {
 				log.Printf("[async] no se pudo renovar el lock %s: %v", invocationID, err)
+			}
+			if err := w.q.Extend(context.Background(), d); err != nil {
+				log.Printf("[async] no se pudo extender la visibilidad %s: %v", invocationID, err)
 			}
 		}
 	}
