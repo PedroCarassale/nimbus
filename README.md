@@ -8,6 +8,7 @@ Plataforma serverless (estilo Lambda) de Pedro Carassale y Federico Tessadro.
 - **Roadmap hasta el MVP:** [docs/roadmap.md](docs/roadmap.md)
 - **Observabilidad:** [docs/observabilidad.md](docs/observabilidad.md)
 - **S3 y SQS (LocalStack / AWS):** [docs/localstack-aws.md](docs/localstack-aws.md)
+- **Varios workers y scheduler:** [docs/cluster-scheduler.md](docs/cluster-scheduler.md)
 - **Auditoría IA (cátedra):** [AI-DECISIONS.md](AI-DECISIONS.md)
 - **Instrucciones para agentes:** [agents.md](agents.md)
 
@@ -40,6 +41,8 @@ make console
 El aislamiento por defecto es Docker. `make up-fc` levanta el mismo stack con microVMs de Firecracker (`NIMBUS_ISOLATION=firecracker`) y hace falta `/dev/kvm`. El detalle está en [`docs/firecracker.md`](docs/firecracker.md).
 
 Los artifacts van a S3 y la cola async a SQS. En local los dos los sirve LocalStack (`localhost:4566`, bucket `nimbus-artifacts`, colas `nimbus-async-jobs` y `nimbus-async-dlq`). Con `S3_ENDPOINT` y `SQS_ENDPOINT` vacíos el mismo código habla con AWS. El detalle está en [`docs/localstack-aws.md`](docs/localstack-aws.md).
+
+`make up` sigue con un solo compute plane. `make up-multi` levanta un scheduler y dos workers detrás del mismo contrato: Nest apunta a `http://scheduler:8080`. El detalle está en [`docs/cluster-scheduler.md`](docs/cluster-scheduler.md).
 
 Esto demuestra el flujo completo del MVP:
 - **Control Plane** (NestJS): crea función, almacena metadata en Postgres, sube código a S3
@@ -78,6 +81,9 @@ make obs          # Prometheus, Grafana y Jaeger (no entra en make up)
 make obs-check    # tráfico real y consulta a las APIs de Prometheus, Grafana y Jaeger
 make up-fc       # Igual que make up, con el compute plane en Firecracker
 make fc-check    # Hello, timeout, OOM, cancel y red dentro del microVM
+make up-multi    # Scheduler + 2 workers de compute (no reemplaza a make up)
+make cluster-check # Reparte invokes, afinidad warm, async, cancel y failover
+make down-multi  # Detiene el stack de make up-multi
 make logs         # Ver logs de todos los servicios
 make down         # Detener el stack
 make down-clean   # Detener y eliminar volúmenes
@@ -451,7 +457,8 @@ nimbus-functions/
 │   ├── Dockerfile         # Imagen del control plane
 │   └── package.json       # Dependencias Node.js
 ├── compute-plane/         # Go Compute Plane (Slice 4)
-│   ├── cmd/server/        # Entrypoint del servidor
+│   ├── cmd/server/        # Entrypoint del worker
+│   ├── cmd/scheduler/     # Scheduler del cluster (mismo contrato HTTP)
 │   ├── internal/
 │   │   ├── handlers/      # HTTP handlers (StartExecution, Cancel)
 │   │   ├── executor/      # Descarga S3 + Docker run

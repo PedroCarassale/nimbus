@@ -723,3 +723,35 @@ func TestLoadConfig(t *testing.T) {
 		t.Fatalf("zero concurrency = %d", got)
 	}
 }
+
+func TestAdmitRecordsWorkerID(t *testing.T) {
+	m := newTestManager(t)
+	m.SetWorkerID("compute-worker-1")
+	ctx := context.Background()
+	if _, err := m.Acquire(ctx, "fn", "running", 1); err != nil {
+		t.Fatal(err)
+	}
+	got, err := m.rdb.HGet(ctx, m.execKey("running"), "workerId").Result()
+	if err != nil || got != "compute-worker-1" {
+		t.Fatalf("running workerId=%q err=%v", got, err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		_, _ = m.Acquire(ctx, "fn", "waiting", 1)
+		close(done)
+	}()
+	waitStatus(t, m, "waiting", "queued")
+	got, err = m.rdb.HGet(ctx, m.execKey("waiting"), "workerId").Result()
+	if err != nil || got != "compute-worker-1" {
+		t.Fatalf("queued workerId=%q err=%v", got, err)
+	}
+	if err := m.Release(ctx, "fn", "running"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued acquire did not finish")
+	}
+}

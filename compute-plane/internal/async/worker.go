@@ -28,9 +28,10 @@ func NewWorker(q Backend, run Runner) *Worker {
 	return &Worker{q: q, run: run, cfg: q.Config()}
 }
 
-// StartWorkers runs n consumers until stop is called. In-flight attempts are
-// given a few seconds to ack; a hard kill leaves the message pending so the
-// next process can claim it.
+// StartWorkers runs n consumers until stop is called. Stop cancels the
+// context and waits a few seconds for the loop to leave. An attempt still
+// running does not ack: the message stays pending and the next process
+// claims it. A hard kill does the same, without the wait.
 func StartWorkers(q Backend, run Runner, n int) (stop func()) {
 	if n < 1 {
 		n = 1
@@ -210,6 +211,18 @@ func (w *Worker) runAttempt(ctx context.Context, d Delivery, job Job, st State, 
 
 	result := w.run(ctx, job.Body)
 	stopRefresh()
+	if ctx.Err() != nil {
+		// The process is stopping. Acking here can delete the only copy of
+		// the result when Redis is restarting too. Put the message back
+		// now, with a context that is not the one being cancelled.
+		rel, stop := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := w.q.Abandon(rel, d); err != nil {
+			log.Printf("[async] no se pudo soltar %s: %v", job.InvocationID, err)
+		}
+		stop()
+		log.Printf("[async] apagado durante %s, el mensaje queda pendiente", job.InvocationID)
+		return
+	}
 
 	switch result.Kind {
 	case KindOK:

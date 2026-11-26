@@ -627,6 +627,53 @@ func TestPoolStress(t *testing.T) {
 	}
 }
 
+func TestPoolIdleKeys(t *testing.T) {
+	p, _ := testPool(t, Config{IdleTTL: time.Minute, MaxPerFunction: 2, GlobalMax: 4})
+	spec := specOf("fn", "v1", "handler", 128, 0)
+	want := AffinityKey(spec.FunctionID, spec.Version, spec.Config)
+	if keys := p.IdleKeys(); len(keys) != 0 {
+		t.Fatalf("idle before run = %v", keys)
+	}
+	if _, meta := p.Run(context.Background(), spec, Invocation{ExecutionID: "a"}); !meta.ColdStart {
+		t.Fatal("expected a cold start")
+	}
+	keys := p.IdleKeys()
+	if len(keys) != 1 || keys[0] != want {
+		t.Fatalf("idle keys = %v want %s", keys, want)
+	}
+	other := specOf("fn", "v2", "handler", 128, 0)
+	if _, meta := p.Run(context.Background(), other, Invocation{ExecutionID: "b"}); !meta.ColdStart {
+		t.Fatal("other version should be cold")
+	}
+	keys = p.IdleKeys()
+	if len(keys) != 2 {
+		t.Fatalf("two idle keys, got %v", keys)
+	}
+}
+
+func TestAffinityKeyIgnoresTimeout(t *testing.T) {
+	base := fnconfig.Resolved{TimeoutSec: 5, MemoryMB: 128, Handler: "index.handler", Runtime: "nodejs20"}
+	slow := base
+	slow.TimeoutSec = 30
+	if AffinityKey("fn", "v1", base) != AffinityKey("fn", "v1", slow) {
+		t.Fatal("timeout must not change the affinity key")
+	}
+	otherMem := base
+	otherMem.MemoryMB = 256
+	if AffinityKey("fn", "v1", base) == AffinityKey("fn", "v1", otherMem) {
+		t.Fatal("memory must change the affinity key")
+	}
+	py := base
+	py.Runtime = "python3.12"
+	if AffinityKey("fn", "v1", base) == AffinityKey("fn", "v1", py) {
+		t.Fatal("runtime must change the affinity key")
+	}
+	got := AffinityKey("fn", "v1", base)
+	if len(got) < len("fn:v1:nodejs20:") || got[:len("fn:v1:nodejs20:")] != "fn:v1:nodejs20:" {
+		t.Fatalf("shape %s", got)
+	}
+}
+
 func TestLoadConfig(t *testing.T) {
 	t.Setenv("NIMBUS_WARM", "")
 	t.Setenv("NIMBUS_WARM_IDLE_SEC", "")

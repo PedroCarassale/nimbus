@@ -28,6 +28,32 @@ func PoolKey(functionID, version string, cfg fnconfig.Resolved) string {
 	}, "\x1f")
 }
 
+// AffinityKey is the idle-warm token a worker publishes and the scheduler
+// matches. The shape is functionId:version:runtime:configHash. configHash
+// covers handler, memory, CPU and env, which is the part of PoolKey that is
+// not already in the prefix. Timeout is excluded, same as PoolKey.
+func AffinityKey(functionID, version string, cfg fnconfig.Resolved) string {
+	return strings.Join([]string{
+		functionID,
+		version,
+		runtime.Canonical(cfg.Runtime),
+		ConfigHash(cfg),
+	}, ":")
+}
+
+// ConfigHash is a stable digest of the container config that distinguishes
+// two warm pools for the same function version and runtime.
+func ConfigHash(cfg fnconfig.Resolved) string {
+	raw := strings.Join([]string{
+		cfg.Handler,
+		strconv.Itoa(cfg.MemoryMB),
+		strconv.Itoa(cfg.CPUsMilli),
+		EnvHash(cfg.Env),
+	}, "\n")
+	sum := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(sum[:])
+}
+
 // EnvHash is a stable digest of the user environment. Names are sorted
 // so two requests with the same variables share a container. The digest
 // is safe to log; the values are not.

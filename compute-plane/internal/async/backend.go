@@ -31,6 +31,10 @@ type Backend interface {
 	SealFailed(context.Context, Delivery, State) error
 	SealDead(context.Context, Delivery, State, DLQEntry) error
 	Extend(context.Context, Delivery) error
+	// Abandon makes a received message visible again without deleting it.
+	// Shutdown uses it so a restart can run the job without waiting out the
+	// visibility timeout.
+	Abandon(context.Context, Delivery) error
 }
 
 // Queuer is the HTTP surface: enqueue, list the DLQ and redrive one entry.
