@@ -4,6 +4,8 @@ Un invoke puede volver enseguida con un id y ejecutarse después. Si el handler 
 
 ## Diseño
 
+`NIMBUS_ASYNC_BACKEND` elige el transporte. `sqs` (el valor del compose, con LocalStack) manda el job a Amazon SQS o a LocalStack. `redis`, o la variable vacía, usa el stream de abajo. Los dos publican el resultado en `nimbus:async:results`, así que Nest actualiza la fila igual. El detalle de S3 y de SQS está en [`localstack-aws.md`](localstack-aws.md).
+
 ```
 POST /functions/:id/invoke?async=true
         │  202 { invocationId, executionId, status: PENDING }
@@ -11,7 +13,7 @@ POST /functions/:id/invoke?async=true
 Control plane (Nest) crea la fila en Postgres
         │  POST /async/jobs
         ▼
-Compute plane (Go) valida y hace XADD a nimbus:async:jobs
+Compute plane (Go) valida y encola (SQS o XADD a nimbus:async:jobs)
         │
         ▼
 Worker del mismo proceso (consumer group)
@@ -20,7 +22,7 @@ Worker del mismo proceso (consumer group)
 Redis nimbus:async:results  ──►  un consumidor de Nest actualiza la fila
 ```
 
-La cola es un stream de Redis con el consumer group `workers`. Cada proceso usa un nombre de consumer distinto. Si el proceso muere, el mensaje queda pendiente: el siguiente hace `XAUTOCLAIM` cuando el idle supera `NIMBUS_ASYNC_CLAIM_IDLE_MS` y lo vuelve a correr.
+Con el backend `redis`, la cola es un stream con el consumer group `workers`. Cada proceso usa un nombre de consumer distinto. Si el proceso muere, el mensaje queda pendiente: el siguiente hace `XAUTOCLAIM` cuando el idle supera `NIMBUS_ASYNC_CLAIM_IDLE_MS` y lo vuelve a correr.
 
 Mientras corre, un lock `nimbus:async:lock:{invocationId}` impide que dos workers ejecuten la misma invocación a la vez. El worker renueva el lock. Si deja de renovarlo, el lock vence y el reclaim puede empezar otro intento. Ese intento cuenta: `attempts` sube.
 
@@ -29,6 +31,22 @@ Un fallo reintentable no deja el mensaje pendiente. Se confirma (`XACK`) y se gu
 Los resultados van a `nimbus:async:results`. Nest tiene su propio consumer group (`nimbus-control`) y escribe `status`, `output`, `error`, `durationMs` y `attempts` en la fila `Invocation`. Cada evento lleva un `seq` por invocación. Uno más viejo, por ejemplo una copia reclamada, no pisa un estado más nuevo.
 
 Go no abre Postgres. La fila la sigue escribiendo Nest.
+
+## Backend SQS
+
+Con `NIMBUS_ASYNC_BACKEND=sqs` el worker hace long polling de `nimbus-async-jobs`. El cuerpo es el mismo job. `traceparent` y `tracestate` van en `MessageAttributes`.
+
+La visibilidad inicial es `NIMBUS_ASYNC_CLAIM_IDLE_MS` redondeado hacia arriba a segundos, con piso de 30 s si ese valor es 0. Un backoff positivo menor a 1 s queda en 1 s: SQS no acepta fracciones. Mientras el intento corre, el heartbeat extiende la visibilidad. Si el proceso muere, el mensaje vuelve a ser visible y otro receive lo toma. El resultado se publica en Redis antes de borrar el mensaje: si Redis no acepta el resultado, el mensaje sigue en la cola y el siguiente receive lo publica de nuevo. Éxito, cancelación y un 400 de validación borran el mensaje. No van a la DLQ.
+
+El long poll usa `WaitTimeSeconds=1`. Es long polling, y un mensaje que ya está en la cola vuelve en ese receive. Una espera de 20 s llega tarde a los checks locales cuando el emulador no corta la espera al aparecer el mensaje.
+
+`ApproximateReceiveCount` en LocalStack sube también en polls que el cliente no llega a ver. Mientras la fase en Redis sigue en `queued`, el intento del cuerpo (1) manda. Al arrancar, el compute plane suelta los slots de su propio hostname: son de un proceso que ya no existe y, si se quedan, el reintento espera hasta que vence el lease.
+
+Un fallo reintentable no borra el mensaje: `ChangeMessageVisibility` lo esconde durante el backoff. La `RedrivePolicy` de la cola (`maxReceiveCount` = `NIMBUS_ASYNC_MAX_ATTEMPTS`, los dos en 3 en el compose) lo mueve a `nimbus-async-dlq` cuando el receive count la supera. El proceso no copia el mensaje a mano. El error, los intentos y `durationMs` quedan en Redis (`nimbus:async:dlqmeta:{id}`) porque el cuerpo de SQS no se puede actualizar. `GET /dlq` lee la DLQ y le pega esos campos. `POST /dlq/:id/redrive` borra ese mensaje y manda uno nuevo a `nimbus-async-jobs` con `attempt` 1.
+
+`maxReceiveCount` se fija al crear la cola. Cambiar `NIMBUS_ASYNC_MAX_ATTEMPTS` después no lo actualiza solo: hay que volver a correr el init (`scripts/localstack-init.sh` lo deja alineado).
+
+El estado, el lock, la deduplicación y el stream de resultados siguen en Redis.
 
 ## Contrato
 
@@ -117,12 +135,16 @@ Los logs de todos los intentos van al mismo stream `nimbus:logs:{executionId}`. 
 
 | Variable | Default | Efecto |
 |----------|---------|--------|
+| `NIMBUS_ASYNC_BACKEND` | `redis` en el proceso, `sqs` en el compose | `sqs` usa SQS. `redis` o vacío usa el stream. Otro valor corta el arranque. |
+| `SQS_ENDPOINT` | vacío | Base URL. Vacío: Amazon SQS de la región. `http://localstack:4566` en el compose. No usa `S3_ENDPOINT`. |
+| `SQS_QUEUE_URL` | se resuelve por `SQS_QUEUE_NAME` | URL de `nimbus-async-jobs`. |
+| `SQS_DLQ_URL` | se resuelve por `SQS_DLQ_NAME` | URL de `nimbus-async-dlq`. |
 | `NIMBUS_ASYNC_ENABLED` | activo | `0`, `false`, `off` o `no` no arranca workers. Encolar sigue respondiendo 202 y el job espera. |
 | `NIMBUS_ASYNC_MAX_ATTEMPTS` | `3` | Intentos totales. Mínimo 1. |
 | `NIMBUS_ASYNC_BACKOFF_BASE_MS` | `500` | Espera después del primer fallo. |
 | `NIMBUS_ASYNC_BACKOFF_MAX_MS` | `30000` | Tope del backoff. |
 | `NIMBUS_ASYNC_BACKOFF_JITTER_MS` | `250` | Se suma un valor aleatorio entre 0 y este número. |
-| `NIMBUS_ASYNC_CLAIM_IDLE_MS` | `20000` | Idle mínimo para `XAUTOCLAIM`. Tiene que ser mayor que el tiempo en el que un worker vivo todavía no confirmó el mensaje, si no otro worker lo ve pendiente. El lock evita ejecutarlo dos veces. |
+| `NIMBUS_ASYNC_CLAIM_IDLE_MS` | `20000` | En Redis, idle mínimo para `XAUTOCLAIM`. En SQS, visibilidad del mensaje mientras un worker lo tiene (en segundos, hacia arriba). Tiene que cubrir el tiempo en el que un worker vivo todavía no renovó, si no otro receive lo toma. El lock evita ejecutarlo dos veces. |
 | `NIMBUS_ASYNC_LOCK_MS` | `15000` | Vida del lock. Se renueva mientras el intento corre. |
 | `NIMBUS_ASYNC_WORKERS` | `4` | Goroutines consumidoras en este proceso. |
 

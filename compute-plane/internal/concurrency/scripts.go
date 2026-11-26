@@ -62,7 +62,11 @@ end
 
 sweep_slots()
 
-if redis.call('EXISTS', execKey) == 0 then
+-- created is true only when this call inserted the hash. A reservation that
+-- already existed (an async job waiting to start) must survive a full-queue
+-- reject, or cancel can no longer find the execution.
+local created = redis.call('EXISTS', execKey) == 0
+if created then
   redis.call('HSET', execKey, 'functionId', functionId)
   redis.call('HSET', execKey, 'status', 'pending')
   redis.call('HSET', execKey, 'cancelled', 'false')
@@ -112,8 +116,7 @@ end
 if not inQueue then
   local qlen = tonumber(redis.call('ZCARD', queue)) or 0
   if qlen >= queueMax then
-    local st = redis.call('HGET', execKey, 'status')
-    if st == 'pending' then
+    if created then
       redis.call('DEL', execKey)
     end
     return {'rejected', '0'}

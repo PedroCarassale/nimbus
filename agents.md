@@ -60,7 +60,7 @@ Nimbus Functions es una plataforma serverless estilo AWS Lambda, desarrollada po
 - Runtime: Node.js (imagen Docker fija)
 - Metadata: PostgreSQL
 - Cache/Cola: Redis
-- Artifacts: MinIO (S3-compatible)
+- Artifacts: S3 (LocalStack en el compose, AWS si `S3_ENDPOINT` está vacío)
 - Consola: React + Vite (opcional para MVP)
 
 Ver `docs/stack.md` para detalles completos y `docs/roadmap.md` para el orden de slices.
@@ -94,7 +94,7 @@ nimbus-functions/
 ## Fuera de alcance (no implementar sin pedir)
 
 Ver `docs/roadmap.md` para el orden de slices. No adelantar:
-- Nest, Go, MinIO, Postgres, Redis, SSE, React (slices futuros)
+- Nest, Go, S3, Postgres, Redis, SSE, React (slices futuros)
 - Multi-runtime (Python, Go)
 - Cambiar el aislamiento por defecto (sigue siendo Docker; Firecracker es opt-in, ver docs/firecracker.md)
 - Auth, billing, VPC

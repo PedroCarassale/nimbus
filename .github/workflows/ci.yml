@@ -94,6 +94,8 @@ jobs:
         run: make warm-check
       - name: make async-check
         run: make async-check
+      - name: make localstack-check
+        run: make localstack-check
       - name: make runtime-check
         run: make runtime-check
       - name: make hello-python

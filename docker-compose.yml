@@ -1,7 +1,8 @@
 # Nimbus Functions — Docker Compose
-# Slice 2: MinIO para almacenamiento de artifacts
+# Artifacts: LocalStack (API de S3). Vaciar S3_ENDPOINT apunta el mismo código a AWS.
+# Cola async: SQS + DLQ nativa en LocalStack. NIMBUS_ASYNC_BACKEND=redis vuelve al stream.
 # Slice 3: Postgres para metadata + NestJS control plane
-# Slice 4: Redis para concurrencia + Go compute plane
+# Slice 4: Redis para concurrencia, locks y resultados async
 #
 # Uso: docker compose up -d
 
@@ -39,52 +40,50 @@ services:
       retries: 5
       start_period: 5s
 
-  # Silo es un fork S3 compatible con MinIO. Las imágenes minio/minio y
-  # minio/mc ya no se pueden bajar sin cuenta (Docker Hub y quay.io).
-  minio:
-    image: pgsty/silo:RELEASE.2026-10-26T00-00-00Z@sha256:7bb2aff6b89efe1cb1303c10fc21d579447434ed06649ac9ec05a5e2dbf30ad7
-    container_name: nimbus-minio
+  # LocalStack emula S3 y SQS. 4.14.0 es el último release community:
+  # desde 2026.03.0 la imagen unificada sale con código 55 si no hay
+  # LOCALSTACK_AUTH_TOKEN, también para S3 y SQS. El digest fija el binario.
+  # path + HOSTNAME_EXTERNAL dejan las URLs en
+  # http://localstack:4566/000000000000/<nombre>.
+  localstack:
+    image: localstack/localstack:4.14.0@sha256:3ebc37595918b8accb852f8048fef2aff047d465167edd655528065b07bc364a
+    container_name: nimbus-localstack
     ports:
-      - "9000:9000"   # API S3
-      - "9001:9001"   # Consola web
+      - "4566:4566"
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      SERVICES: s3,sqs
+      AWS_DEFAULT_REGION: us-east-1
+      SQS_ENDPOINT_STRATEGY: path
+      HOSTNAME_EXTERNAL: localstack
+      LOCALSTACK_HOST: localstack
+      DEBUG: "0"
     volumes:
-      - minio-data:/data
-    command: server /data --console-address ":9001"
+      - localstack-data:/var/lib/localstack
     healthcheck:
-      test: ["CMD", "silo", "healthcheck", "live"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:4566/_localstack/health"]
       interval: 5s
       timeout: 5s
-      retries: 10
-      start_period: 5s
+      retries: 20
+      start_period: 15s
 
-  minio-init:
-    image: pgsty/mc:latest@sha256:b532278b7a3747dbab6fe45eebb40a653efa704e6758e24e9d9ec54fc96c1800
-    container_name: nimbus-minio-init
+  localstack-init:
+    image: localstack/localstack:4.14.0@sha256:3ebc37595918b8accb852f8048fef2aff047d465167edd655528065b07bc364a
+    container_name: nimbus-localstack-init
     depends_on:
-      minio:
+      localstack:
         condition: service_healthy
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
-      MINIO_BUCKET: ${MINIO_BUCKET:-nimbus-artifacts}
-    entrypoint: >
-      /bin/sh -c "
-        i=0;
-        until mc alias set nimbus http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD}; do
-          i=$$((i+1));
-          if [ $$i -ge 30 ]; then
-            echo 'No se pudo configurar el alias de Silo/MinIO';
-            exit 1;
-          fi;
-          sleep 1;
-        done;
-        mc mb nimbus/$${MINIO_BUCKET} --ignore-existing;
-        mc anonymous set download nimbus/$${MINIO_BUCKET};
-        echo Bucket $${MINIO_BUCKET} listo;
-      "
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://localstack:4566
+      S3_BUCKET: ${S3_BUCKET:-nimbus-artifacts}
+      SQS_QUEUE_NAME: nimbus-async-jobs
+      SQS_DLQ_NAME: nimbus-async-dlq
+      NIMBUS_ASYNC_MAX_ATTEMPTS: ${NIMBUS_ASYNC_MAX_ATTEMPTS:-3}
+    volumes:
+      - ./scripts/localstack-init.sh:/init/localstack-init.sh:ro
+    entrypoint: ["/bin/bash", "/init/localstack-init.sh"]
 
   compute-plane:
     build:
@@ -96,10 +95,18 @@ services:
     environment:
       PORT: "8080"
       REDIS_URL: redis:6379
-      MINIO_ENDPOINT: minio:9000
-      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
-      MINIO_BUCKET: ${MINIO_BUCKET:-nimbus-artifacts}
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+      S3_BUCKET: ${S3_BUCKET:-nimbus-artifacts}
+      S3_ENDPOINT: http://localstack:4566
+      S3_FORCE_PATH_STYLE: "true"
+      SQS_ENDPOINT: http://localstack:4566
+      SQS_QUEUE_URL: http://localstack:4566/queue/us-east-1/000000000000/nimbus-async-jobs
+      SQS_DLQ_URL: http://localstack:4566/queue/us-east-1/000000000000/nimbus-async-dlq
+      NIMBUS_ASYNC_BACKEND: sqs
       NIMBUS_IMAGE: nimbus-node
       # Mismo path en el contenedor y en el host: el daemon resuelve -v.
       NIMBUS_WORK_DIR: /tmp/nimbus-work
@@ -130,9 +137,9 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-      minio:
+      localstack:
         condition: service_healthy
-      minio-init:
+      localstack-init:
         condition: service_completed_successfully
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -157,10 +164,12 @@ services:
       - "3000:3000"
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-nimbus}:${POSTGRES_PASSWORD:-nimbus}@postgres:5432/${POSTGRES_DB:-nimbus}
-      MINIO_ENDPOINT: http://minio:9000
-      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
-      MINIO_BUCKET: ${MINIO_BUCKET:-nimbus-artifacts}
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      S3_BUCKET: ${S3_BUCKET:-nimbus-artifacts}
+      S3_ENDPOINT: http://localstack:4566
+      S3_FORCE_PATH_STYLE: "true"
       COMPUTE_PLANE_URL: http://compute-plane:8080
       REDIS_URL: redis:6379
       NIMBUS_TIMEOUT_SEC: ${NIMBUS_TIMEOUT_SEC:-5}
@@ -175,9 +184,9 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      minio:
+      localstack:
         condition: service_healthy
-      minio-init:
+      localstack-init:
         condition: service_completed_successfully
       compute-plane:
         condition: service_healthy
@@ -270,7 +279,7 @@ services:
 volumes:
   postgres-data:
     name: nimbus-postgres-data
-  minio-data:
-    name: nimbus-minio-data
+  localstack-data:
+    name: nimbus-localstack-data
   redis-data:
     name: nimbus-redis-data

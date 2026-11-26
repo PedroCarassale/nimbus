@@ -623,3 +623,36 @@ El contrato queda en `docs/async.md`.
 
 **Validación y Corrección Humana:** Riesgos que quedan en el diseño: el one-shot de Firecracker reporta `initMs` y corre como uid 1000; el one-shot de Node en Docker sigue como root y con `initMs` 0. Un `cpus` fraccionario no achica el tiempo de CPU del guest. La RAM del host por slot es el pedido más 64 MiB. Las variables de entorno viven en el ext4 del código mientras la VM existe. No hay snapshot/restore. El jailer copia el rootfs cuando el hardlink cruza de filesystem, y el default queda apagado. `/dev/kvm` y el contenedor privilegiado están solo en el override. El trace id de adentro sale del frame de invoke. Nest y la consola no conocen `NIMBUS_ISOLATION`.
 
+---
+
+## LocalStack para S3 y SQS
+
+**Problema abordado:** Los artifacts salían por un fork de MinIO (Silo) y la cola async era un stream de Redis. Hacía falta el mismo código contra la API de S3 y de SQS, con LocalStack en el compose, y que apuntar a AWS sea solo configuración. La DLQ de los jobs async tenía que ser la DLQ nativa de SQS. Nest sigue siendo de Federico: no debe aprender a encolar.
+
+**Prompt / Herramienta utilizada:** Cursor Cloud Agent (Grok 4.7). Pedido de Paso 7a, LocalStack (AWS S3 + SQS/DLQ), sobre la rama de Firecracker (PR #20). Un PR, sin merge.
+
+**Código / Arquitectura generada:**
+
+1. **Compose**
+   - Salen `pgsty/silo` y `pgsty/mc`. Entra `localstack/localstack:4.14.0` con digest fijo, `SERVICES=s3,sqs`, path style y `HOSTNAME_EXTERNAL=localstack`. Desde 2026.03.0 la imagen unificada sale con código 55 sin `LOCALSTACK_AUTH_TOKEN`, también para S3 y SQS. 4.14.0 es el último release community y arranca sin cuenta. La API sigue siendo la de AWS.
+   - `localstack-init` crea el bucket `nimbus-artifacts`, la cola `nimbus-async-dlq` y `nimbus-async-jobs` con `RedrivePolicy` (`maxReceiveCount` = `NIMBUS_ASYNC_MAX_ATTEMPTS`).
+   - Compute y control reciben `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `S3_BUCKET`, `S3_ENDPOINT=http://localstack:4566` y `S3_FORCE_PATH_STYLE=true`. El compute además `SQS_ENDPOINT`, las dos URLs y `NIMBUS_ASYNC_BACKEND=sqs`.
+
+2. **S3**
+   - Go: el paquete `internal/minio` pasa a `internal/objects`. Endpoint vacío es Amazon S3, sin path style y sin credenciales estáticas si no hay keys (cadena de IAM). Endpoint puesto usa esa base y path style, salvo `S3_FORCE_PATH_STYLE=false`. `MINIO_*` queda como alias.
+   - Nest: `MinioService` lee las mismas variables. No cambia de clase ni de llamadas. El log pasa a `[s3]`.
+
+3. **SQS**
+   - `NIMBUS_ASYNC_BACKEND=sqs|redis`. Vacío en el proceso sigue siendo `redis` (tests). El compose pone `sqs`.
+   - Nest no cambia el camino async: sigue en `POST /async/jobs`. Go manda el mensaje a `nimbus-async-jobs` con `traceparent` en `MessageAttributes`.
+   - El worker hace long polling (`WaitTimeSeconds=1`: LocalStack 4.14 no corta una espera de 20 s cuando el mensaje aparece) y el mismo pipeline (semáforo, config, warm, logs, métricas, cancel). El resultado entra en Redis antes de borrar el mensaje. Un fallo reintentable usa `ChangeMessageVisibility` (cualquier espera positiva menor a 1 s queda en 1 s). La `RedrivePolicy` mueve el mensaje a `nimbus-async-dlq`; el proceso no lo copia. Mientras la fase sigue en `queued`, un `ApproximateReceiveCount` inflado no pisa el intento del cuerpo.
+   - Un rechazo por cola llena no borra el hash de ejecución si el enqueue ya lo había creado: el cancel de un async que todavía no arrancó lo sigue encontrando. Al arrancar, el proceso suelta los slots de su propio hostname (un lease vivo de un proceso muerto bloqueaba a los reintentos hasta 30 s). Los slots de otro host no se tocan.
+   - `GET /dlq` y `POST /dlq/:id/redrive` leen esa cola. El error, los intentos y `durationMs` salen de Redis porque el cuerpo de SQS no se reescribe. El redrive borra el mensaje de la DLQ y publica uno nuevo en la cola de jobs. El resultado sigue yendo a `nimbus:async:results`.
+
+4. **Operación**
+   - `make localstack-check` mira el bucket, el paso por SQS, la DLQ nativa y el redrive, con `awslocal` dentro del contenedor.
+   - El job de compose del CI lo corre junto con el resto.
+   - `docs/localstack-aws.md` describe las variables de LocalStack y las de AWS.
+
+**Validación y Corrección Humana:** Riesgos que quedan en el diseño: SQS mide la visibilidad en segundos enteros, así que un backoff de 400 ms espera 1 s. `maxReceiveCount` se graba al crear la cola; cambiar `NIMBUS_ASYNC_MAX_ATTEMPTS` después no lo mueve solo. LocalStack puede sumar `ApproximateReceiveCount` en un poll que el cliente no ve, y la `RedrivePolicy` mueve el mensaje con ese contador, no con los intentos que el worker llegó a ejecutar. `GET /dlq` recibe los mensajes unos segundos y les devuelve la visibilidad a 0: en esa ventana otro lector no los ve. Las credenciales del compose son `test`/`test`, las de LocalStack. Nest solo cambia la configuración del cliente S3; el enqueue async sigue en Go. El backend `redis` queda para los tests y como alternativa si se setea la variable.
+
