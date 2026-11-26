@@ -4,6 +4,9 @@ node_modules/
 # Build
 dist/
 
+# Test coverage
+coverage/
+
 # Logs
 *.log
 npm-debug.log*
