@@ -96,7 +96,7 @@ nimbus-functions/
 Ver `docs/roadmap.md` para el orden de slices. No adelantar:
 - Nest, Go, MinIO, Postgres, Redis, SSE, React (slices futuros)
 - Multi-runtime (Python, Go)
-- Firecracker/microVM
+- Cambiar el aislamiento por defecto (sigue siendo Docker; Firecracker es opt-in, ver docs/firecracker.md)
 - Auth, billing, VPC
 
 ## Variables de Entorno del Runner

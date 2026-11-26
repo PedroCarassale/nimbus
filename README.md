@@ -36,6 +36,8 @@ make console
 
 `make hello` sigue en Node. `make hello-python` y `make hello-go` invocan el compute plane con `runtime` (`python3.12` o `go1.x`): Nest todavía no guarda ni reenvía ese campo. El detalle está en [`docs/runtimes.md`](docs/runtimes.md).
 
+El aislamiento por defecto es Docker. `make up-fc` levanta el mismo stack con microVMs de Firecracker (`NIMBUS_ISOLATION=firecracker`) y hace falta `/dev/kvm`. El detalle está en [`docs/firecracker.md`](docs/firecracker.md).
+
 El servicio S3 del compose es Silo (`pgsty/silo`), compatible con la API de MinIO. Las imágenes `minio/minio` y `minio/mc` ya no se pueden descargar sin cuenta.
 
 Esto demuestra el flujo completo del MVP:
@@ -72,6 +74,8 @@ make warm-check   # cold start vs warm start, idle, timeout y OOM
 make async-check  # 202, reintentos, DLQ, redrive y reclaim si el compute plane muere
 make obs          # Prometheus, Grafana y Jaeger (no entra en make up)
 make obs-check    # tráfico real y consulta a las APIs de Prometheus, Grafana y Jaeger
+make up-fc       # Igual que make up, con el compute plane en Firecracker
+make fc-check    # Hello, timeout, OOM, cancel y red dentro del microVM
 make logs         # Ver logs de todos los servicios
 make down         # Detener el stack
 make down-clean   # Detener y eliminar volúmenes

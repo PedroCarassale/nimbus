@@ -112,3 +112,16 @@ jobs:
           name: compose-logs
           path: compose-logs.txt
           if-no-files-found: ignore
+
+  firecracker-kvm:
+    name: Firecracker KVM probe
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe /dev/kvm
+        run: |
+          if [[ -e /dev/kvm ]] && sudo test -r /dev/kvm && sudo test -w /dev/kvm; then
+            echo "Este runner expone /dev/kvm. El check completo (rootfs, microVM, make fc-check) corre en una VM con el toolchain; no se lanza acá para no alargar el job de compose."
+          else
+            echo "Este runner no expone /dev/kvm. make fc-check queda para una VM. El job sale 0 a propósito."
+          fi
+          exit 0

@@ -64,14 +64,14 @@ func (e *Executor) executeWarm(ctx context.Context, req *ExecutionRequest) *Exec
 	}
 
 	image := e.imageFor(cfg)
-	if err := e.ensureImage(ctx, image); err != nil {
+	if err := e.ensureRuntime(ctx, image); err != nil {
 		result.Error = fmt.Sprintf("Error con imagen Docker: %v", err)
 		logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Error: %s", result.Error))
 		return result
 	}
 
-	logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Ejecutando handler '%s' (runtime: %s, timeout: %ds, memory: %dMB, cpus: %s, env: %d)",
-		cfg.Handler, runtime.Canonical(cfg.Runtime), cfg.TimeoutSec, cfg.MemoryMB, cpusLabel(cfg), len(cfg.Env)))
+	logWriter.WriteStderr(ctx, fmt.Sprintf("[nimbus] Ejecutando handler '%s' (runtime: %s, isolation: %s, timeout: %ds, memory: %dMB, cpus: %s, env: %d)",
+		cfg.Handler, runtime.Canonical(cfg.Runtime), e.isolation(), cfg.TimeoutSec, cfg.MemoryMB, cpusLabel(cfg), len(cfg.Env)))
 
 	timeoutCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.TimeoutSec)*time.Second)
 	defer cancel()
@@ -82,7 +82,10 @@ func (e *Executor) executeWarm(ctx context.Context, req *ExecutionRequest) *Exec
 	}
 
 	_, acquireSpan := ntrace.Start(ctx, "container.acquire")
-	acquireSpan.SetAttributes(attribute.String("nimbus.function_id", req.FunctionID))
+	acquireSpan.SetAttributes(
+		attribute.String("nimbus.function_id", req.FunctionID),
+		attribute.String("nimbus.isolation", e.isolation()),
+	)
 	var runSpan trace.Span
 	runStarted := false
 	out, meta := e.pool.Run(timeoutCtx, warm.Spec{
@@ -112,6 +115,7 @@ func (e *Executor) executeWarm(ctx context.Context, req *ExecutionRequest) *Exec
 			runSpan.SetAttributes(
 				attribute.String("nimbus.function_id", req.FunctionID),
 				attribute.String("nimbus.execution_id", req.ExecutionID),
+				attribute.String("nimbus.isolation", e.isolation()),
 				attribute.Bool("nimbus.cold_start", m.ColdStart),
 			)
 			runStarted = true

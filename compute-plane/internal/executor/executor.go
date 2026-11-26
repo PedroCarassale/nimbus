@@ -18,7 +18,9 @@ import (
 	"time"
 
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/cancel"
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/firecracker"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/fnconfig"
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/isolate"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/logs"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/metrics"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/runtime"
@@ -39,6 +41,7 @@ type Executor struct {
 	rdb          *redis.Client
 	defaultImage string
 	pool         *warm.Pool
+	backend      isolate.Backend
 
 	codeMu    sync.Mutex
 	codeDirs  map[string]string
@@ -63,15 +66,20 @@ type ExecutionResult struct {
 	// ColdStart is true when this invocation started a new container.
 	// A warm hit reports false. Clients that ignore unknown fields are unchanged.
 	ColdStart bool `json:"coldStart"`
-	// InitMs is how long the new container took to become ready.
-	// It is 0 on a warm hit and on the cold one-shot path, which does not
-	// split initialization from the handler.
+	// InitMs is how long the new sandbox took to become ready.
+	// It is 0 on a warm hit and on the Docker cold one-shot path, which does not
+	// split initialization from the handler. A Firecracker one-shot reports
+	// the boot time here.
 	InitMs int64  `json:"initMs"`
 	Stdout string `json:"stdout,omitempty"`
 	Stderr string `json:"stderr,omitempty"`
 }
 
 func New(store artifactDownloader, rdb *redis.Client) *Executor {
+	iso, err := isolate.Parse(os.Getenv("NIMBUS_ISOLATION"))
+	if err != nil {
+		log.Fatalf("[executor] %v", err)
+	}
 	e := &Executor{
 		store:        store,
 		rdb:          rdb,
@@ -79,9 +87,16 @@ func New(store artifactDownloader, rdb *redis.Client) *Executor {
 		codeDirs:     map[string]string{},
 		codeLocks:    map[string]*sync.Mutex{},
 	}
+	switch iso {
+	case isolate.Firecracker:
+		e.backend = firecracker.NewFromEnv()
+	default:
+		e.backend = dockerStarter{image: e.defaultImage}
+	}
+	log.Printf("[executor] Aislamiento: %s", e.backend.Name())
 	cfg := warm.LoadConfig()
 	if cfg.Enabled {
-		e.pool = warm.New(cfg, dockerStarter{image: e.defaultImage})
+		e.pool = warm.New(cfg, e.backend)
 		log.Printf("[executor] Warm pool activo (idle=%s, por función=%d, global=%d)", cfg.IdleTTL, cfg.MaxPerFunction, cfg.GlobalMax)
 	} else {
 		log.Printf("[executor] Warm pool apagado (NIMBUS_WARM)")
@@ -117,6 +132,8 @@ func (e *Executor) Execute(ctx context.Context, req *ExecutionRequest) *Executio
 	var result *ExecutionResult
 	if e.pool != nil {
 		result = e.executeWarm(ctx, req)
+	} else if e.isolation() == isolate.Firecracker {
+		result = e.executeOnce(ctx, req)
 	} else {
 		result = e.executeCold(ctx, req)
 	}
@@ -293,6 +310,7 @@ func (e *Executor) runDockerWithStreaming(ctx context.Context, executionID, work
 	_, acquireSpan := ntrace.Start(ctx, "container.acquire")
 	acquireSpan.SetAttributes(
 		attribute.String("nimbus.execution_id", executionID),
+		attribute.String("nimbus.isolation", isolate.Docker),
 		attribute.Bool("nimbus.cold_start", true),
 	)
 	if err := cmd.Start(); err != nil {
@@ -305,6 +323,7 @@ func (e *Executor) runDockerWithStreaming(ctx context.Context, executionID, work
 	ctx, runSpan := ntrace.Start(ctx, "container.run")
 	runSpan.SetAttributes(
 		attribute.String("nimbus.execution_id", executionID),
+		attribute.String("nimbus.isolation", isolate.Docker),
 		attribute.Bool("nimbus.cold_start", true),
 	)
 	defer runSpan.End()

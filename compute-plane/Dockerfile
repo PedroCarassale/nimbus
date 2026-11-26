@@ -27,7 +27,8 @@ RUN apk add --no-cache \
     docker-cli \
     ca-certificates \
     tzdata \
-    wget
+    wget \
+    e2fsprogs
 
 WORKDIR /app
 

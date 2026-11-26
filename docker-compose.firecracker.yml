@@ -1,0 +1,22 @@
+# Override for NIMBUS_ISOLATION=firecracker.
+# `make up` does not load this file. `make up-fc` does.
+# The compute plane needs /dev/kvm and enough privileges to boot a microVM.
+# Jailer stays off until NIMBUS_FC_JAILER=1; a cgroup that cannot be
+# delegated fails the boot instead of falling back to the direct process.
+
+services:
+  compute-plane:
+    privileged: true
+    devices:
+      - /dev/kvm:/dev/kvm
+    environment:
+      NIMBUS_ISOLATION: firecracker
+      NIMBUS_FC_JAILER: ${NIMBUS_FC_JAILER:-0}
+      NIMBUS_FC_BIN: /usr/local/bin/firecracker
+      NIMBUS_FC_JAILER_BIN: /usr/local/bin/jailer
+      NIMBUS_FC_KERNEL: /var/lib/nimbus/fc/vmlinux
+      NIMBUS_FC_ROOTFS_DIR: /var/lib/nimbus/fc/rootfs
+    volumes:
+      - /var/lib/nimbus/fc:/var/lib/nimbus/fc:ro
+      - /usr/local/bin/firecracker:/usr/local/bin/firecracker:ro
+      - /usr/local/bin/jailer:/usr/local/bin/jailer:ro
