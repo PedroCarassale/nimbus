@@ -594,3 +594,43 @@ El contrato queda en `docs/async.md`.
 
 **Validación y Corrección Humana:** Go no conserva estado de proceso entre invokes del mismo container. El binario tiene que ser estático (`CGO_ENABLED=0`) y de la arquitectura del daemon; uno enlazado a glibc no arranca en Alpine. Node en frío sigue como root. Nest no guarda ni reenvía `runtime`, así que el invoke de la consola sigue en Node.
 
+## Paso 0 del control plane — tests con Jest y CI
+
+**Problema abordado:** El control plane no tenía tests. El CI solo compilaba Nest, así que un PR podía romper el invoke (estados, 429, async) sin que nada fallara antes de `make smoke`, que necesita el stack completo con Docker.
+
+**Prompt / Herramienta utilizada:** Claude Code (Claude Opus 5.5). Pedido: "Paso 0 del roadmap de Federico: tests básicos del control plane con Jest y correrlos en el CI en cada PR".
+
+**Código / Arquitectura generada:**
+
+1. **Setup**
+   - `jest` 29 + `ts-jest` y `jest.config.js` con `rootDir: src` y archivos `*.spec.ts` al lado del código.
+   - `tsconfig.build.json` excluye los `*.spec.ts`, así `nest build` y la imagen Docker no los compilan.
+   - Scripts `npm test` y `npm run test:cov`.
+
+2. **Tests unitarios (60)**, todos con dependencias mockeadas. No necesitan Postgres, Redis, MinIO ni el compute plane:
+   - `FunctionsService`: nombre duplicado (409), 404, deploy con reintento cuando choca el tag de versión (P2002), tope de 5 intentos, y que `updateInvocation` solo mande los campos presentes y traduzca `null` a `DbNull`.
+   - `RunnerService`: body de `POST /executions` con los defaults y con variables de entorno, 429 de la cola, caída de red sin excepción, `enqueue` 202/400/502 y `cancel`.
+   - `FunctionsController.invoke`: `RUNNING` antes de llamar a Go, exit 124 → `TIMEOUT`, sin versiones → 400, 429, y el camino async (`?async=true`, header `Event`, 400 con `field`, 502).
+   - `AsyncResultConsumer`: descarta un `seq` viejo o repetido, reset en un redrive de la DLQ y eventos inválidos.
+   - `InvocationsService` y los DTOs (`name` en minúsculas y guiones, `event` objeto).
+
+3. **CI**
+   - El job `Control plane (Nest)` corre `npm test -- --ci` después de `prisma generate` y antes del build.
+
+**Validación y Corrección Humana:**
+
+*Correcciones sobre la propuesta de la IA:*
+- Un test se llamaba "sends a W3C traceparent-ready JSON request", pero solo comprobaba el método y el `Content-Type`. Se renombró a "sends a JSON POST". En los tests unitarios no hay un contexto de OpenTelemetry registrado, así que `propagation.inject` no hace nada: la propagación de `traceparent` no está testeada acá y la sigue cubriendo `make obs-check`.
+- Sin `tsconfig.build.json`, `nest build` compilaba los `*.spec.ts` dentro de `dist/` y terminaban en la imagen Docker. Se agregó para excluirlos y se comprobó que `dist/` ya no tiene archivos `.spec.js`.
+- Se había instalado `@nestjs/testing`, pero los tests crean las clases con `new` y mocks por constructor. Se desinstaló para no dejar una dependencia sin uso.
+
+*Limitaciones aceptadas:*
+- `AsyncResultConsumer.apply` es privado. El test lo llama con un cast y un cliente Redis falso: queda acoplado a detalles internos y el loop de `XREADGROUP`/`XAUTOCLAIM` no tiene tests. Se acepta para no tocar código de producción en un PR de tests. La mejora es extraer `apply` a una función pura.
+- Los tests del controller llaman al método directo, sin HTTP ni `ValidationPipe`. Por eso los DTOs se testean aparte con `class-validator`. La integración real sigue en `make smoke` (job de compose del CI).
+- Cobertura de líneas: 39% (`npm run test:cov`). Cubre la lógica de negocio; Prisma, Redis, MinIO y observabilidad se prueban con el stack levantado. No se fija un umbral mínimo en el CI todavía.
+
+*Problemas del código existente que aparecieron al testear (no se arreglan en este PR):*
+- Con el compute plane caído, el invoke sync responde 200 con `status: ERROR`; debería ser 502, como ya hace el camino async. Queda para el Paso 4.
+- `runner.service.ts` parsea `NIMBUS_MEMORY` con `.replace('m', '')`: `256M` o `1g` dan `NaN`, viajan como `null` y Go usa el default sin avisar. Se resuelve en el Paso 2, cuando la memoria pase a ser config de la función.
+- `CreateFunctionDto` no limita el largo de `name`. Se suma `@MaxLength` en el Paso 1, junto con la unicidad por usuario.
+
