@@ -8,9 +8,11 @@
 package async
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -114,6 +116,19 @@ func envBool(key string, fallback bool) bool {
 		return false
 	default:
 		return true
+	}
+}
+
+// ParseBackend accepts sqs or redis. Empty means redis so unit tests and a
+// process without LocalStack keep the stream. Compose sets sqs.
+func ParseBackend(raw string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "redis":
+		return "redis", nil
+	case "sqs":
+		return "sqs", nil
+	default:
+		return "", fmt.Errorf("NIMBUS_ASYNC_BACKEND=%q (se espera sqs o redis)", raw)
 	}
 }
 

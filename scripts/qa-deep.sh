@@ -408,7 +408,7 @@ export NIMBUS_MAX_CONTAINERS=3 NIMBUS_FN_CONCURRENCY=3 NIMBUS_FN_QUEUE_MAX=0
 recreate_compute
 user_containers() {
   docker ps --format '{{.Names}}' | grep -E '^nimbus-' \
-    | grep -vE '^nimbus-(postgres|redis|minio|minio-init|compute-plane|control-plane|console|grafana|prometheus|jaeger|otel-collector)$' \
+    | grep -vE '^nimbus-(postgres|redis|localstack|localstack-init|minio|minio-init|compute-plane|control-plane|console|grafana|prometheus|jaeger|otel-collector)$' \
     || true
 }
 PEAK=0
@@ -514,7 +514,7 @@ fi
 sleep 1
 HOST="$(docker exec nimbus-compute-plane hostname)"
 SLOTS="$(docker exec nimbus-redis redis-cli ZCARD "nimbus:slots:machine:$HOST")"
-EXITED="$(docker ps -a --filter status=exited --format '{{.Names}}' | grep -E '^nimbus-' | grep -vE '^nimbus-(postgres|redis|minio|minio-init|compute-plane|control-plane|console|grafana|prometheus|jaeger|otel-collector)$' || true)"
+EXITED="$(docker ps -a --filter status=exited --format '{{.Names}}' | grep -E '^nimbus-' | grep -vE '^nimbus-(postgres|redis|localstack|localstack-init|minio|minio-init|compute-plane|control-plane|console|grafana|prometheus|jaeger|otel-collector)$' || true)"
 WARM_NOW="$(docker ps -q --filter label=nimbus.warm=1 | wc -l)"
 echo "  slots máquina actual=$SLOTS warm vivos=$WARM_NOW"
 echo "  exited usuario: ${EXITED:-ninguno}"

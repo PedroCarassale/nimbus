@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Nimbus Functions — Sube un artifact (zip) a MinIO
+# Nimbus Functions — Sube un artifact (zip) a S3 (LocalStack o AWS)
 #
 # Uso: ./scripts/upload-artifact.sh <function-id> <path/to/fn.zip> [version]
 #
@@ -7,18 +7,18 @@
 # Si no se especifica version, usa timestamp (YYYYMMDD-HHMMSS)
 #
 # Variables de entorno:
-#   AWS_ACCESS_KEY_ID     - Access key (default: minioadmin)
-#   AWS_SECRET_ACCESS_KEY - Secret key (default: minioadmin)
-#   AWS_ENDPOINT_URL      - Endpoint MinIO (default: http://localhost:9000)
-#   MINIO_BUCKET          - Bucket name (default: nimbus-artifacts)
+#   AWS_ACCESS_KEY_ID     - Access key (default: test)
+#   AWS_SECRET_ACCESS_KEY - Secret key (default: test)
+#   AWS_ENDPOINT_URL      - Endpoint S3 (default: http://localhost:4566). Vacío = AWS real.
+#   S3_BUCKET             - Bucket (default: nimbus-artifacts). MINIO_BUCKET sigue como alias.
 
 set -euo pipefail
 
 # Defaults
-AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-minioadmin}"
-AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-minioadmin}"
-AWS_ENDPOINT_URL="${AWS_ENDPOINT_URL:-http://localhost:9000}"
-MINIO_BUCKET="${MINIO_BUCKET:-nimbus-artifacts}"
+AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-test}"
+AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-test}"
+AWS_ENDPOINT_URL="${AWS_ENDPOINT_URL:-${S3_ENDPOINT:-http://localhost:4566}}"
+MINIO_BUCKET="${S3_BUCKET:-${MINIO_BUCKET:-nimbus-artifacts}}"
 
 export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
 
@@ -55,7 +55,7 @@ elif command -v mc &>/dev/null; then
   mc alias set nimbus "$AWS_ENDPOINT_URL" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" >/dev/null 2>&1
   mc cp "$ZIP_PATH" "nimbus/${MINIO_BUCKET}/${OBJECT_KEY}"
 else
-  echo "Error: Se requiere 'aws' CLI o 'mc' (MinIO Client)" >&2
+  echo "Error: Se requiere 'aws' CLI o 'mc'" >&2
   exit 1
 fi
 

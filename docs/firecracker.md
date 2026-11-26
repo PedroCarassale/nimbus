@@ -54,7 +54,7 @@ make up-fc
 make fc-check
 ```
 
-`make up-fc` corre `scripts/fc-prepare.sh` y después `docker compose` con `docker-compose.firecracker.yml`. Ese override deja el compute plane privilegiado, le pasa `/dev/kvm` y monta el kernel, los rootfs y los binarios de Firecracker v1.18.0. El resto del stack (Postgres, Redis, MinIO, Nest, consola) no cambia.
+`make up-fc` corre `scripts/fc-prepare.sh` y después `docker compose` con `docker-compose.firecracker.yml`. Ese override deja el compute plane privilegiado, le pasa `/dev/kvm` y monta el kernel, los rootfs y los binarios de Firecracker v1.18.0. El resto del stack (Postgres, Redis, LocalStack, Nest, consola) no cambia.
 
 `make fc-check` exige `GET /health` con `"isolation":"firecracker"`. Mide hello cold y warm de `nodejs20`, `python3.12` y `go1.x`, y prueba timeout 124, OOM, error de handler, cancel, ausencia de red, logs en Redis mientras el POST sigue abierto, `cpus: 2` y el one-shot con `NIMBUS_WARM=0`.
 

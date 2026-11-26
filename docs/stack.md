@@ -10,8 +10,8 @@
 |--------|------------|-------|
 | Control plane (APIs create/deploy/config) | NestJS + TypeScript | APIs y orquestación; no ejecuta el código del usuario |
 | Metadata | PostgreSQL | Funciones, versiones, invocaciones, configuración inmutable |
-| Cola / concurrency / cache | Redis | Locks, rate limits, warm hints, pub/sub de logs |
-| Artifact store | MinIO (API S3) | Local-first; luego S3 real sin cambiar contrato |
+| Cola / concurrency / cache | Redis, y SQS para la cola async | Locks, logs y resultados en Redis. Jobs async en SQS (`redis` sigue como backend) |
+| Artifact store | S3 (LocalStack en local, AWS con el endpoint vacío) | Misma API; el compose no usa MinIO |
 | Compute plane (scheduler + runner) | Go | Binario chico, manejo de timeouts y procesos |
 | Aislamiento (MVP) | Docker | Firecracker/microVM después |
 | Runtime del usuario | Node.js (imagen fija de la plataforma) | El zip solo trae el código del usuario |
@@ -20,7 +20,7 @@
 | Logs live | SSE desde control plane | Runner empuja líneas a Redis/stream |
 | Métricas (post-MVP) | OpenTelemetry → Prometheus + Grafana | No bloquea el primer slice |
 | Consola | React + TypeScript + Vite | Create/deploy/invoke + logs |
-| Entorno local | Docker Compose | pg + redis + minio + control + compute |
+| Entorno local | Docker Compose | pg + redis + localstack + control + compute |
 
 ---
 

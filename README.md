@@ -7,6 +7,7 @@ Plataforma serverless (estilo Lambda) de Pedro Carassale y Federico Tessadro.
 - **Stack técnico del MVP:** [docs/stack.md](docs/stack.md)
 - **Roadmap hasta el MVP:** [docs/roadmap.md](docs/roadmap.md)
 - **Observabilidad:** [docs/observabilidad.md](docs/observabilidad.md)
+- **S3 y SQS (LocalStack / AWS):** [docs/localstack-aws.md](docs/localstack-aws.md)
 - **Auditoría IA (cátedra):** [AI-DECISIONS.md](AI-DECISIONS.md)
 - **Instrucciones para agentes:** [agents.md](agents.md)
 
@@ -38,10 +39,10 @@ make console
 
 El aislamiento por defecto es Docker. `make up-fc` levanta el mismo stack con microVMs de Firecracker (`NIMBUS_ISOLATION=firecracker`) y hace falta `/dev/kvm`. El detalle está en [`docs/firecracker.md`](docs/firecracker.md).
 
-El servicio S3 del compose es Silo (`pgsty/silo`), compatible con la API de MinIO. Las imágenes `minio/minio` y `minio/mc` ya no se pueden descargar sin cuenta.
+Los artifacts van a S3 y la cola async a SQS. En local los dos los sirve LocalStack (`localhost:4566`, bucket `nimbus-artifacts`, colas `nimbus-async-jobs` y `nimbus-async-dlq`). Con `S3_ENDPOINT` y `SQS_ENDPOINT` vacíos el mismo código habla con AWS. El detalle está en [`docs/localstack-aws.md`](docs/localstack-aws.md).
 
 Esto demuestra el flujo completo del MVP:
-- **Control Plane** (NestJS): crea función, almacena metadata en Postgres, sube código a MinIO
+- **Control Plane** (NestJS): crea función, almacena metadata en Postgres, sube código a S3
 - **Compute Plane** (Go): ejecuta la función en Docker aislado con timeout y límites de memoria
 - **Live Logs** (SSE): logs en tiempo real via Redis streams
 
@@ -51,8 +52,8 @@ Esto demuestra el flujo completo del MVP:
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │                              docker compose up                                   │
 ├──────────┬──────────┬──────────┬────────────┬────────────┬──────────────────────┤
-│ Postgres │  Redis   │  MinIO   │  Control   │  Compute   │      Console         │
-│ (metada) │ (locks)  │(artifacts│ Plane:3000 │ Plane:8080 │   (React):8088       │
+│ Postgres │  Redis   │LocalStack│  Control   │  Compute   │      Console         │
+│ (metada) │ (locks)  │ S3 + SQS │ Plane:3000 │ Plane:8080 │   (React):8088       │
 └──────────┴──────────┴──────────┴─────┬──────┴──────┬─────┴──────────┬───────────┘
                                        │ HTTP        │ Docker         │ Browser
                                        ▼             ▼                ▼
@@ -72,6 +73,7 @@ make load         # 6 invokes en paralelo: 2 corren, 3 esperan, 1 recibe 429
 make config-check # timeout, memoria, env, handler y cpus contra el compute plane
 make warm-check   # cold start vs warm start, idle, timeout y OOM
 make async-check  # 202, reintentos, DLQ, redrive y reclaim si el compute plane muere
+make localstack-check # zip en S3, jobs en SQS, fallo en la DLQ nativa y redrive
 make obs          # Prometheus, Grafana y Jaeger (no entra en make up)
 make obs-check    # tráfico real y consulta a las APIs de Prometheus, Grafana y Jaeger
 make up-fc       # Igual que make up, con el compute plane en Firecracker
@@ -119,20 +121,20 @@ Ejecuta el ejemplo "hello" directamente con Docker:
 
 Esto empaqueta `examples/hello/` en un zip y lo ejecuta con el runtime Node.js.
 
-### Demo con MinIO (Slice 2)
+### Demo con S3 (LocalStack)
 
-Ejecuta el flujo completo con almacenamiento de artifacts en MinIO:
+Ejecuta el flujo de artifacts contra LocalStack:
 
 ```bash
 ./scripts/run-hello-from-minio.sh
 ```
 
 Esto:
-1. Levanta MinIO si no está corriendo
-2. Empaqueta y sube `hello` a MinIO
-3. Descarga y ejecuta la función desde MinIO
+1. Levanta LocalStack si no está corriendo
+2. Empaqueta y sube `hello` al bucket `nimbus-artifacts`
+3. Descarga y ejecuta la función desde S3
 
-Consola MinIO: http://localhost:9001 (usuario: `minioadmin`, password: `minioadmin`)
+API S3: http://localhost:4566 (access key `test`, secret `test`)
 
 ### Ejecutar una función desde zip
 
@@ -147,11 +149,11 @@ Consola MinIO: http://localhost:9001 (usuario: `minioadmin`, password: `minioadm
 ./scripts/run-zip.sh dist/hello.zip mi-evento.json
 ```
 
-### MinIO y Artifacts (Slice 2)
+### S3 y artifacts
 
 ```bash
-# Levantar MinIO (crea el bucket automáticamente)
-docker compose up -d minio minio-init
+# Levantar LocalStack (crea el bucket y las colas)
+docker compose up -d localstack localstack-init
 
 # Subir un artifact
 ./scripts/upload-artifact.sh hello dist/hello.zip
@@ -159,7 +161,7 @@ docker compose up -d minio minio-init
 # Subir hello (empaqueta + sube)
 ./scripts/upload-hello.sh
 
-# Ejecutar desde MinIO
+# Ejecutar desde S3
 ./scripts/run-artifact.sh hello latest
 
 # Ejecutar versión específica
@@ -169,7 +171,7 @@ docker compose up -d minio minio-init
 ### Control Plane API (Slice 3-4)
 
 ```bash
-# Levantar todo el stack (postgres + redis + minio + compute-plane + control-plane)
+# Levantar todo el stack (postgres + redis + localstack + compute-plane + control-plane)
 docker compose up -d
 
 # Esperar a que esté listo
@@ -355,14 +357,20 @@ Cliente HTTP
 | `NIMBUS_CPUS` | vacío | Default de `--cpus` (0.1..4). Vacío: sin cuota |
 | `NIMBUS_IMAGE` | `nimbus-node` | Nombre de la imagen Docker |
 
-**MinIO (Slice 2):**
+**S3 y SQS (LocalStack o AWS):** el detalle está en [docs/localstack-aws.md](docs/localstack-aws.md).
 
-| Variable | Default | Descripción |
-|----------|---------|-------------|
-| `AWS_ACCESS_KEY_ID` | `minioadmin` | Access key para MinIO/S3 |
-| `AWS_SECRET_ACCESS_KEY` | `minioadmin` | Secret key para MinIO/S3 |
-| `AWS_ENDPOINT_URL` | `http://localhost:9000` | Endpoint de MinIO |
-| `MINIO_BUCKET` | `nimbus-artifacts` | Nombre del bucket |
+| Variable | Default en compose | Descripción |
+|----------|--------------------|-------------|
+| `AWS_REGION` | `us-east-1` | Región. Con el endpoint vacío, es la de AWS |
+| `AWS_ACCESS_KEY_ID` | `test` | Access key. Vacío y sin endpoint: cadena de IAM |
+| `AWS_SECRET_ACCESS_KEY` | `test` | Secret key |
+| `S3_BUCKET` | `nimbus-artifacts` | Bucket de artifacts |
+| `S3_ENDPOINT` | `http://localstack:4566` | Vacío: el SDK habla con S3 real |
+| `S3_FORCE_PATH_STYLE` | `true` | Path style. En AWS real se deja vacío |
+| `SQS_ENDPOINT` | `http://localstack:4566` | Vacío: Amazon SQS. Independiente de `S3_ENDPOINT` |
+| `SQS_QUEUE_URL` | `.../nimbus-async-jobs` | Cola de jobs |
+| `SQS_DLQ_URL` | `.../nimbus-async-dlq` | DLQ nativa |
+| `NIMBUS_ASYNC_BACKEND` | `sqs` | `redis` vuelve al stream. Vacío en el proceso también es `redis` |
 
 **PostgreSQL (Slice 3):**
 
@@ -438,7 +446,7 @@ nimbus-functions/
 │   ├── src/               # Código fuente TypeScript
 │   │   ├── functions/     # Módulo de funciones (CRUD + invoke)
 │   │   ├── prisma/        # Servicio Prisma
-│   │   └── minio/         # Servicio MinIO/S3
+│   │   └── minio/         # Cliente S3 (env AWS_*/S3_*)
 │   ├── prisma/            # Schema y migraciones Postgres
 │   ├── Dockerfile         # Imagen del control plane
 │   └── package.json       # Dependencias Node.js
@@ -446,9 +454,10 @@ nimbus-functions/
 │   ├── cmd/server/        # Entrypoint del servidor
 │   ├── internal/
 │   │   ├── handlers/      # HTTP handlers (StartExecution, Cancel)
-│   │   ├── executor/      # Descarga MinIO + Docker run
+│   │   ├── executor/      # Descarga S3 + Docker run
 │   │   ├── concurrency/   # Semáforo y cola FIFO en Redis
-│   │   └── minio/         # Cliente MinIO
+│   │   ├── async/         # Cola SQS o Redis, reintentos y DLQ
+│   │   └── objects/       # Cliente S3
 │   ├── Dockerfile         # Imagen del compute plane
 │   └── go.mod             # Dependencias Go
 ├── runtime-node/          # Imagen Docker del runtime Node.js
@@ -460,16 +469,17 @@ nimbus-functions/
 │   ├── run-zip.sh         # Ejecuta función desde zip (Slice 1)
 │   ├── run-hello.sh       # Demo rápida local (Slice 1)
 │   ├── pack-hello.sh      # Empaqueta ejemplo en zip
-│   ├── upload-artifact.sh # Sube zip a MinIO (Slice 2)
+│   ├── upload-artifact.sh # Sube zip a S3 (Slice 2)
 │   ├── upload-hello.sh    # Empaqueta + sube hello (Slice 2)
-│   ├── run-artifact.sh    # Descarga + ejecuta desde MinIO (Slice 2)
-│   ├── run-hello-from-minio.sh  # Demo completa MinIO (Slice 2)
-│   ├── minio-init.sh      # Inicializa bucket (alternativo)
+│   ├── run-artifact.sh    # Descarga + ejecuta desde S3 (Slice 2)
+│   ├── run-hello-from-minio.sh  # Demo S3 / LocalStack (Slice 2)
+│   ├── localstack-init.sh # Bucket y colas SQS
+│   ├── localstack-check.sh # Verifica S3, SQS y la DLQ nativa
 │   └── smoke-test.sh      # Test E2E del control plane (Slice 3-4)
 ├── docs/                  # Documentación
 │   ├── stack.md           # Stack técnico
 │   └── roadmap.md         # Roadmap de desarrollo
-├── docker-compose.yml     # Postgres + Redis + MinIO + Compute + Control
+├── docker-compose.yml     # Postgres + Redis + LocalStack + Compute + Control
 ├── .env.example           # Variables de entorno de ejemplo
 └── dist/                  # Artifacts generados (ignorado en git)
 ```

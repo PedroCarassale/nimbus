@@ -39,7 +39,7 @@ type Handler struct {
 	executor    runner
 	concurrency locker
 	defaults    fnconfig.Defaults
-	queue       *async.Queue
+	queue       async.Queuer
 	runs        *runStops
 }
 
@@ -58,7 +58,7 @@ func NewWithDefaults(exec *executor.Executor, concMgr *concurrency.Manager, defa
 
 // SetQueue attaches the durable async queue. Without it the async endpoints
 // answer 503 and the sync path is unchanged.
-func (h *Handler) SetQueue(q *async.Queue) {
+func (h *Handler) SetQueue(q async.Queuer) {
 	h.queue = q
 }
 

@@ -64,6 +64,7 @@ type DLQEntry struct {
 	AttemptTimes []int64         `json:"attemptTimes"`
 	FailedAt     int64           `json:"failedAt"`
 	DeadAt       int64           `json:"deadAt"`
+	DurationMs   int64           `json:"durationMs"`
 }
 
 // RunResult is the outcome of one attempt, produced by the execution path.
@@ -78,8 +79,12 @@ type RunResult struct {
 	QueuedMs   int64
 }
 
-// Delivery is a stream message already parsed into a job.
+// Delivery is a stream or SQS message already parsed into a job.
+// ReceiptHandle and ReceiveCount are set for SQS. ReceiveCount 0 means the
+// Redis path, which keeps the attempt number on the job itself.
 type Delivery struct {
-	ID  string
-	Job Job
+	ID            string
+	ReceiptHandle string
+	ReceiveCount  int
+	Job           Job
 }
