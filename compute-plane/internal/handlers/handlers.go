@@ -13,6 +13,7 @@ import (
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/concurrency"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/executor"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/fnconfig"
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/isolate"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/metrics"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/runtime"
 	ntrace "github.com/PedroCarassale/nimbus/compute-plane/internal/trace"
@@ -70,7 +71,11 @@ func (h *Handler) effectiveDefaults() fnconfig.Defaults {
 
 func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": "compute-plane"})
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":    "ok",
+		"service":   "compute-plane",
+		"isolation": isolate.Current(),
+	})
 }
 
 type StartExecutionRequest struct {

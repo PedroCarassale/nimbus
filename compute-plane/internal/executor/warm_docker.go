@@ -18,6 +18,7 @@ import (
 
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/cancel"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/fnconfig"
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/isolate"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/runtime"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/warm"
 )
@@ -29,6 +30,8 @@ import (
 type dockerStarter struct {
 	image string
 }
+
+func (d dockerStarter) Name() string { return isolate.Docker }
 
 func (d dockerStarter) Start(ctx context.Context, spec warm.Spec) (warm.Session, error) {
 	image := spec.Image

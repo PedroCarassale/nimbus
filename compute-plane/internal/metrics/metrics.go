@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/cancel"
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/isolate"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/runtime"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -19,8 +20,8 @@ import (
 var (
 	invocations = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "nimbus_invocations_total",
-		Help: "Invocations that ran, by function, status (success, error, timeout, oom, cancelled), mode (sync, async) and runtime (nodejs20, python3.12, go1.x).",
-	}, []string{"function_id", "status", "mode", "runtime"})
+		Help: "Invocations that ran, by function, status (success, error, timeout, oom, cancelled), mode (sync, async), runtime (nodejs20, python3.12, go1.x) and isolation (docker, firecracker).",
+	}, []string{"function_id", "status", "mode", "runtime", "isolation"})
 
 	errorsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "nimbus_errors_total",
@@ -39,13 +40,13 @@ var (
 
 	coldStarts = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "nimbus_cold_starts_total",
-		Help: "Invocations that started a new container.",
-	}, []string{"function_id"})
+		Help: "Invocations that started a new sandbox.",
+	}, []string{"function_id", "isolation"})
 
 	warmStarts = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "nimbus_warm_starts_total",
-		Help: "Invocations that reused a warm container.",
-	}, []string{"function_id"})
+		Help: "Invocations that reused a warm sandbox.",
+	}, []string{"function_id", "isolation"})
 
 	rejections = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "nimbus_rejections_total",
@@ -128,8 +129,9 @@ func RecordInvocation(functionID, mode, status, runtimeName string, durationMs i
 	mode = modeLabel(mode)
 	status = statusLabel(status)
 	runtimeName = runtime.Label(runtimeName)
+	iso := isolate.Label(isolate.Current())
 	Remember(id)
-	invocations.WithLabelValues(id, status, mode, runtimeName).Inc()
+	invocations.WithLabelValues(id, status, mode, runtimeName, iso).Inc()
 	switch status {
 	case "error":
 		errorsTotal.WithLabelValues(id, mode).Inc()
@@ -143,12 +145,12 @@ func RecordInvocation(functionID, mode, status, runtimeName string, durationMs i
 	}
 	duration.WithLabelValues(id, mode).Observe(float64(durationMs) / 1000)
 	if coldStart {
-		coldStarts.WithLabelValues(id).Inc()
+		coldStarts.WithLabelValues(id, iso).Inc()
 		if initMs > 0 {
 			initDuration.WithLabelValues(id).Observe(float64(initMs) / 1000)
 		}
 	} else {
-		warmStarts.WithLabelValues(id).Inc()
+		warmStarts.WithLabelValues(id, iso).Inc()
 	}
 }
 

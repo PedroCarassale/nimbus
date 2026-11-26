@@ -594,3 +594,32 @@ El contrato queda en `docs/async.md`.
 
 **Validación y Corrección Humana:** Go no conserva estado de proceso entre invokes del mismo container. El binario tiene que ser estático (`CGO_ENABLED=0`) y de la arquitectura del daemon; uno enlazado a glibc no arranca en Alpine. Node en frío sigue como root. Nest no guarda ni reenvía `runtime`, así que el invoke de la consola sigue en Node.
 
+---
+
+## Firecracker como backend alternativo
+
+**Problema abordado:** El compute plane aislaba con Docker y no había otra opción. Hacía falta un backend de microVM, elegible por entorno, que reutilice el contrato que ya tienen los runtimes: one-shot y warm, timeout, memoria, vCPU, variables, handler, logs, cancel y la etiqueta de aislamiento en las métricas. El default tenía que seguir siendo Docker.
+
+**Prompt / Herramienta utilizada:** Cursor Cloud Agent (Grok 4.7). Pedido de Paso 6, Firecracker / microVM, con `NIMBUS_ISOLATION=docker|firecracker` y el default en Docker.
+
+**Código / Arquitectura generada:**
+
+1. **Backend**
+   - `NIMBUS_ISOLATION` elige el `Starter` del pool. Vacío o `docker` no cambia el camino actual. `firecracker` bootea una microVM por sandbox. Otro valor corta el proceso al arrancar.
+   - El pool warm es el mismo. No hay snapshot/restore: el warm es no matar la VM. `NIMBUS_WARM=0` bootea, invoca una vez y destruye, y ese camino reporta `initMs`. El one-shot de Docker sigue en 0.
+   - `GET /health` agrega `isolation`. `nimbus_invocations_total`, `nimbus_cold_starts_total` y `nimbus_warm_starts_total` llevan la etiqueta. Los spans siguen llamándose `container.acquire` y `container.run`, con el atributo `nimbus.isolation`.
+
+2. **Guest**
+   - Kernel de CI de Firecracker v1.18.0 (6.1.188, pineado en `scripts/fc-prepare.sh`) y un rootfs ext4 por runtime, armado con `docker export` de la imagen que ya usa Docker más `/sbin/nimbus-init`.
+   - El código va en un segundo disco de solo lectura: `/nimbus.json` y `/task/`. El init lo monta y hace bind en `/var/task`. No hay NIC.
+   - El host y el guest hablan el mismo protocolo de líneas JSON que un container warm, sobre un vsock (`CONNECT 5000`).
+   - La VM mide `memoryMb + 64` MiB. El runtime corre en un cgroup con `memory.max` = `memoryMb`. `oom_score_adj=-1000` se aplica a init después del exec, porque el hijo lo hereda. El init se queda leyendo el vsock después del frame `fatal`: si sale, `panic=1` reinicia el guest y el host pierde el frame.
+   - `cpus` se mapea a `vcpu_count` (1 o par, tope 4). No es una cuota CFS.
+   - El jailer es opt-in (`NIMBUS_FC_JAILER`). Con `--new-pid-ns` el padre sale enseguida; el compute plane espera el socket y mata el pid que el jailer dejó anotado. No hay fallback si el cgroup no delega.
+
+3. **Operación**
+   - `make up` no carga el override. `make up-fc` prepara binarios, kernel y rootfs y levanta el compose con `docker-compose.firecracker.yml` (privilegiado, `/dev/kvm`). `make fc-check` cubre hello, timeout, OOM, error, cancel, red, logs, vCPU, 64 MiB, one-shot y un intento de jailer.
+   - El job `firecracker-kvm` del CI solo pregunta si existe `/dev/kvm` y sale 0 en los dos casos. `make fc-check` no corre en GitHub.
+
+**Validación y Corrección Humana:** Riesgos que quedan en el diseño: el one-shot de Firecracker reporta `initMs` y corre como uid 1000; el one-shot de Node en Docker sigue como root y con `initMs` 0. Un `cpus` fraccionario no achica el tiempo de CPU del guest. La RAM del host por slot es el pedido más 64 MiB. Las variables de entorno viven en el ext4 del código mientras la VM existe. No hay snapshot/restore. El jailer copia el rootfs cuando el hardlink cruza de filesystem, y el default queda apagado. `/dev/kvm` y el contenedor privilegiado están solo en el override. El trace id de adentro sale del frame de invoke. Nest y la consola no conocen `NIMBUS_ISOLATION`.
+

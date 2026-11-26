@@ -10,7 +10,9 @@
 #   make logs    — Muestra logs de todos los servicios
 #   make console — Abre la consola web en el navegador
 
-.PHONY: up down hello hello-python hello-go smoke load config-check warm-check async-check runtime-check obs obs-check qa logs build clean wait-healthy help
+.PHONY: up down hello hello-python hello-go smoke load config-check warm-check async-check runtime-check obs obs-check qa logs build clean wait-healthy help up-fc fc-prepare fc-check
+
+COMPOSE_FC := docker compose -f docker-compose.yml -f docker-compose.firecracker.yml
 
 # Variables
 COMPOSE := docker compose
@@ -125,6 +127,23 @@ qa: ## QA profundo de los pasos 0–5 más los runtimes de python y go
 	@echo "$(YELLOW)>>> QA profundo...$(NC)"
 	@./scripts/qa-deep.sh
 	@./scripts/runtime-check.sh
+
+fc-prepare: ## Kernel, binarios y rootfs ext4 para Firecracker
+	@echo "$(YELLOW)>>> Preparando Firecracker...$(NC)"
+	@./scripts/fc-prepare.sh
+
+up-fc: fc-prepare ## Stack con el compute plane en microVM (hace falta /dev/kvm)
+	@echo "$(YELLOW)>>> Levantando stack con Firecracker...$(NC)"
+	@mkdir -p $(WORK_DIR)
+	@chmod 1777 $(WORK_DIR)
+	$(COMPOSE_FC) up -d --build
+	@echo "$(YELLOW)>>> Esperando que los servicios estén healthy...$(NC)"
+	@$(MAKE) wait-healthy
+	@echo "$(GREEN)>>> Compute plane en modo firecracker ($(COMPUTE_URL)/health)$(NC)"
+
+fc-check: ## Hello, timeout, OOM, error, cancel y red contra Firecracker
+	@echo "$(YELLOW)>>> Prueba de Firecracker...$(NC)"
+	@./scripts/fc-check.sh
 
 logs: ## Muestra logs de todos los servicios (follow)
 	$(COMPOSE) logs -f

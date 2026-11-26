@@ -31,18 +31,18 @@ El endpoint es `GET /metrics`. Las etiquetas usan `function_id`. No hay `executi
 
 | Métrica | Tipo | Etiquetas | Qué mide |
 |---------|------|-----------|----------|
-| `nimbus_invocations_total` | counter | `function_id`, `status`, `mode`, `runtime` | Invocaciones que pasaron la admisión. `status` es `success`, `error`, `timeout`, `oom` o `cancelled`. `cancelled` es un `POST /executions/:id/cancel` que alcanzó a cortar el container (exit 130). `mode` es `sync` o `async`. `runtime` es `nodejs20`, `python3.12` o `go1.x` (un valor vacío cuenta como `nodejs20`). El resto de las series no lleva `runtime`: tres valores en un solo counter alcanzan para partir el tráfico por lenguaje. |
+| `nimbus_invocations_total` | counter | `function_id`, `status`, `mode`, `runtime`, `isolation` | Invocaciones que pasaron la admisión. `status` es `success`, `error`, `timeout`, `oom` o `cancelled`. `cancelled` es un `POST /executions/:id/cancel` que alcanzó a cortar el sandbox (exit 130). `mode` es `sync` o `async`. `runtime` es `nodejs20`, `python3.12` o `go1.x` (un valor vacío cuenta como `nodejs20`). `isolation` es `docker` o `firecracker`. El resto de las series no lleva `runtime`. |
 | `nimbus_errors_total` | counter | `function_id`, `mode` | El handler falló y no fue timeout ni OOM. |
 | `nimbus_timeouts_total` | counter | `function_id`, `mode` | Exit 124. |
 | `nimbus_ooms_total` | counter | `function_id`, `mode` | Exit 137, 134, o el texto de límite de memoria. |
 | `nimbus_invocation_duration_seconds` | histogram | `function_id`, `mode` | Tiempo después de conseguir el slot (`durationMs`). |
-| `nimbus_cold_starts_total` | counter | `function_id` | Esta invocación arrancó un container. |
-| `nimbus_warm_starts_total` | counter | `function_id` | Reutilizó uno del pool. |
-| `nimbus_init_duration_seconds` | histogram | `function_id` | `initMs` de un cold start. Un warm y el camino frío de un solo uso (init 0) no entran. |
+| `nimbus_cold_starts_total` | counter | `function_id`, `isolation` | Esta invocación arrancó un sandbox. |
+| `nimbus_warm_starts_total` | counter | `function_id`, `isolation` | Reutilizó uno del pool. |
+| `nimbus_init_duration_seconds` | histogram | `function_id` | `initMs` de un cold start. Un warm no entra. El one-shot de Docker reporta init 0 y tampoco. El one-shot de Firecracker sí: el boot es el init. |
 | `nimbus_queue_depth` | gauge | `function_id` | Invocaciones esperando en la cola FIFO. Se lee de Redis en cada scrape. Si la función ya corrió y la cola está vacía, el valor es 0. |
 | `nimbus_queue_wait_seconds` | histogram | `function_id` | `queuedMs`, también en un 429. |
 | `nimbus_active_executions` | gauge | `function_id` | Ejecuciones que tienen un slot ahora, en este proceso. |
-| `nimbus_warm_pool_size` | gauge | `function_id`, `state` | Containers del pool. `state` es `idle` o `busy`. |
+| `nimbus_warm_pool_size` | gauge | `function_id`, `state` | Sandboxes del pool (container o microVM). `state` es `idle` o `busy`. |
 | `nimbus_containers_in_use` | gauge | — | Slots vivos de esta máquina (`nimbus:slots:machine:*` con lease vigente). Los warm ociosos no entran: están en el pool. |
 | `nimbus_containers_limit` | gauge | — | `NIMBUS_MAX_CONTAINERS`. |
 | `nimbus_rejections_total` | counter | `function_id`, `reason` | HTTP 429. `reason` es `queue_full` o `queue_timeout`. No suma a `nimbus_invocations_total`: no llegó a correr. |

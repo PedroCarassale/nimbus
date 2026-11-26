@@ -12,8 +12,10 @@ import (
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/async"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/concurrency"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/executor"
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/firecracker"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/fnconfig"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/handlers"
+	"github.com/PedroCarassale/nimbus/compute-plane/internal/isolate"
 	"github.com/PedroCarassale/nimbus/compute-plane/internal/metrics"
 	minioClient "github.com/PedroCarassale/nimbus/compute-plane/internal/minio"
 	ntrace "github.com/PedroCarassale/nimbus/compute-plane/internal/trace"
@@ -64,7 +66,14 @@ func main() {
 		fnDefaults.TimeoutSec, fnDefaults.MemoryMB, fnDefaults.Handler, fnDefaults.CPUsLabel())
 	concurrencyMgr := concurrency.NewManager(rdb, concCfg)
 	concurrencyMgr.StartSweeper()
-	if err := warm.CleanupOrphans(ctx); err != nil {
+	iso, isoErr := isolate.Parse(os.Getenv("NIMBUS_ISOLATION"))
+	if isoErr != nil {
+		log.Fatalf("[compute-plane] %v", isoErr)
+	}
+	log.Printf("[compute-plane] Aislamiento: %s", iso)
+	if iso == isolate.Firecracker {
+		firecracker.CleanupLeaked()
+	} else if err := warm.CleanupOrphans(ctx); err != nil {
 		log.Printf("[compute-plane] No se pudieron limpiar containers warm anteriores: %v", err)
 	}
 	exec := executor.New(mc, rdb)
